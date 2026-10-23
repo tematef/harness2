@@ -207,11 +207,11 @@ flowchart LR
 - Modify: `harness2/cli/judge.py`
 - Create: `tests/test_skillbench_cli.py`
 
-- [ ] write tests: `--arm` required for `--bench skillbench`, rejected for other benches; `make_adapter("skillbench", None, "agy", arm="without")` builds the adapter with that arm; skillbench with `oc`/`cx` raises a clear error; omitted `--substrate` resolves to `agy` for skillbench and stays `oc` otherwise
-- [ ] write tests: `run_sweep` passes `tag=<arm>` to `summary_namespace`, `library_root_for`, `_check_identity`, the dry-run printer and the scheduler; WITH and WITHOUT write separate namespaces
-- [ ] write tests: `harness2-judge --bench skillbench --arm without --bases` reads the `without` namespace only
-- [ ] implement the threading (non-skillbench calls keep `tag=""`)
-- [ ] run tests - must pass before next task
+- [x] write tests: `--arm` required for `--bench skillbench`, rejected for other benches; `make_adapter("skillbench", None, "agy", arm="without")` builds the adapter with that arm; skillbench with `oc`/`cx` raises a clear error; omitted `--substrate` resolves to `agy` for skillbench and stays `oc` otherwise
+- [x] write tests: `run_sweep` passes `tag=<arm>` to `summary_namespace`, `library_root_for`, `_check_identity`, the dry-run printer and the scheduler; WITH and WITHOUT write separate namespaces
+- [x] write tests: `harness2-judge --bench skillbench --arm without --bases` reads the `without` namespace only
+- [x] implement the threading (non-skillbench calls keep `tag=""`)
+- [x] run tests - must pass before next task
 
 ### Task 10: skillbench path through preflight, config and identity
 

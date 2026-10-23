@@ -27,11 +27,12 @@ from ..core import library as LIB
 from ..core import schedule as SCHED
 from ..core.spec import BenchmarkAdapter
 
-BENCHES = ("jb", "wb", "lab")
+BENCHES = ("jb", "wb", "lab", "skillbench")
 WB_SUBSETS = ("office", "web", "code")
 SUBSTRATES = ("oc", "cx", "agy")
+ARMS = ("with", "without")
 # Substrates that only some benches support; every other bench rejects them.
-SUBSTRATE_BENCHES: dict[str, tuple[str, ...]] = {"agy": ()}
+SUBSTRATE_BENCHES: dict[str, tuple[str, ...]] = {"agy": ("skillbench",)}
 
 MODES_DEFAULT = "parallel"
 MODES_HELP = (
@@ -44,12 +45,35 @@ class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescript
     """Defaults in the help text, module docstring kept verbatim as the description."""
 
 
+def default_substrate(bench: str) -> str:
+    """Default substrate when `--substrate` is omitted: `agy` for skillbench, `oc` otherwise."""
+    return "agy" if bench == "skillbench" else "oc"
+
+
+def arm_tag(bench: str, arm: str | None) -> str:
+    """Run tag for `(bench, arm)`: the arm name for skillbench, empty for other benches."""
+    return arm or "" if bench == "skillbench" else ""
+
+
+class _BenchAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        setattr(namespace, self.dest, values)
+        if getattr(namespace, "substrate", None) is None:
+            namespace.substrate = default_substrate(values)
+
+
 def make_adapter(
-    bench: str, subset: str | None, substrate: str, split_file: Path | None = None
+    bench: str,
+    subset: str | None = None,
+    substrate: str | None = None,
+    split_file: Path | None = None,
+    arm: str | None = None,
 ) -> BenchmarkAdapter:
-    """The one place a CLI turns (--bench, --subset, --substrate) into an adapter."""
+    """The one place a CLI turns (--bench, --subset, --substrate, --arm) into an adapter."""
     if bench not in BENCHES:
         raise ValueError(f"unknown bench {bench!r}; expected one of {BENCHES}")
+    if substrate is None:
+        substrate = default_substrate(bench)
     if substrate not in SUBSTRATES:
         raise ValueError(f"unknown substrate {substrate!r}; expected one of {SUBSTRATES}")
     if substrate in SUBSTRATE_BENCHES and bench not in SUBSTRATE_BENCHES[substrate]:
@@ -57,6 +81,18 @@ def make_adapter(
             f"--substrate {substrate} is not supported by --bench {bench}; it is reserved for "
             f"the skillbench benchmark"
         )
+    if bench == "skillbench":
+        if subset:
+            raise ValueError(f"--subset applies to --bench wb only, got {subset!r} for {bench}")
+        if substrate != "agy":
+            raise ValueError(f"--bench skillbench requires --substrate agy, got {substrate!r}")
+        if arm not in ARMS:
+            raise ValueError(f"--bench skillbench requires --arm from {ARMS}, got {arm!r}")
+        from ..benchmarks.skillbench import SkillbenchAdapter
+
+        return SkillbenchAdapter(arm, substrate=substrate, split_file=split_file)
+    if arm is not None:
+        raise ValueError(f"--arm applies to --bench skillbench only, got {arm!r} for {bench}")
     if bench == "wb":
         if subset not in WB_SUBSETS:
             raise ValueError(f"--bench wb needs --subset from {WB_SUBSETS}, got {subset!r} ")
@@ -103,15 +139,28 @@ def summary_namespace(adapter: BenchmarkAdapter, k: int, *, seed: int | None, ta
 
 def add_cell_args(p: argparse._ActionsContainer) -> None:
     """The (benchmark, substrate) cell selectors; `p` may be a parser or an argument group."""
-    p.add_argument("--bench", required=True, choices=BENCHES, help="jb | wb | lab")
+    p.add_argument(
+        "--bench",
+        required=True,
+        choices=BENCHES,
+        action=_BenchAction,
+        help="jb | wb | lab | skillbench",
+    )
     p.add_argument(
         "--subset", default=None, choices=WB_SUBSETS, help="WB only: office | web | code"
     )
     p.add_argument(
         "--substrate",
-        default="oc",
+        default=None,
         choices=SUBSTRATES,
-        help="task-executor substrate: oc (opencode) | cx (codex) | agy (AGY / Jetski)",
+        help="task-executor substrate: oc (opencode) | cx (codex) | agy (AGY / Jetski; "
+        "default: agy for skillbench, oc otherwise)",
+    )
+    p.add_argument(
+        "--arm",
+        default=None,
+        choices=ARMS,
+        help="skillbench only (required): with | without",
     )
 
 

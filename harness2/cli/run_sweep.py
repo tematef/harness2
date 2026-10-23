@@ -88,22 +88,25 @@ def _stream_for(adapter, args) -> tuple[dict[str, list[str]], list[tuple[str, st
     return by_domain, [(domain, task) for domain, tasks in by_domain.items() for task in tasks]
 
 
-def _print_stream(adapter, args, modes) -> int:
+def _print_stream(adapter, args, modes, tag: str = "") -> int:
     by_domain, stream = _stream_for(adapter, args)
     print(
         f"# {adapter.spec.name}-{adapter.substrate.name} split={args.split} "
         f"seed={args.seed} k={args.k} modes={','.join(C.mode_label(m) for m in modes)}"
+        + (f" tag={tag}" if tag else "")
     )
     for m in modes:
         namespace = schedule.ns(
-            adapter.spec.name, adapter.substrate.name, m, args.k, seed=args.seed
+            adapter.spec.name, adapter.substrate.name, m, args.k, seed=args.seed, tag=tag
         )
         print(f"#   namespace[{C.mode_label(m)}]: {namespace}")
     print(
         f"#   summaries under: {C.runs_root_for(adapter)}/"
-        f"{C.summary_namespace(adapter, args.k, seed=args.seed)}"
+        f"{C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)}"
     )
-    print(f"#   library root:    {C.library_root_for(adapter, args.k, seed=args.seed)}")
+    print(
+        f"#   library root:    {C.library_root_for(adapter, args.k, seed=args.seed, tag=tag)}"
+    )
     print(f"#   domains parallel: {args.workers}")
     for i, (domain, task) in enumerate(stream, 1):
         print(f"{i:>4}  {domain:<40} {task}")
@@ -132,22 +135,23 @@ def _main(args: argparse.Namespace) -> int:
     if args.k < 1 or args.workers < 1:
         raise ValueError("--k and --workers must be positive")
     modes = C.parse_modes(args.modes)
+    adapter = C.make_adapter(
+        args.bench, args.subset, args.substrate, args.split_file, arm=args.arm
+    )
+    tag = C.arm_tag(args.bench, args.arm)
 
     if args.dry_run:
-        return _print_stream(
-            C.make_adapter(args.bench, args.subset, args.substrate, args.split_file), args, modes
-        )
+        return _print_stream(adapter, args, modes, tag=tag)
 
-    adapter = C.make_adapter(args.bench, args.subset, args.substrate, args.split_file)
     _stream_for(adapter, args)
     from ..preflight import require_ready
 
     require_ready(adapter, judge=True)
 
     runs_root = C.runs_root_for(adapter)
-    library_root = C.library_root_for(adapter, args.k, seed=args.seed)
-    summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed)
-    _check_identity(adapter, args, runs_root / summary_ns)
+    library_root = C.library_root_for(adapter, args.k, seed=args.seed, tag=tag)
+    summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)
+    _check_identity(adapter, args, runs_root / summary_ns, tag=tag)
     prop = Proposer(adapter.spec.channels["proposer"], audit_dir=runs_root / "_audit" / summary_ns)
 
     only = _csv(args.only_domains)
@@ -165,7 +169,7 @@ def _main(args: argparse.Namespace) -> int:
         split=args.split,
         modes=modes,
         seed=args.seed,
-        tag="",
+        tag=tag,
         domain_parallel=lanes,
         only_domains=only,
         max_tasks=args.max_tasks,
@@ -196,7 +200,8 @@ def _main(args: argparse.Namespace) -> int:
     print(
         f"next:   python3 -m harness2.cli.judge --bench {args.bench}"
         + (f" --subset {args.subset}" if args.subset else "")
-        + f" --substrate {args.substrate} --k {args.k}"
+        + (f" --arm {args.arm}" if args.arm else "")
+        + f" --substrate {adapter.substrate.name} --k {args.k}"
         + (f" --seed {args.seed}" if args.seed is not None else "")
         + f" --modes {args.modes}"
     )
@@ -206,7 +211,7 @@ def _main(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _check_identity(adapter, args, namespace_dir: Path) -> None:
+def _check_identity(adapter, args, namespace_dir: Path, tag: str = "") -> None:
     """Prevent a resumed run or library from silently mixing models or task partitions."""
     identity = {
         "method_version": config.METHOD_VERSION,
@@ -223,6 +228,8 @@ def _check_identity(adapter, args, namespace_dir: Path) -> None:
         "domains": sorted(_csv(args.only_domains)),
         "seed": args.seed,
     }
+    if tag:
+        identity["tag"] = tag
     namespace_dir.mkdir(parents=True, exist_ok=True)
     path = namespace_dir / "config.json"
     if path.is_file():
