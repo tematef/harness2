@@ -118,10 +118,10 @@ flowchart LR
 - Create: `tests/fixtures/agy_stub.py`
 - Create: `tests/test_agy_stub.py`
 
-- [ ] `python3 -m venv .venv && .venv/bin/pip install -e .`; confirm the existing suite passes as a baseline
-- [ ] write tests for the stub first: replays fixture named by `AGY_STUB_SCENARIO`, logs argv/cwd/`HOME`/env to `AGY_STUB_LOG`, optional per-event sleep, non-zero-exit and hang scenarios, writes a file into cwd when the scenario asks (to produce a diff)
-- [ ] implement `tests/fixtures/agy_stub.py` (executable, stdlib only)
-- [ ] run tests - must pass before next task
+- [x] `python3 -m venv .venv && .venv/bin/pip install -e .`; confirm the existing suite passes as a baseline
+- [x] write tests for the stub first: replays fixture named by `AGY_STUB_SCENARIO`, logs argv/cwd/`HOME`/env to `AGY_STUB_LOG`, optional per-event sleep, non-zero-exit and hang scenarios, writes a file into cwd when the scenario asks (to produce a diff)
+- [x] implement `tests/fixtures/agy_stub.py` (executable, stdlib only)
+- [x] run tests - must pass before next task
 
 ### Task 3: stream-json decoder and skill timing
 
