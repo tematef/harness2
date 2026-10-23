@@ -181,11 +181,11 @@ flowchart LR
 - Modify: `harness2/benchmarks/skillbench.py` (`score`)
 - Create: `tests/test_skillbench_judge.py`
 
-- [ ] write tests (stub): judge runs in an empty HOME with no plugins, `--model $SKILLBENCH_JUDGE_MODEL`, `--json-schema`; prompt contains rubric + scrubbed `final.md` / `diff.patch` / new files, and no trajectory, arm label, skill names or `SKILL.md` paths
-- [ ] write tests: valid output → `{n_passed, n_criteria}`; unknown/missing ids, malformed JSON, timeout, disagreeing model field → `None`; invalid rollout → `None` without calling the judge
-- [ ] write tests: second `score()` on the same run dir hits `judgments.json` and does not call agy; changing judge model or rubric invalidates the cache; `SKILLBENCH_JUDGE_REPEAT=2` stores two judgments
-- [ ] implement `score`, scrubbing and cache
-- [ ] run tests - must pass before next task
+- [x] write tests (stub): judge runs in an empty HOME with no plugins, `--model $SKILLBENCH_JUDGE_MODEL`, `--json-schema`; prompt contains rubric + scrubbed `final.md` / `diff.patch` / new files, and no trajectory, arm label, skill names or `SKILL.md` paths
+- [x] write tests: valid output → `{n_passed, n_criteria}`; unknown/missing ids, malformed JSON, timeout, disagreeing model field → `None`; invalid rollout → `None` without calling the judge
+- [x] write tests: second `score()` on the same run dir hits `judgments.json` and does not call agy; changing judge model or rubric invalidates the cache; `SKILLBENCH_JUDGE_REPEAT=2` stores two judgments
+- [x] implement `score`, scrubbing and cache
+- [x] run tests - must pass before next task
 
 ### Task 8: SkillbenchAdapter surface
 
