@@ -27,6 +27,14 @@ Staging (install mode `agy_home`, one Install per arm):
                               copied auth files and side-effect shims -> a HOME template
     prepare_rollout           fresh per-rollout copy of that HOME + the isolated environment
 
+Execution (one rollout per run_id):
+
+    run_rollout               fixture -> `<run>/work` git repo, one headless agy call, then
+                              events.jsonl, final.md, diff.patch, new_files/, skill_timing.json
+    AgySubstrate.execute      run_rollout for each run_id (task resolver + runs root supplied
+                              by the benchmark adapter)
+    AgySubstrate.preflight    binary, git, pinned effort, plugins dir and auth files present
+
 The event shape follows revmux's agy decoder (`event`, `result{structured_output, model?,
 usage.total_tokens}`, `step_update{step_type, state, tool_name, text_delta, tool_info{name,
 parameters}}`). Fields marked "assumed" in docs/skillbench-spike.md (the optional
@@ -41,10 +49,14 @@ import json
 import os
 import re
 import shutil
+import signal
+import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import IO, Any, Callable, Iterable, Mapping
 
 from .. import config
 from ..core import runmark as RM
@@ -370,12 +382,8 @@ def _target_dirs(root: Path, allowlist: tuple[str, ...], skill: str) -> list[Pat
     ]
 
 
-def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
-    """Copy the allowlisted plugins (symlinks resolved) into `dest`.
-
-    Arm `without` omits `skills/<target_skill>/` from every staged plugin that has it; hooks
-    and every other file stay. Returns the omitted paths relative to `dest`.
-    """
+def checked_plugins() -> tuple[Path, tuple[str, ...]]:
+    """`(plugins_dir(), plugin_allowlist())` after checking every allowlisted plugin exists."""
     root = plugins_dir()
     allow = plugin_allowlist()
     missing = [p for p in allow if not (root / p).is_dir()]
@@ -384,6 +392,16 @@ def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
             f"allowlisted plugin(s) {missing} not found in SKILLBENCH_PLUGINS_DIR={root}; fix "
             f"SKILLBENCH_PLUGINS or update the cc-thingz checkout"
         )
+    return root, allow
+
+
+def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
+    """Copy the allowlisted plugins (symlinks resolved) into `dest`.
+
+    Arm `without` omits `skills/<target_skill>/` from every staged plugin that has it; hooks
+    and every other file stay. Returns the omitted paths relative to `dest`.
+    """
+    root, allow = checked_plugins()
     targets = _target_dirs(root, allow, target_skill)
     if not targets:
         raise ValueError(
@@ -405,8 +423,8 @@ def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
     return sorted(str(t.relative_to(root)) for t in omit)
 
 
-def stage_auth(home: Path) -> list[str]:
-    """Copy (never link) the SKILLBENCH_AUTH_FILES from the real `$HOME` into `home`."""
+def checked_auth_files() -> tuple[Path, tuple[str, ...]]:
+    """`(real $HOME, auth_files())` after checking every listed auth file exists there."""
     real = Path.home()
     rels = auth_files()
     missing = [r for r in rels if not (real / r).is_file()]
@@ -415,6 +433,12 @@ def stage_auth(home: Path) -> list[str]:
             f"auth file(s) {missing} listed in SKILLBENCH_AUTH_FILES not found under {real}: "
             f"log in with `agy` once, or fix SKILLBENCH_AUTH_FILES"
         )
+    return real, rels
+
+
+def stage_auth(home: Path) -> list[str]:
+    """Copy (never link) the SKILLBENCH_AUTH_FILES from the real `$HOME` into `home`."""
+    real, rels = checked_auth_files()
     for rel in rels:
         dst = home / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -487,10 +511,371 @@ def _digest(*parts: str) -> str:
     return hashlib.sha1("\0".join(parts).encode()).hexdigest()[:16]
 
 
+# --------------------------------------------------------------------------------------------
+# Execution: fixture repo, one headless agy call, run-dir outputs, model guard, preflight.
+# --------------------------------------------------------------------------------------------
+
+DEFAULT_AGY_BIN = "agy"
+DEFAULT_EXEC_MODEL = "opus"
+# Used when a caller passes no positive timeout (adapters pass `int(timeout or 0)`).
+DEFAULT_TIMEOUT_S = 1800
+# Upper bound on draining agy's stdout after the process (group) is gone.
+_READER_JOIN_S = 10.0
+# Fixed identity for the fixture's initial commit (and any commit the agent makes): the
+# rollout HOME has no ~/.gitconfig, and the real one must never be read.
+GIT_ENV = {
+    "GIT_AUTHOR_NAME": "skillbench",
+    "GIT_AUTHOR_EMAIL": "skillbench@localhost",
+    "GIT_COMMITTER_NAME": "skillbench",
+    "GIT_COMMITTER_EMAIL": "skillbench@localhost",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+@dataclass(frozen=True)
+class AgyTask:
+    """What a rollout needs from the benchmark: the prompt exactly as sent, and the fixture repo
+    copied into `<run>/work` (`None` -> an empty repository)."""
+
+    prompt: str
+    fixture: Path | None = None
+
+
+def agy_bin() -> str:
+    """The configured agy command (HARNESS2_AGY_BIN, default `agy`)."""
+    return str(config.env("HARNESS2_AGY_BIN", DEFAULT_AGY_BIN))
+
+
+def resolve_agy_bin() -> Path | None:
+    """HARNESS2_AGY_BIN as an executable path (a bare name is looked up on PATH), else None."""
+    raw = agy_bin()
+    if os.sep in raw or raw.startswith("~"):
+        p = Path(raw).expanduser()
+        return p if p.is_file() and os.access(p, os.X_OK) else None
+    found = shutil.which(raw)
+    return Path(found) if found else None
+
+
+def exec_model() -> str:
+    """The executor model requested from agy (SKILLBENCH_EXEC_MODEL, default `opus`)."""
+    return str(config.env("SKILLBENCH_EXEC_MODEL", DEFAULT_EXEC_MODEL))
+
+
+def exec_effort() -> str:
+    """SKILLBENCH_EFFORT (required): agy's default effort is unknown, so it is always pinned."""
+    return config.require(
+        "SKILLBENCH_EFFORT",
+        needed_by="the agy substrate (pinned --effort, identical in both skillbench arms)",
+    )
+
+
+def agy_argv(
+    binary: Path | str,
+    prompt: str,
+    *,
+    model: str,
+    timeout: int,
+    effort: str | None = None,
+    json_schema: str | None = None,
+) -> list[str]:
+    """The headless agy command line (revmux's executor flags)."""
+    argv = [
+        str(binary),
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--dangerously-skip-permissions",
+        "--disable-slash-commands",
+        "--model",
+        model,
+    ]
+    if effort:
+        argv += ["--effort", effort]
+    if json_schema is not None:
+        argv += ["--json-schema", json_schema]
+    argv += ["--print-timeout", f"{int(timeout)}s"]
+    return argv
+
+
+def observed_model(events: Iterable[AgyEvent]) -> str | None:
+    """The last model name the stream reported, or None when agy reports none."""
+    seen = None
+    for ev in events:
+        if ev.model is not None:
+            seen = ev.model
+    return seen
+
+
+def model_matches(requested: str, actual: str) -> bool:
+    """`actual` names the requested model: equal, or the requested alias is one of its
+    dash/dot-separated tokens (`opus` matches `claude-opus-4-1`). Case-insensitive."""
+    req, act = requested.strip().lower(), actual.strip().lower()
+    return bool(req) and (req == act or req in re.split(r"[^a-z0-9]+", act))
+
+
+def model_guard(events: Iterable[AgyEvent], requested: str) -> tuple[str | None, str | None]:
+    """`(actual_model, invalid_reason)`: a reported model that disagrees invalidates the rep; no
+    reported model is `actual_model=None` and keeps the rep valid ("model unverified")."""
+    actual = observed_model(events)
+    if actual is not None and not model_matches(requested, actual):
+        return actual, f"model mismatch: requested {requested!r}, agy reported {actual!r}"
+    return actual, None
+
+
+def final_text(events: Iterable[AgyEvent]) -> str:
+    """agy's final message: the last `DONE` response delta, else the response text streamed
+    after the last tool call."""
+    last_done: str | None = None
+    tail: list[str] = []
+    for ev in events:
+        if ev.is_tool:
+            tail = []
+            continue
+        if ev.text is None or ev.step_type in _THINKING_STEPS:
+            continue
+        if ev.state == "DONE":
+            last_done = ev.text
+        else:
+            tail.append(ev.text)
+    return last_done if last_done is not None else "".join(tail)
+
+
+def _git(work: Path, env: Mapping[str, str], *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=work,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed in {work}: {proc.stderr.strip()[:500]}")
+    return proc.stdout
+
+
+def init_work(work: Path, fixture: Path | None, env: Mapping[str, str]) -> str:
+    """Copy `fixture` (without any `.git`) into `work`, `git init` and commit it; returns the
+    base commit sha the deliverable diff is taken against."""
+    if fixture is not None:
+        fixture = Path(fixture)
+        if not fixture.is_dir():
+            raise ValueError(f"task fixture {fixture} is not a directory")
+        shutil.copytree(
+            fixture, work, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        )
+    else:
+        work.mkdir(parents=True)
+    _git(work, env, "init", "-q")
+    _git(work, env, "add", "-A")
+    _git(
+        work,
+        env,
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "--no-verify",
+        "-m",
+        "skillbench fixture",
+    )
+    return _git(work, env, "rev-parse", "HEAD").strip()
+
+
+def collect_changes(work: Path, base: str, run_dir: Path, env: Mapping[str, str]) -> list[str]:
+    """Write `diff.patch` (everything since `base`, incl. agent commits and untracked files)
+    and copy files added since `base` into `new_files/`. Returns the added paths."""
+    _git(work, env, "add", "-A")
+    (run_dir / "diff.patch").write_text(
+        _git(work, env, "diff", "--cached", "--binary", base), encoding="utf-8"
+    )
+    names = _git(work, env, "diff", "--cached", "--name-only", "--diff-filter=A", "-z", base)
+    added = [n for n in names.split("\0") if n]
+    out = run_dir / "new_files"
+    out.mkdir(exist_ok=True)
+    for rel in added:
+        src = work / rel
+        if src.is_symlink() or not src.is_file():
+            continue
+        dst = out / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+    return added
+
+
+def _pump(stdout: IO[bytes], sink: IO[str], start: float, events: list[AgyEvent]) -> None:
+    """Copy agy's stdout into events.jsonl, stamping each JSON object line with `t`."""
+    for raw in iter(stdout.readline, b""):
+        t = round(time.monotonic() - start, 3)
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict):
+            obj["t"] = t
+            line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        sink.write(line + "\n")
+        sink.flush()
+        ev = parse_event(line)
+        if ev is not None:
+            events.append(ev)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _scrub_auth(home: Path) -> None:
+    """Drop the copied credentials from a finished rollout's HOME (run dirs are kept)."""
+    try:
+        rels = auth_files()
+    except config.ConfigError:
+        return
+    for rel in rels:
+        try:
+            (home / rel).unlink()
+        except (FileNotFoundError, IsADirectoryError):
+            pass
+
+
+def run_rollout(
+    install: Install,
+    run_dir: Path,
+    *,
+    prompt: str,
+    fixture: Path | None = None,
+    timeout: int = DEFAULT_TIMEOUT_S,
+    base_env: Mapping[str, str] | None = None,
+) -> Path:
+    """One isolated agy rollout into a fresh `run_dir`.
+
+    Writes `work/` (the fixture as a git repo, cwd of agy), `home/` (credentials removed
+    afterwards), `side_effects/`, `events.jsonl` (+`t`), `agy.stderr.log`, `final.md`,
+    `diff.patch`, `new_files/` and `skill_timing.json`. A timeout, a non-zero exit, a reported
+    model that disagrees with the requested one, a stream without a result event or an
+    unreadable work tree mark the rep invalid (`valid=false`, `invalid_reason`); the run dir is
+    written either way. Infrastructure failures (missing binary, fixture or config) raise.
+    """
+    target = install.extras.get("target_skill")
+    if not target:
+        raise ValueError("install has no target_skill; materialise it with ctx['target_skill']")
+    binary = resolve_agy_bin()
+    if binary is None:
+        raise RuntimeError(
+            f"agy binary {agy_bin()!r} not found or not executable: install AGY/Jetski or set "
+            f"HARNESS2_AGY_BIN to the agy (or jetski) executable"
+        )
+    model, effort = exec_model(), exec_effort()
+    timeout = int(timeout) if timeout and int(timeout) > 0 else DEFAULT_TIMEOUT_S
+    run_dir = Path(run_dir)
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    env = prepare_rollout(install, run_dir, base_env)
+    env.update(GIT_ENV)
+    work = run_dir / "work"
+    try:
+        base = init_work(work, fixture, env)
+        argv = agy_argv(binary, prompt, model=model, timeout=timeout, effort=effort)
+        events: list[AgyEvent] = []
+        timed_out = False
+        with (
+            open(run_dir / "events.jsonl", "w", encoding="utf-8") as sink,
+            open(run_dir / "agy.stderr.log", "wb") as err,
+        ):
+            start = time.monotonic()
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=work,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=err,
+                    start_new_session=True,
+                )
+            except OSError as e:
+                raise RuntimeError(f"could not start agy ({binary}): {e}") from e
+            reader = threading.Thread(
+                target=_pump, args=(proc.stdout, sink, start, events), daemon=True
+            )
+            reader.start()
+            try:
+                exit_code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_group(proc)
+                exit_code = proc.wait()
+            t_total = round(time.monotonic() - start, 3)
+            _kill_group(proc)  # leftovers of the session must not keep the pipe open
+            reader.join(_READER_JOIN_S)
+            if proc.stdout is not None:
+                proc.stdout.close()
+        (run_dir / "final.md").write_text(final_text(events), encoding="utf-8")
+        diff_error = None
+        try:
+            collect_changes(work, base, run_dir, env)
+        except RuntimeError as e:
+            diff_error = str(e)
+            (run_dir / "diff.patch").write_text("", encoding="utf-8")
+            (run_dir / "new_files").mkdir(exist_ok=True)
+
+        actual, mismatch = model_guard(events, model)
+        if timed_out:
+            reason = f"timeout after {timeout}s"
+        elif exit_code != 0:
+            reason = f"agy exited with code {exit_code}"
+        elif mismatch:
+            reason = mismatch
+        elif not any(ev.is_result for ev in events):
+            reason = "no result event in stream"
+        elif diff_error:
+            reason = f"work tree unreadable: {diff_error}"
+        else:
+            reason = None
+        tokens = [ev.total_tokens for ev in events if ev.total_tokens is not None]
+        record = {
+            **skill_timing(events, target),
+            "t_total_s": t_total,
+            "requested_model": model,
+            "actual_model": actual,
+            "valid": reason is None,
+            "invalid_reason": reason,
+            "exit_code": exit_code,
+            "total_tokens": tokens[-1] if tokens else None,
+        }
+        (run_dir / "skill_timing.json").write_text(
+            json.dumps(record, indent=2) + "\n", encoding="utf-8"
+        )
+    finally:
+        _scrub_auth(run_dir / "home")
+    return run_dir
+
+
 class AgySubstrate:
-    """AGY / Jetski behind the Substrate interface (bases-only staging for skillbench)."""
+    """AGY / Jetski behind the Substrate interface (bases-only staging for skillbench).
+
+    `tasks` maps a task_ref to its `AgyTask` and `runs_root / <run_id>` is each rollout's run
+    dir; both come from the benchmark adapter (staging and preflight work without them).
+    """
 
     name = "agy"
+
+    def __init__(
+        self,
+        tasks: Callable[[str], AgyTask] | None = None,
+        runs_root: Path | None = None,
+    ):
+        self._tasks = tasks
+        self._runs_root = Path(runs_root) if runs_root is not None else None
 
     def surface(self) -> SurfaceSpec:
         return AGY_SURFACE
@@ -541,6 +926,27 @@ class AgySubstrate:
             },
         )
 
+    def execute(
+        self, task_ref: str, install: Install, run_ids: list[str], timeout: int
+    ) -> list[Path]:
+        """One `run_rollout` per run_id into `runs_root / <run_id>`, in order."""
+        if self._tasks is None or self._runs_root is None:
+            raise RuntimeError(
+                "AgySubstrate was constructed without a task resolver and runs root; the "
+                "benchmark adapter must supply both (it owns prompts, fixtures and run dirs)"
+            )
+        task = self._tasks(task_ref)
+        return [
+            run_rollout(
+                install,
+                self._runs_root / rid,
+                prompt=task.prompt,
+                fixture=task.fixture,
+                timeout=int(timeout or 0),
+            )
+            for rid in run_ids
+        ]
+
     def read_trajectory(
         self, stream_path: Path, *, obs_trunc: int, max_chars: int, args_trunc: int = 400
     ) -> str:
@@ -550,3 +956,17 @@ class AgySubstrate:
             max_chars=max_chars,
             args_trunc=args_trunc,
         )
+
+    def preflight(self) -> None:
+        """Checks the agy binary, git, the pinned effort, the plugins checkout and the auth
+        files; starts nothing (agy is not even asked for --version)."""
+        if resolve_agy_bin() is None:
+            raise RuntimeError(
+                f"agy binary {agy_bin()!r} not found or not executable: install AGY/Jetski so "
+                f"`agy` is on PATH, or set HARNESS2_AGY_BIN to its path (e.g. the jetski alias)"
+            )
+        if shutil.which("git") is None:
+            raise RuntimeError("git not found on PATH: install git (fixtures run as git repos)")
+        exec_effort()
+        checked_plugins()
+        checked_auth_files()

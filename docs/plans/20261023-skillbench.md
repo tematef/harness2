@@ -156,11 +156,11 @@ flowchart LR
 - Modify: `harness2/cli/_common.py` (`SUBSTRATES` gains `agy`)
 - Create: `tests/test_agy_execute.py`
 
-- [ ] write tests (stub, `HOME=<tmp>`): `execute` copies the fixture into `<run>/work`, `git init` + initial commit, invokes agy with expected argv (incl. pinned `--effort`, `--model $SKILLBENCH_EXEC_MODEL`) / `HOME` / cwd, writes `events.jsonl` with monotonic `t`, `final.md`, `diff.patch`, `new_files/`, `skill_timing.json`
-- [ ] write tests: model field present and disagreeing ⇒ invalid with reason; model field absent ⇒ `actual_model=null`, rep stays valid; timeout and non-zero exit ⇒ invalid, run dir still written
-- [ ] write tests: `preflight` raises `RuntimeError` with remediation when the binary, auth files or plugins dir are missing
-- [ ] implement `execute`, model guard, `preflight`; register `AgySubstrate`
-- [ ] run tests - must pass before next task
+- [x] write tests (stub, `HOME=<tmp>`): `execute` copies the fixture into `<run>/work`, `git init` + initial commit, invokes agy with expected argv (incl. pinned `--effort`, `--model $SKILLBENCH_EXEC_MODEL`) / `HOME` / cwd, writes `events.jsonl` with monotonic `t`, `final.md`, `diff.patch`, `new_files/`, `skill_timing.json`
+- [x] write tests: model field present and disagreeing ⇒ invalid with reason; model field absent ⇒ `actual_model=null`, rep stays valid; timeout and non-zero exit ⇒ invalid, run dir still written
+- [x] write tests: `preflight` raises `RuntimeError` with remediation when the binary, auth files or plugins dir are missing
+- [x] implement `execute`, model guard, `preflight`; register `AgySubstrate`
+- [x] run tests - must pass before next task
 
 ### Task 6: Task format, loader, freeze and simulated-user preamble
 

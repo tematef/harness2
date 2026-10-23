@@ -29,7 +29,9 @@ from ..core.spec import BenchmarkAdapter
 
 BENCHES = ("jb", "wb", "lab")
 WB_SUBSETS = ("office", "web", "code")
-SUBSTRATES = ("oc", "cx")
+SUBSTRATES = ("oc", "cx", "agy")
+# Substrates that only some benches support; every other bench rejects them.
+SUBSTRATE_BENCHES: dict[str, tuple[str, ...]] = {"agy": ()}
 
 MODES_DEFAULT = "parallel"
 MODES_HELP = (
@@ -50,6 +52,11 @@ def make_adapter(
         raise ValueError(f"unknown bench {bench!r}; expected one of {BENCHES}")
     if substrate not in SUBSTRATES:
         raise ValueError(f"unknown substrate {substrate!r}; expected one of {SUBSTRATES}")
+    if substrate in SUBSTRATE_BENCHES and bench not in SUBSTRATE_BENCHES[substrate]:
+        raise ValueError(
+            f"--substrate {substrate} is not supported by --bench {bench}; it is reserved for "
+            f"the skillbench benchmark"
+        )
     if bench == "wb":
         if subset not in WB_SUBSETS:
             raise ValueError(f"--bench wb needs --subset from {WB_SUBSETS}, got {subset!r} ")
@@ -104,7 +111,7 @@ def add_cell_args(p: argparse._ActionsContainer) -> None:
         "--substrate",
         default="oc",
         choices=SUBSTRATES,
-        help="task-executor substrate: oc (opencode) | cx (codex)",
+        help="task-executor substrate: oc (opencode) | cx (codex) | agy (AGY / Jetski)",
     )
 
 
