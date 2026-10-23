@@ -129,11 +129,11 @@ flowchart LR
 - Create: `harness2/substrate/agy.py` (decoder part)
 - Create: `tests/test_agy_stream.py`
 
-- [ ] write tests for `parse_event(line)`: step updates, tool calls with parameters, result with usage / structured output, optional model field (present → value, absent → `None`), malformed lines ignored
-- [ ] write tests for `skill_timing(events, target_skill)`: first read of `skills/<target>/SKILL.md` → `t_skill_s` + `step_idx`; reads of other skills ignored; never read → `invoked=false, t_skill_s=null`
-- [ ] write tests for `render_trajectory(events, obs_trunc, max_chars, args_trunc)` matching the shape of `OpencodeSubstrate.read_trajectory`
-- [ ] implement `parse_event`, `skill_timing`, `render_trajectory`
-- [ ] run tests - must pass before next task
+- [x] write tests for `parse_event(line)`: step updates, tool calls with parameters, result with usage / structured output, optional model field (present → value, absent → `None`), malformed lines ignored
+- [x] write tests for `skill_timing(events, target_skill)`: first read of `skills/<target>/SKILL.md` → `t_skill_s` + `step_idx`; reads of other skills ignored; never read → `invoked=false, t_skill_s=null`
+- [x] write tests for `render_trajectory(events, obs_trunc, max_chars, args_trunc)` matching the shape of `OpencodeSubstrate.read_trajectory`
+- [x] implement `parse_event`, `skill_timing`, `render_trajectory`
+- [x] run tests - must pass before next task
 
 ### Task 4: AgySubstrate staging — allowlist, arms, isolated HOME, shims
 
