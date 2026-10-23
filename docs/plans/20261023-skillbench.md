@@ -168,12 +168,12 @@ flowchart LR
 - Create: `harness2/benchmarks/skillbench.py` (task model part)
 - Create: `tests/test_skillbench_tasks.py`
 
-- [ ] write tests for `load_task(dir)`: valid `task.toml` + `rubric.json` + `fixture/`; errors for missing fields, 0 or > 8 criteria, duplicate criterion ids, missing `user_answers` for the 8 `ask_question` skills
-- [ ] write tests for the prompt check: rejects `<name> skill`, `/<name>`, `skills/<name>`, `SKILL.md`, `forbidden_terms`; accepts ordinary words ("add this to the backlog")
-- [ ] write tests for `build_prompt(task)`: appends the simulated-user preamble with `user_answers` in order; identical for both arms
-- [ ] write tests for `freeze(root)` → `manifest.json` and `check_manifest(root)` failing on changed/added/removed tasks; `python -m harness2.benchmarks.skillbench freeze [--force]` refuses to overwrite without `--force`
-- [ ] implement task model, prompt check, `build_prompt`, `freeze`, `check_manifest`, `__main__` entry
-- [ ] run tests - must pass before next task
+- [x] write tests for `load_task(dir)`: valid `task.toml` + `rubric.json` + `fixture/`; errors for missing fields, 0 or > 8 criteria, duplicate criterion ids, missing `user_answers` for the 8 `ask_question` skills
+- [x] write tests for the prompt check: rejects `<name> skill`, `/<name>`, `skills/<name>`, `SKILL.md`, `forbidden_terms`; accepts ordinary words ("add this to the backlog")
+- [x] write tests for `build_prompt(task)`: appends the simulated-user preamble with `user_answers` in order; identical for both arms
+- [x] write tests for `freeze(root)` → `manifest.json` and `check_manifest(root)` failing on changed/added/removed tasks; `python -m harness2.benchmarks.skillbench freeze [--force]` refuses to overwrite without `--force`
+- [x] implement task model, prompt check, `build_prompt`, `freeze`, `check_manifest`, `__main__` entry
+- [x] run tests - must pass before next task
 
 ### Task 7: agy judge (fable) with scrubbing and cache
 
