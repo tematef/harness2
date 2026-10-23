@@ -194,10 +194,10 @@ flowchart LR
 - Modify: `harness2/benchmarks/tasks.py` (`discover("skillbench")`)
 - Create: `tests/test_skillbench_adapter.py`
 
-- [ ] write tests: `discover("skillbench")` maps `<skill>/<task-id>` → domain `<skill>`; `tasks()` honours `pilot` filtering; adapter refuses to construct when `check_manifest` fails
-- [ ] write tests for every protocol member: `spec` (valid `BenchSpec`, both channels set, no "rubric"/"score" in `BenchPrompts`), `domain_of`, `task_prompt` (= `build_prompt`), `task_files`, `execute` (passes `arm` + `target_skill` via `ctx`), `delivered` (non-empty `final.md` and valid), `trajectory`, `deliverable_text` / `deliverable_files`, `base_harness` (non-empty minimal tree), `validate_tree`, `preflight`
-- [ ] implement `SkillbenchAdapter(arm, substrate="agy", split_file=None)`
-- [ ] run tests - must pass before next task
+- [x] write tests: `discover("skillbench")` maps `<skill>/<task-id>` → domain `<skill>`; `tasks()` honours `pilot` filtering; adapter refuses to construct when `check_manifest` fails
+- [x] write tests for every protocol member: `spec` (valid `BenchSpec`, both channels set, no "rubric"/"score" in `BenchPrompts`), `domain_of`, `task_prompt` (= `build_prompt`), `task_files`, `execute` (passes `arm` + `target_skill` via `ctx`), `delivered` (non-empty `final.md` and valid), `trajectory`, `deliverable_text` / `deliverable_files`, `base_harness` (non-empty minimal tree), `validate_tree`, `preflight`
+- [x] implement `SkillbenchAdapter(arm, substrate="agy", split_file=None)`
+- [x] run tests - must pass before next task
 
 ### Task 9: Arm/tag threading through the CLIs
 

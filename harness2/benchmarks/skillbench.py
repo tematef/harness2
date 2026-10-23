@@ -27,6 +27,7 @@ Task model and agy judge (the benchmark adapter builds on both):
     scrub_deliverable  redacts skill names, SKILL.md paths and plugin paths to `[redacted]`
     score              runs the isolated agy judge (`--model $SKILLBENCH_JUDGE_MODEL --json-schema`)
                        and caches judgments in `<run_dir>/judgments.json`
+    SkillbenchAdapter  BenchmarkAdapter for leave-one-out skill lift (`arm="with" | "without"`)
 
 Task layout::
 
@@ -49,23 +50,33 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from .. import config
+from ..core import runmark as RM
+from ..core import tree as HT
+from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.agy import (
+    AGY_SURFACE,
+    ARMS,
+    INSTALL_MODE,
     AgyEvent,
+    AgySubstrate,
     AgyTask,
     _kill_group,
     agy_argv,
     agy_bin,
     auth_files,
+    exec_model,
     model_guard,
     parse_event,
     resolve_agy_bin,
 )
+from .tasks import discover, select
 
 # The bundled corpus. A `skillbench/` directory next to this module holds only data (no
 # `__init__.py`), so `harness2.benchmarks.skillbench` still imports this file.
@@ -894,6 +905,276 @@ def score(
     }
     cache_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return result
+
+
+# --------------------------------------------------------------------------------------------
+# BenchmarkAdapter surface
+# --------------------------------------------------------------------------------------------
+
+_BASE_LOCK = threading.Lock()
+BASE_GEMINI_MD = "<!-- skillbench base harness -->\n"
+
+SKILLBENCH_PROMPTS = BenchPrompts(
+    work=(
+        "Software engineering assignments in a local git repository: planning features, "
+        "investigating root causes of bugs and failures, reviewing diffs, refactoring code, "
+        "and writing technical documentation or structured project artifacts."
+    ),
+    domain_word="skill domain",
+    deliverable_word="repository changes and final answer",
+    inv_levers=(
+        "- inspect the repository layout, relevant source files, and git state before editing\n"
+        "- follow applicable workflow skills when present and complete every requested step\n"
+        "- write requested files to the exact paths expected in the workspace and verify them\n"
+        "- summarize findings, decisions, and changes clearly in the final response"
+    ),
+    dom_levers=(
+        "- tailor the depth of analysis, plan structure, or code change to the task type\n"
+        "- preserve existing tests and behavior when refactoring unless asked to change them\n"
+        "- ground root-cause claims and design choices in concrete file and line evidence"
+    ),
+    yardstick=(
+        "Did the run inspect the workspace, perform the requested engineering operation, "
+        "leave the working tree and any requested files in a clean, usable state, and "
+        "provide a complete final response?"
+    ),
+    selection_checks=(
+        "Prefer the candidate that satisfies every stated requirement in the prompt, grounds "
+        "its claims in the repository files, leaves clean and working code or documentation "
+        "artifacts, and gives a clear, actionable final response."
+    ),
+)
+
+
+def _default_runs_root() -> Path:
+    raw = config.env("HARNESS2_RUNS_DIR")
+    base = Path(raw).expanduser().resolve() if raw else config.RUNS
+    return base / "skillbench"
+
+
+def _env_pilot() -> bool:
+    raw = str(config.env("SKILLBENCH_PILOT") or "").strip().lower()
+    return raw in ("1", "true", "yes")
+
+
+def skillbench_spec(*, runs_root: Path | None = None) -> BenchSpec:
+    """The skillbench `BenchSpec` on the `agy` substrate."""
+    effort = str(config.env("SKILLBENCH_EFFORT") or "high")
+    channel = ChannelSpec("claude_cli", exec_model(), effort=effort)
+    return BenchSpec(
+        name="skillbench",
+        runs_root=Path(runs_root) if runs_root is not None else _default_runs_root(),
+        install_mode=INSTALL_MODE,
+        prompts=SKILLBENCH_PROMPTS,
+        channels={"proposer": channel, "selector": channel},
+        domain_word="skill domain",
+        leak_globs=(RUBRIC_FILE, TASK_FILE, MANIFEST),
+        allow_subagents=False,
+        proposer_deliverables="contents",
+        obs_trunc=50_000,
+    )
+
+
+class SkillbenchAdapter:
+    """The `BenchmarkAdapter` surface for skillbench on the `agy` substrate.
+
+    Each adapter instance represents one arm (`"with"` or `"without"`). Constructing the
+    adapter verifies `check_manifest` against the task corpus root and refuses on drift.
+    """
+
+    def __init__(
+        self,
+        arm: str,
+        substrate: str = "agy",
+        split_file: Path | None = None,
+        *,
+        pilot: bool | None = None,
+        root: Path | None = None,
+        runs_root: Path | None = None,
+    ):
+        if arm not in ARMS:
+            raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
+        if substrate != "agy":
+            raise ValueError(f"skillbench requires substrate 'agy', got {substrate!r}")
+        self.arm = arm
+        self.split_file = split_file
+        self._pilot = pilot
+        self._root = Path(TASKS_ROOT if root is None else root)
+        self.manifest_hash = check_manifest(self._root)
+        self._tasks = load_tasks(self._root)
+        self.spec = skillbench_spec(runs_root=runs_root)
+        self._results_root = self.spec.runs_root / "results" / self.arm
+        self.substrate = AgySubstrate(
+            tasks=self._agy_task,
+            runs_root=self._results_root,
+        )
+
+    def _get_task(self, task_id: str) -> SkillbenchTask:
+        if task_id not in self._tasks:
+            raise KeyError(f"unknown skillbench task {task_id!r}")
+        return self._tasks[task_id]
+
+    def _agy_task(self, task_id: str) -> AgyTask:
+        return agy_task(self._get_task(task_id))
+
+    def tasks(self, split: str = "all", *, pilot: bool | None = None) -> list[str]:
+        pilot_only = (
+            (self._pilot if self._pilot is not None else _env_pilot())
+            if pilot is None
+            else bool(pilot)
+        )
+        if split == "pilot":
+            split = "all"
+            pilot_only = True
+        discovered = (
+            discover("skillbench")
+            if self._root == TASKS_ROOT
+            else {tid: t.target_skill for tid, t in self._tasks.items()}
+        )
+        selected = select(discovered, split, self.split_file, benchmark="skillbench")
+        if pilot_only:
+            return [tid for tid in selected if self._tasks[tid].pilot]
+        return selected
+
+    def domain_of(self, task_id: str) -> str:
+        if task_id in self._tasks:
+            return self._tasks[task_id].target_skill
+        if "/" in task_id:
+            skill, rest = task_id.split("/", 1)
+            if _NAME.fullmatch(skill) and _TASK_ID.fullmatch(rest):
+                return skill
+        raise ValueError(f"malformed skillbench task_id {task_id!r} (expected '<skill>/<task-id>')")
+
+    def reference_domain_order(self) -> list[str]:
+        return sorted({t.target_skill for t in self._tasks.values()})
+
+    def task_prompt(self, task_id: str) -> str:
+        return build_prompt(self._get_task(task_id))
+
+    def task_files(self, task_id: str) -> Path | None:
+        fix = self._get_task(task_id).fixture
+        return fix if fix.is_dir() else None
+
+    def _run_dir(self, run_id: str) -> Path:
+        return self._results_root / run_id
+
+    def _output_fingerprint(self, run_dir: Path) -> str:
+        run_dir = Path(run_dir)
+        h = hashlib.sha1()
+        for name in (SKILL_TIMING_FILE, "final.md", "diff.patch"):
+            p = run_dir / name
+            if p.is_file():
+                h.update(name.encode() + b"\0" + p.read_bytes() + b"\0")
+        h.update(b"new_files\0" + RM.fingerprint(run_dir / "new_files").encode() + b"\0")
+        h.update(b"side_effects\0" + RM.fingerprint(run_dir / "side_effects").encode() + b"\0")
+        return h.hexdigest()[:16]
+
+    def artifacts_intact(self, run_dir: Path) -> bool:
+        run_dir = Path(run_dir)
+        if not (
+            (run_dir / SKILL_TIMING_FILE).is_file()
+            and (run_dir / "final.md").is_file()
+            and (run_dir / "diff.patch").is_file()
+            and (run_dir / "events.jsonl").is_file()
+            and (run_dir / "new_files").is_dir()
+        ):
+            return False
+        marker = RM.read_mark(run_dir)
+        if marker is not None and "output_fingerprint" in marker:
+            return marker["output_fingerprint"] == self._output_fingerprint(run_dir)
+        return True
+
+    def execute(
+        self, task_id: str, harness_dir: Path | None, run_id: str, *, timeout: int | None = None
+    ) -> Path:
+        task = self._get_task(task_id)
+        out = self._run_dir(run_id)
+        mark = RM.read_mark(out) or {}
+        if (
+            RM.is_complete(out, harness_dir=harness_dir)
+            and mark.get("arm") == self.arm
+            and mark.get("target_skill") == task.target_skill
+            and self.artifacts_intact(out)
+        ):
+            return out
+        src = Path(harness_dir) if harness_dir is not None else self.base_harness()
+        install = self.substrate.materialise(
+            src,
+            self.spec,
+            {"arm": self.arm, "target_skill": task.target_skill},
+        )
+        eff_timeout = (
+            int(timeout) if timeout is not None and int(timeout) > 0 else task.timeout
+        )
+        try:
+            dirs = self.substrate.execute(task_id, install, [run_id], eff_timeout)
+        finally:
+            shutil.rmtree(install.staging_dir, ignore_errors=True)
+        out = dirs[0]
+        RM.mark_complete(
+            out,
+            run_id=run_id,
+            harness_dir=harness_dir,
+            extra={
+                "arm": self.arm,
+                "target_skill": task.target_skill,
+                "output_fingerprint": self._output_fingerprint(out),
+            },
+        )
+        return out
+
+    def delivered(self, run_dir: Path) -> bool:
+        run_dir = Path(run_dir)
+        if not rollout_valid(run_dir):
+            return False
+        final_p = run_dir / "final.md"
+        if not final_p.is_file():
+            return False
+        try:
+            return bool(final_p.read_text(encoding="utf-8", errors="replace").strip())
+        except OSError:
+            return False
+
+    def trajectory(self, run_dir: Path, *, obs_trunc: int = 50_000) -> str:
+        stream = Path(run_dir) / "events.jsonl"
+        if not stream.is_file():
+            return f"(no trajectory recorded for {Path(run_dir).name})"
+        return self.substrate.read_trajectory(stream, obs_trunc=obs_trunc, max_chars=10**9)
+
+    def deliverable_files(self, run_dir: Path) -> dict[str, str]:
+        return deliverable_files(run_dir)
+
+    def deliverable_text(self, run_dir: Path) -> str:
+        return deliverable_text(run_dir)
+
+    def base_harness(self) -> Path:
+        d = self.spec.runs_root / f"_base_harness_{os.getpid()}"
+        with _BASE_LOCK:
+            if not HT.is_tree(AGY_SURFACE, d):
+                HT.write_tree(AGY_SURFACE, {"GEMINI.md": BASE_GEMINI_MD}, d, stubs=False)
+        return d
+
+    def validate_tree(self, tree: dict[str, str]) -> None:
+        if not isinstance(tree, dict) or not any(k in tree for k in AGY_SURFACE.always_on):
+            raise ValueError("skillbench harness tree must define GEMINI.md")
+        bad = [k for k in tree if not HT.is_allowed(AGY_SURFACE, k)]
+        if bad:
+            raise ValueError(f"path(s) off the agy editable surface: {bad}")
+        HT.validate(
+            AGY_SURFACE,
+            tree,
+            allow_subagents=self.spec.allow_subagents,
+            reserved_scripts=HT.RESERVED_SCRIPTS | self.spec.reserved_scripts,
+        )
+
+    def preflight(self) -> None:
+        self.substrate.preflight()
+        check_manifest(self._root)
+        judge_repeat()
+
+    def score(self, run_dir: Path, task_id: str) -> dict | None:
+        task = self._tasks.get(task_id, task_id)
+        return score(run_dir, task, root=self._root)
 
 
 # --------------------------------------------------------------------------------------------

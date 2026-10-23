@@ -49,6 +49,11 @@ def discover(bench: str, subset: str | None = None) -> dict[str, str]:
             if not (p.parent / "instruction.md").is_file():
                 raise FileNotFoundError(f"Missing task instructions: {p.parent / 'instruction.md'}")
             tasks[p.parent.name] = domain.strip()
+    elif bench == "skillbench" and subset is None:
+        from . import skillbench
+
+        root = skillbench.TASKS_ROOT
+        tasks = {tid: d.parent.name for tid, d in skillbench.task_dirs(root).items()}
     else:
         raise ValueError(f"Unknown benchmark/subset: {bench}/{subset}")
     if not tasks:
