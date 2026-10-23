@@ -25,10 +25,18 @@ from harness2.preflight import check
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     add_cell_args(p)
+    p.add_argument(
+        "--pilot",
+        action="store_true",
+        help="skillbench only: restrict task count to pilot tasks (pilot = true)",
+    )
     args = p.parse_args(argv)
     arm = args.arm or ("with" if args.bench == "skillbench" else None)
     try:
-        adapter = make_adapter(args.bench, args.subset, args.substrate, arm=arm)
+        adapter_kw = {"arm": arm}
+        if args.pilot:
+            adapter_kw["pilot"] = True
+        adapter = make_adapter(args.bench, args.subset, args.substrate, **adapter_kw)
         errors = check(adapter, judge=True)
     except (OSError, RuntimeError, ValueError) as exc:
         errors = [str(exc)]

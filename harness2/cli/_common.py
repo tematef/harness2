@@ -68,6 +68,8 @@ def make_adapter(
     substrate: str | None = None,
     split_file: Path | None = None,
     arm: str | None = None,
+    *,
+    pilot: bool | None = None,
 ) -> BenchmarkAdapter:
     """The one place a CLI turns (--bench, --subset, --substrate, --arm) into an adapter."""
     if bench not in BENCHES:
@@ -90,9 +92,13 @@ def make_adapter(
             raise ValueError(f"--bench skillbench requires --arm from {ARMS}, got {arm!r}")
         from ..benchmarks.skillbench import SkillbenchAdapter
 
-        return SkillbenchAdapter(arm, substrate=substrate, split_file=split_file)
+        return SkillbenchAdapter(
+            arm, substrate=substrate, split_file=split_file, pilot=pilot
+        )
     if arm is not None:
         raise ValueError(f"--arm applies to --bench skillbench only, got {arm!r} for {bench}")
+    if pilot:
+        raise ValueError(f"--pilot applies to --bench skillbench only, got {bench!r}")
     if bench == "wb":
         if subset not in WB_SUBSETS:
             raise ValueError(f"--bench wb needs --subset from {WB_SUBSETS}, got {subset!r} ")

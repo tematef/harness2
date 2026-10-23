@@ -993,6 +993,7 @@ class SkillbenchAdapter:
         split_file: Path | None = None,
         *,
         pilot: bool | None = None,
+        pilot_only: bool | None = None,
         root: Path | None = None,
         runs_root: Path | None = None,
     ):
@@ -1002,7 +1003,7 @@ class SkillbenchAdapter:
             raise ValueError(f"skillbench requires substrate 'agy', got {substrate!r}")
         self.arm = arm
         self.split_file = split_file
-        self._pilot = pilot
+        self._pilot = pilot if pilot is not None else pilot_only
         self._root = Path(TASKS_ROOT if root is None else root)
         self.manifest_hash = check_manifest(self._root)
         self._tasks = load_tasks(self._root)

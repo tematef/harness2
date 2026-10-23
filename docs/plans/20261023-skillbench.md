@@ -274,9 +274,9 @@ flowchart LR
 - Create: `scripts/run_skillbench.sh`
 - Create: `tests/test_skillbench_e2e.py`
 
-- [ ] write the e2e test first (stub, `HOME=<tmp>`): full chain on 1 skill × 1 task × k=1 → `report.md` with one row, both arms in separate namespaces
-- [ ] create `scripts/run_skillbench.sh` mirroring `run_lab.sh`: `harness2-check` → `harness2 --arm with` → `harness2 --arm without` → `harness2-judge --bases` per arm → `skillbench-report`; honours `K`, `SEED`, `PILOT=1` (sets `SKILLBENCH_JUDGE_REPEAT=2`, `--pilot`), extra args
-- [ ] run tests - must pass before next task
+- [x] write the e2e test first (stub, `HOME=<tmp>`): full chain on 1 skill × 1 task × k=1 → `report.md` with one row, both arms in separate namespaces
+- [x] create `scripts/run_skillbench.sh` mirroring `run_lab.sh`: `harness2-check` → `harness2 --arm with` → `harness2 --arm without` → `harness2-judge --bases` per arm → `skillbench-report`; honours `K`, `SEED`, `PILOT=1` (sets `SKILLBENCH_JUDGE_REPEAT=2`, `--pilot`), extra args
+- [x] run tests - must pass before next task
 
 ### Task 15: Verify acceptance criteria
 - [ ] verify lift + CI + verdict and time-to-skill are produced per skill from the stub chain

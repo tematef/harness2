@@ -145,22 +145,103 @@ def emit(line, mapping, cwd):
     apply_write(rewritten, cwd)
 
 
+def auto_judge_events(prompt):
+    """Synthesize a valid judge stream matching the criterion IDs in ``prompt``."""
+    rubric_block = prompt or ""
+    if "## Rubric\n" in rubric_block:
+        rubric_block = rubric_block.split("## Rubric\n", 1)[1]
+    if "\n\n## Deliverable\n" in rubric_block:
+        rubric_block, deliverable = rubric_block.split("\n\n## Deliverable\n", 1)
+    else:
+        deliverable = ""
+    cids = []
+    for line in rubric_block.splitlines():
+        if line.startswith("- ") and ":" in line:
+            cid = line[2:].split(":", 1)[0].strip()
+            if cid:
+                cids.append(cid)
+    if not cids:
+        cids = ["c1", "c2"]
+    has_new_files = "### new_files\n(none)" not in deliverable
+    criteria = [
+        {
+            "id": cid,
+            "pass": True if has_new_files else (i % 2 == 0),
+            "reason": (
+                "Deliverable satisfies criterion."
+                if (has_new_files or i % 2 == 0)
+                else "Criterion not satisfied."
+            ),
+        }
+        for i, cid in enumerate(cids)
+    ]
+    return [
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "state": "DONE",
+                "text_delta": "grading done",
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "structured_output": {"criteria": criteria},
+                "usage": {"total_tokens": 512},
+            },
+        },
+    ]
+
+
+def select_scenario(flags, cwd):
+    """Return ``("auto", None)`` for synthesized judge output, else ``("fixture", name)``."""
+    raw_scenario = os.environ.get("AGY_STUB_SCENARIO")
+    if "json_schema" in flags:
+        judge_scenario = os.environ.get("AGY_STUB_JUDGE_SCENARIO")
+        if judge_scenario == "auto" or (
+            not judge_scenario and raw_scenario in (None, "", "skill_read")
+        ):
+            return ("auto", None)
+        if judge_scenario:
+            return ("fixture", judge_scenario)
+    else:
+        posix_cwd = cwd.as_posix()
+        with_scen = os.environ.get("AGY_STUB_WITH_SCENARIO")
+        without_scen = os.environ.get("AGY_STUB_WITHOUT_SCENARIO")
+        if with_scen and "/results/with/" in posix_cwd:
+            return ("fixture", with_scen)
+        if without_scen and "/results/without/" in posix_cwd:
+            return ("fixture", without_scen)
+    return ("fixture", raw_scenario or DEFAULT_SCENARIO)
+
+
 def main(argv):
     home = os.environ.get("HOME", "")
+    flags = parse_flags(argv)
     if log_path := os.environ.get("AGY_STUB_LOG"):
         write_log(log_path, argv, home)
     if "--version" in argv:
         print("agy-stub 0.0.0")
         return 0
-    scenario = os.environ.get("AGY_STUB_SCENARIO") or DEFAULT_SCENARIO
-    fixture = resolve_scenario(scenario)
-    if fixture is None:
-        print(f"agy-stub: unknown scenario {scenario!r} (looked in {FIXTURES})", file=sys.stderr)
-        return 2
-    sleep_s = float(os.environ.get("AGY_STUB_SLEEP") or 0)
     cwd = Path.cwd().resolve()
+    mode, scenario = select_scenario(flags, cwd)
+    sleep_s = float(os.environ.get("AGY_STUB_SLEEP") or 0)
     mapping = [(PLACEHOLDER_HOME, home), (PLACEHOLDER_WORK, str(cwd))]
-    for line in fixture.read_text(encoding="utf-8").splitlines():
+    if mode == "auto":
+        lines = [
+            json.dumps(ev, ensure_ascii=False, separators=(",", ":"))
+            for ev in auto_judge_events(flags.get("prompt", ""))
+        ]
+    else:
+        fixture = resolve_scenario(scenario)
+        if fixture is None:
+            print(
+                f"agy-stub: unknown scenario {scenario!r} (looked in {FIXTURES})", file=sys.stderr
+            )
+            return 2
+        lines = fixture.read_text(encoding="utf-8").splitlines()
+    for line in lines:
         if not line:
             continue
         if sleep_s:

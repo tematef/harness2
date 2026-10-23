@@ -79,6 +79,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "(implied by --bench skillbench)",
     )
     g.add_argument(
+        "--pilot",
+        action="store_true",
+        help="skillbench only: restrict the stream to pilot tasks (pilot = true)",
+    )
+    g.add_argument(
         "--dry-run",
         action="store_true",
         help="print the stream order, the namespaces and the split's domains, then "
@@ -149,8 +154,11 @@ def _main(args: argparse.Namespace) -> int:
     if args.k < 1 or args.workers < 1:
         raise ValueError("--k and --workers must be positive")
     modes = C.parse_modes(args.modes)
+    adapter_kw: dict[str, object] = {"arm": args.arm}
+    if getattr(args, "pilot", False):
+        adapter_kw["pilot"] = True
     adapter = C.make_adapter(
-        args.bench, args.subset, args.substrate, args.split_file, arm=args.arm
+        args.bench, args.subset, args.substrate, args.split_file, **adapter_kw
     )
     tag = C.arm_tag(args.bench, args.arm)
 
