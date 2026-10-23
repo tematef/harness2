@@ -279,12 +279,12 @@ flowchart LR
 - [x] run tests - must pass before next task
 
 ### Task 15: Verify acceptance criteria
-- [ ] verify lift + CI + verdict and time-to-skill are produced per skill from the stub chain
-- [ ] verify isolation: during the e2e test, walk-and-hash the tmp `HOME` before/after (unchanged) and assert nothing written outside the run root
-- [ ] verify model-guard fallback, judge-`None` paths and invalid reps are excluded, not zeroed
-- [ ] verify existing benches unaffected: `tests/test_workflow.py` and `harness2-demo --k 1` pass
-- [ ] run full test suite: `python -m unittest discover -s tests -v`
-- [ ] run linter: `ruff check .`
+- [x] verify lift + CI + verdict and time-to-skill are produced per skill from the stub chain
+- [x] verify isolation: during the e2e test, walk-and-hash the tmp `HOME` before/after (unchanged) and assert nothing written outside the run root
+- [x] verify model-guard fallback, judge-`None` paths and invalid reps are excluded, not zeroed
+- [x] verify existing benches unaffected: `tests/test_workflow.py` and `harness2-demo --k 1` pass
+- [x] run full test suite: `python -m unittest discover -s tests -v`
+- [x] run linter: `ruff check .`
 
 ### Task 16: [Final] Update documentation
 - [ ] add a `skillbench` section to `docs/BENCHMARKS.md` (task format, arms, allowlist, shims, metrics, power note, env vars, cost gates) and the agy substrate to `docs/SETUP.md`

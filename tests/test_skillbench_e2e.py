@@ -333,6 +333,258 @@ class TestRunSkillbenchEndToEnd(_E2ECase):
         self.assertEqual(len(exec_calls), 2)
         self.assertEqual(len(judge_calls), 2)
 
+        # Isolation: fake HOME and plugins dir are byte-identical before/after, and nothing was
+        # written outside self.runs_dir (except self.stub_log).
+        self.assertEqual(_tree_hash(self.home), self.home_before)
+        for p in self.tmp.rglob("*"):
+            if not p.is_file() or p == self.stub_log:
+                continue
+            self.assertTrue(
+                p.is_relative_to(self.home)
+                or p.is_relative_to(self.plugins)
+                or p.is_relative_to(self.runs_dir),
+                f"unexpected file written outside run root: {p}",
+            )
+        for call in calls:
+            self.assertTrue(
+                Path(call["home"]).resolve().is_relative_to(self.runs_dir.resolve()),
+                f"stub HOME outside runs_dir: {call['home']}",
+            )
+            self.assertTrue(
+                Path(call["cwd"]).resolve().is_relative_to(self.runs_dir.resolve()),
+                f"stub cwd outside runs_dir: {call['cwd']}",
+            )
+
+    def test_multi_skill_stub_chain_produces_lift_ci_verdict_and_time_to_skill_per_skill(
+        self,
+    ) -> None:
+        # Custom WITH scenario that reads both target skills and writes a deliverable file.
+        multi_read = self.tmp / "multi_skill_read.jsonl"
+        events = [
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE",
+                    "tool_name": "view_file",
+                    "tool_info": {
+                        "name": "view_file",
+                        "parameters": {
+                            "AbsolutePath": (
+                                "/tmp/skillbench-run/home/.gemini/config/plugins/"
+                                "planning/skills/make-plan/SKILL.md"
+                            )
+                        },
+                    },
+                },
+            },
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE",
+                    "tool_name": "view_file",
+                    "tool_info": {
+                        "name": "view_file",
+                        "parameters": {
+                            "AbsolutePath": (
+                                "/tmp/skillbench-run/home/.gemini/config/plugins/"
+                                "review/skills/code-review-refactor/SKILL.md"
+                            )
+                        },
+                    },
+                },
+            },
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE",
+                    "tool_name": "write_to_file",
+                    "tool_info": {
+                        "name": "write_to_file",
+                        "parameters": {
+                            "TargetFile": "/tmp/skillbench-run/work/DELIVERABLE.md",
+                            "CodeContent": "# Deliverable\nDone.\n",
+                        },
+                    },
+                },
+            },
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "DONE",
+                    "text_delta": "Completed task.",
+                },
+            },
+            {"event": "result", "result": {"usage": {"total_tokens": 1024}}},
+        ]
+        _write(multi_read, "".join(json.dumps(e) + "\n" for e in events))
+
+        plugins_before = _tree_hash(self.plugins)
+        proc = self.run_script(
+            "--only-domains",
+            "make-plan,code-review-refactor",
+            K="2",
+            SEED="7",
+            PILOT="1",
+            SKILLBENCH_JUDGE_REPEAT="1",
+            AGY_STUB_WITH_SCENARIO=str(multi_read),
+            AGY_STUB_WITHOUT_SCENARIO="plain_answer",
+            AGY_STUB_JUDGE_SCENARIO="auto",
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"multi-skill run_skillbench.sh failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+        )
+        self.assertEqual(_tree_hash(self.home), self.home_before)
+        self.assertEqual(_tree_hash(self.plugins), plugins_before)
+
+        report = json.loads(
+            (self.runs_dir / "skillbench" / "report.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(sorted(report["by_skill"]), ["code-review-refactor", "make-plan"])
+        expected_by_skill = {
+            "code-review-refactor": (0.6, 0.4, "0.60", "+0.40 [+0.40, +0.40]"),
+            "make-plan": (0.5, 0.5, "0.50", "+0.50 [+0.50, +0.50]"),
+        }
+        for skill_name, (exp_without, exp_lift, _, _) in expected_by_skill.items():
+            row = report["by_skill"][skill_name]
+            self.assertEqual(row["n_tasks"], 2)
+            self.assertEqual(row["n_qualifying_tasks"], 2)
+            self.assertAlmostEqual(row["with_mean"], 1.0)
+            self.assertAlmostEqual(row["without_mean"], exp_without)
+            self.assertAlmostEqual(row["lift"], exp_lift)
+            self.assertAlmostEqual(row["ci_low"], exp_lift)
+            self.assertAlmostEqual(row["ci_high"], exp_lift)
+            self.assertEqual(row["verdict"], "helps")
+            self.assertEqual(row["invoked"], 4)
+            self.assertEqual(row["valid_with_reps"], 4)
+            self.assertAlmostEqual(row["invocation_rate"], 1.0)
+            self.assertIsNotNone(row["t_skill_p50"])
+            self.assertIsNotNone(row["t_skill_p90"])
+            self.assertEqual(row["invalid_total"], 0)
+
+        md = (self.runs_dir / "skillbench" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("model unverified (agy reports no model)", md)
+        table = {r[0]: r for r in _table_rows(md)}
+        self.assertEqual(sorted(table), ["code-review-refactor", "make-plan"])
+        for skill_name, (_, _, exp_without_str, exp_lift_str) in expected_by_skill.items():
+            cells = table[skill_name]
+            self.assertEqual(cells[1], "2", skill_name)
+            self.assertEqual(cells[2], "1.00", skill_name)
+            self.assertEqual(cells[3], exp_without_str, skill_name)
+            self.assertEqual(cells[4], exp_lift_str, skill_name)
+            self.assertEqual(cells[5], "helps", skill_name)
+            self.assertEqual(cells[6], "4/4 (100%)", skill_name)
+            self.assertNotEqual(cells[7], "—", skill_name)
+            self.assertEqual(cells[8], "0", skill_name)
+
+    def test_model_guard_fallback_judge_none_and_invalid_reps_excluded_not_zeroed(self) -> None:
+        from harness2.cli import judge as judge_cli
+        from harness2.cli import skillbench_report as SR
+
+        # Roll k=3 on 1 skill x 1 task via the CLI:
+        # - base1: valid rollout with no model field (model-guard fallback -> valid, score=6/6=1.0)
+        # - base2: invalid rollout due to model mismatch (result_model_mismatch -> invalid, score=None)
+        # - base3: valid rollout whose judge call fails (malformed output -> score=None)
+        # Verify base2 and base3 are excluded (not zeroed), so WITH mean is 1.0 (not 1/3 or 1/2).
+        with mock.patch.dict(os.environ, self.base_env()):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_with = sweep_cli.main(
+                    [
+                        "--bench",
+                        "skillbench",
+                        "--arm",
+                        "with",
+                        "--k",
+                        "3",
+                        "--only-domains",
+                        "make-plan",
+                        "--max-tasks",
+                        "1",
+                    ]
+                )
+                rc_without = sweep_cli.main(
+                    [
+                        "--bench",
+                        "skillbench",
+                        "--arm",
+                        "without",
+                        "--k",
+                        "3",
+                        "--only-domains",
+                        "make-plan",
+                        "--max-tasks",
+                        "1",
+                    ]
+                )
+            self.assertEqual((rc_with, rc_without), (0, 0))
+
+            adapt_dir = self.runs_dir / "skillbench" / "adapt"
+            with_ns = adapt_dir / "skillbench-agy-agg3-with"
+            without_ns = adapt_dir / "skillbench-agy-agg3-without"
+            with_summary = json.loads(
+                next(with_ns.glob("*/summary.json")).read_text(encoding="utf-8")
+            )
+
+            # Mutate base2's skill_timing.json to simulate a model-guard mismatch rollout
+            base2_dir = Path(with_summary["base"][1]["run_dir"])
+            timing2 = json.loads((base2_dir / "skill_timing.json").read_text(encoding="utf-8"))
+            timing2["valid"] = False
+            timing2["actual_model"] = "gemini-2.5-flash"
+            timing2["invalid_reason"] = (
+                "model mismatch: requested 'opus', agy reported 'gemini-2.5-flash'"
+            )
+            (base2_dir / "skill_timing.json").write_text(
+                json.dumps(timing2, indent=2) + "\n", encoding="utf-8"
+            )
+
+            # Judge WITH arm: base1 gets 6/6, base2 is invalid -> None without calling judge,
+            # and force base3's judge call to return None (malformed judge stream).
+            real_score = SB.SkillbenchAdapter.score
+            base3_dir = Path(with_summary["base"][2]["run_dir"]).resolve()
+
+            def score_with_one_judge_none(adapter_self, run_dir: Path, task_id: str):
+                if Path(run_dir).resolve() == base3_dir:
+                    with mock.patch.dict(
+                        os.environ, {"AGY_STUB_JUDGE_SCENARIO": "malformed_line"}
+                    ):
+                        return real_score(adapter_self, run_dir, task_id)
+                return real_score(adapter_self, run_dir, task_id)
+
+            with (
+                mock.patch.object(SB.SkillbenchAdapter, "score", score_with_one_judge_none),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                rc_jw = judge_cli.main(
+                    ["--bench", "skillbench", "--arm", "with", "--k", "3", "--bases"]
+                )
+                rc_jwo = judge_cli.main(
+                    ["--bench", "skillbench", "--arm", "without", "--k", "3", "--bases"]
+                )
+            # judge_bases returns 2 when some rows are ungraded (base2, base3) and 0 when all graded
+            self.assertEqual((rc_jw, rc_jwo), (2, 0))
+
+            rep = SR.build_report(with_ns, without_ns, draws=200)
+            self.assertFalse(rep["exec_model_verified"])
+            row = rep["by_skill"]["make-plan"]
+            t_entry = row["tasks"]["make-plan/token-bucket-limiter"]
+            # Only base1 (1.0) is in with_fracs; base2 (invalid) and base3 (judge None) are excluded!
+            self.assertEqual(t_entry["with_fracs"], [1.0])
+            self.assertAlmostEqual(row["with_mean"], 1.0)
+            self.assertEqual(row["invalid_with"], 1)
+            self.assertEqual(row["ungraded_with"], 1)
+            self.assertEqual(
+                row["invalid_by_reason"],
+                {"model mismatch: requested 'opus', agy reported 'gemini-2.5-flash'": 1},
+            )
+            # Valid WITH reps = 2 (base1 and base3); base2 (invalid) is excluded from invocation rate too
+            self.assertEqual(row["valid_with_reps"], 2)
+            self.assertEqual(row["invoked"], 2)
+
     def test_pilot_and_seed_and_k_settings_honoured(self) -> None:
         proc = self.run_script(
             "--only-domains",

@@ -24,6 +24,7 @@ from unittest.mock import Mock, patch
 
 from harness2 import config
 from harness2.cli import _common as C
+from harness2.cli import demo as demo_cli
 from harness2.cli import judge as judge_cli
 from harness2.cli import run_sweep as sweep_cli
 from harness2.core import context, judge, recursion, schedule, tree
@@ -428,6 +429,16 @@ class WorkflowTests(unittest.TestCase):
                 ("ledger-2", "base2", {"n_passed": 2, "n_criteria": 2}),
             ],
         )
+
+    def test_harness2_demo_cli_k1(self):
+        demo_out = self.root / "demo_out"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = demo_cli.main(["--k", "1", "--output", str(demo_out)])
+        self.assertEqual(rc, 0)
+        self.assertIn("2 tasks completed; 0 failed", buf.getvalue())
+        report = json.loads((demo_out / "demo.json").read_text(encoding="utf-8"))
+        self.assertEqual((report["done"], report["failed"]), (2, 0))
 
 
 if __name__ == "__main__":
