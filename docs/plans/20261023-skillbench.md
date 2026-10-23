@@ -250,11 +250,11 @@ flowchart LR
 - Modify: `pyproject.toml` (`skillbench-report` script)
 - Create: `tests/test_skillbench_report.py`
 
-- [ ] write tests on synthetic namespaces (`base_judged.json` + `summary.json` → `base[].run_dir` → `skill_timing.json`, `judgments.json`): paired deltas on `frac`, lift, bootstrap CI reproducible for a fixed seed, verdict thresholds incl. `insufficient data` (pilot threshold)
-- [ ] write tests: invalid reps counted per reason and excluded; time-to-skill p50/p90 over invoked reps; invocation-rate denominator = valid WITH reps; "model unverified" header when `actual_model` is null
-- [ ] write tests: judge-noise rate (criterion-level disagreement between repeated judgments) when repeats exist; power note always present
-- [ ] implement the report (stdlib only — `random`, `statistics`) writing `report.json` + `report.md`
-- [ ] run tests - must pass before next task
+- [x] write tests on synthetic namespaces (`base_judged.json` + `summary.json` → `base[].run_dir` → `skill_timing.json`, `judgments.json`): paired deltas on `frac`, lift, bootstrap CI reproducible for a fixed seed, verdict thresholds incl. `insufficient data` (pilot threshold)
+- [x] write tests: invalid reps counted per reason and excluded; time-to-skill p50/p90 over invoked reps; invocation-rate denominator = valid WITH reps; "model unverified" header when `actual_model` is null
+- [x] write tests: judge-noise rate (criterion-level disagreement between repeated judgments) when repeats exist; power note always present
+- [x] implement the report (stdlib only — `random`, `statistics`) writing `report.json` + `report.md`
+- [x] run tests - must pass before next task
 
 ### Task 13: Pilot corpus
 
