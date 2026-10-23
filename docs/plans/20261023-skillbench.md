@@ -27,13 +27,12 @@
 - **Installed plugins** in `~/.gemini/config/plugins/` also include `revmux` (spawns nested agy runs), `googlecloudtools.datacloud_telemetry`, `agterm-ide-launcher` — must not be staged.
 - **Environment**: `agy` not installed on the dev host; Python 3.13 only (pyproject allows 3.12–3.13); no `uv`; tests are stdlib `unittest` (`tests/test_workflow.py`); ruff config in `pyproject.toml`.
 
-## Prerequisites (before Task 1)
-- install `agy` on the dev host, or point `HARNESS2_AGY_BIN` at the `jetski` alias, and authenticate it
-- user approves the small spike spend (≈ 8 short `agy -p` calls on opus and fable)
-- tasks 2–16 never call a real model; everything after Task 1 runs against the stub
+## Prerequisites
+- none for Tasks 1–16: implementation is fully offline. `agy` is not installed on the dev host, so Task 1 builds **synthetic** stream-json fixtures from revmux's decoder, and every later task runs against the stub
+- `agy` (or `HARNESS2_AGY_BIN` → `jetski` alias) is needed only for the **pre-pilot spike** in Post-Completion, which checks the synthetic fixtures against real streams
 
 ## Development Approach
-- **testing approach**: TDD — write failing tests first, then code. `agy` is faked by `tests/fixtures/agy_stub.py`, selected through `HARNESS2_AGY_BIN`, replaying stream-json captured in the Task 1 spike.
+- **testing approach**: TDD — write failing tests first, then code. `agy` is faked by `tests/fixtures/agy_stub.py`, selected through `HARNESS2_AGY_BIN`, replaying the synthetic stream-json fixtures from Task 1 (reconciled with real streams in the pre-pilot spike).
 - complete each task fully before moving to the next
 - make small, focused changes
 - **CRITICAL: every task MUST include new/updated tests** for code changes in that task
@@ -73,8 +72,8 @@ flowchart LR
 ```
 - **Arms = tags, end to end.** `--arm with|without` (required for `--bench skillbench`) flows `run_sweep`/`judge` → `make_adapter(arm=)` → `SkillbenchAdapter(arm)` → substrate `ctx`, and becomes the Harness² run `tag`, so each arm has its own namespace, identity and library root. Domain = target skill, so `--only-domains <skill>` selects one skill.
 - **Leave-one-out over an allowlist.** Plugins come from `SKILLBENCH_PLUGINS_DIR` (a cc-thingz `plugins/` checkout, required) filtered by `SKILLBENCH_PLUGINS` (default `brainstorm,planning,review,skill-eval,thinking-tools,workflow`). WITHOUT drops only `skills/<target>/`; hooks (incl. `skill-eval`) stay in both arms.
-- **Isolation.** Per rollout: throwaway `HOME` holding only the arm's plugins and the agy auth files (copied, or symlinked only if the spike shows agy never writes them); fresh `git init` copy of the fixture as cwd. **Side-effect shims** in both arms: `EDITOR=VISUAL=true`, PATH shims `xclip xsel wl-copy pbcopy revdiff` that write stdin to `<run>/side_effects/<tool>.txt`.
-- **Simulated user.** Default: identical preamble appended to the prompt in both arms — "The user is unavailable. When you would ask a question, take these answers in order: …; otherwise proceed with your recommended option. Never open an editor or interactive review." A `PreToolUse` answer hook is built only if the spike proves AGY hooks can return answers (AGY's documented `PreToolUse` contract returns only `decision`).
+- **Isolation.** Per rollout: throwaway `HOME` holding only the arm's plugins and the agy auth files (always copied, never symlinked, so a token refresh can't write through to the real `$HOME`); fresh `git init` copy of the fixture as cwd. **Side-effect shims** in both arms: `EDITOR=VISUAL=true`, PATH shims `xclip xsel wl-copy pbcopy revdiff` that write stdin to `<run>/side_effects/<tool>.txt`.
+- **Simulated user.** Default: identical preamble appended to the prompt in both arms — "The user is unavailable. When you would ask a question, take these answers in order: …; otherwise proceed with your recommended option. Never open an editor or interactive review." A `PreToolUse` answer hook is not built now; it is considered only if the pre-pilot spike proves AGY hooks can return answers (AGY's documented `PreToolUse` contract returns only `decision`).
 - **Judge independence.** Separate `agy --model fable --json-schema` call in an empty HOME (no plugins); input = rubric + scrubbed deliverable (skill names and `SKILL.md`/plugin paths replaced with `[redacted]`); no trajectory, no arm label. Judgments cached per run dir.
 - **Model guard (with fallback).** If stream-json exposes a model field, record `actual_model` and invalidate reps where it disagrees; if not, record `actual_model=null` and flag the report header "model unverified (agy reports no model)" without invalidating anything.
 - **Frozen tasks.** `manifest.json` holds sha256 per task dir; runs refuse to start on drift.
@@ -87,7 +86,7 @@ flowchart LR
   - prompt check rejects explicit invocation only: `<name> skill`, `/<name>`, `skills/<name>`, `SKILL.md`, and any `forbidden_terms`; ordinary words (`backlog`, `learn`, `wrong`) are allowed
 - **Run dir outputs** (per rollout): `events.jsonl` (each line + `t` seconds since spawn), `final.md`, `diff.patch`, `new_files/`, `side_effects/`, `skill_timing.json` `{invoked, t_skill_s, step_idx, t_total_s, requested_model, actual_model|null, valid, invalid_reason}`, `judgments.json` (cache).
 - **Judge schema**: `{"criteria": [{"id": str, "pass": bool, "reason": str}]}` → `{n_passed, n_criteria}`; malformed / unknown ids / timeout / disagreeing model field ⇒ `None`. Cache key: judge model + rubric sha256 + deliverable sha256. `SKILLBENCH_JUDGE_REPEAT` (default 1; pilot 2) stores repeated judgments; the score uses the first.
-- **Env (`.env`)**: `HARNESS2_AGY_BIN` (default `agy`), `SKILLBENCH_PLUGINS_DIR` (required), `SKILLBENCH_PLUGINS` (allowlist), `SKILLBENCH_AUTH_FILES` (from spike), `SKILLBENCH_EXEC_MODEL=opus`, `SKILLBENCH_JUDGE_MODEL=fable`, `SKILLBENCH_EFFORT` (pinned, same in both arms), `SKILLBENCH_JUDGE_REPEAT`.
+- **Env (`.env`)**: `HARNESS2_AGY_BIN` (default `agy`), `SKILLBENCH_PLUGINS_DIR` (required), `SKILLBENCH_PLUGINS` (allowlist), `SKILLBENCH_AUTH_FILES` (required comma list relative to `$HOME`; confirmed in the pre-pilot spike), `SKILLBENCH_EXEC_MODEL=opus`, `SKILLBENCH_JUDGE_MODEL=fable`, `SKILLBENCH_EFFORT` (pinned, same in both arms), `SKILLBENCH_JUDGE_REPEAT`.
 - **Lift**: per task `d_t = mean_k(frac WITH) − mean_k(frac WITHOUT)` over valid graded reps; `lift = mean_t(d_t)`; 95% CI by two-level bootstrap (resample tasks, then reps within task; 10 000 draws; fixed seed). `helps` if CI low > 0, `hurts` if CI high < 0, else `inconclusive`; `insufficient data` if < 3 tasks (pilot: < 2) have ≥ 2 valid reps in both arms.
 - **Time-to-skill**: invocation rate = invoked / valid WITH reps; p50 / p90 of `t_skill_s` over invoked reps. Located via `summary.json` → `base[].run_dir` → `skill_timing.json`.
 - **Report**: `report.json` + `report.md` table `skill | tasks | WITH | WITHOUT | lift [95% CI] | verdict | invoked | t_skill p50/p90 | invalid`; header: requested/actual models (or "unverified"), manifest hash, seed, k, judge-noise rate, statistical-power note.
@@ -99,18 +98,19 @@ flowchart LR
 
 ## Implementation Steps
 
-### Task 1: Spike — headless agy behavior and fixtures
+### Task 1: Synthetic agy stream-json fixtures and deferred spike script
 
 **Files:**
+- Create: `tests/fixtures/agy/*.jsonl`
+- Create: `tests/test_agy_fixtures.py`
 - Create: `scripts/agy_spike.sh`
 - Create: `docs/skillbench-spike.md`
-- Create: `tests/fixtures/agy/*.jsonl`
 
-- [ ] create `scripts/agy_spike.sh` with probes on `--model opus` and `--model fable`: plain answer; a prompt that triggers a skill read; a prompt that makes a skill call `ask_question`; `--json-schema` structured output; all under `HOME=<tmp>` with a staged plugin dir
-- [ ] record in `docs/skillbench-spike.md`: accepted model aliases; whether any event carries the actual model; how a skill read appears (`view_file` path vs dedicated tool); what `ask_question` does under `-p`; whether a `PreToolUse` hook can supply an answer; skills still discoverable with `--disable-slash-commands`; default `--effort`
-- [ ] record auth: which `$HOME` files agy needs, and whether it writes them during a run (decides copy vs symlink); confirm plugin discovery comes only from `<tmp>/.gemini/config/plugins/`
-- [ ] save captured streams (secrets scrubbed) to `tests/fixtures/agy/`
-- [ ] no unit tests (exploratory); mark any contradiction with Tasks 3–7 in this plan with ⚠️
+- [ ] derive the event shape from `~/projects/revmux/app/executor/agy.go` (`event`, `result{structured_output, usage.total_tokens}`, `step_update{step_type, state, tool_name, text_delta, tool_info{name, parameters}}`) and write synthetic fixtures: plain answer; skill read (`view_file` on `.../skills/<x>/SKILL.md`, plus a read of a different skill); `ask_question` call; `--json-schema` structured result; result with and without a model field; one malformed line
+- [ ] write `tests/test_agy_fixtures.py` (stdlib only, no harness2 import): every fixture line except the deliberate malformed one is valid JSON matching the revmux event shape; each scenario named in `docs/skillbench-spike.md` has a fixture
+- [ ] create `scripts/agy_spike.sh` (**not run now**): probes on `--model opus` / `--model fable` — plain answer, skill read, `ask_question`, `--json-schema` — under `HOME=<tmp>` with a staged plugin dir; saves streams to `tests/fixtures/agy/real/` with secrets scrubbed; records auth files read/written
+- [ ] create `docs/skillbench-spike.md`: each open question (model aliases; model field in stream; how a skill read appears; `ask_question` under `-p`; `PreToolUse` answer hook; skills under `--disable-slash-commands`; default `--effort`; auth files and whether agy writes them; plugin discovery only from `<tmp>` HOME) with the **assumed** answer used by the synthetic fixtures, each marked "assumed — verify in pre-pilot spike"
+- [ ] run tests - must pass before next task
 
 ### Task 2: agy stub binary and dev environment
 
@@ -143,7 +143,7 @@ flowchart LR
 - Create: `tests/test_agy_staging.py`
 
 - [ ] write tests: `materialise(tree_dir, spec, ctx={"arm": "with", ...})` stages only allowlisted plugins from `SKILLBENCH_PLUGINS_DIR` (symlinks resolved) into `<run>/home/.gemini/config/plugins/`; unlisted plugins (e.g. `revmux`) never staged; `arm=without, target_skill=X` omits only `skills/X/`; unknown target raises; missing `SKILLBENCH_PLUGINS_DIR` raises with remediation
-- [ ] write tests: auth files copied (or symlinked per spike) and nothing else from the real `$HOME`; fingerprint stable for identical trees, different between arms
+- [ ] write tests: auth files (`SKILLBENCH_AUTH_FILES`) copied — never symlinked — and nothing else from the real `$HOME`; missing listed file raises; fingerprint stable for identical trees, different between arms
 - [ ] write tests: shim dir on PATH with `xclip xsel wl-copy pbcopy revdiff` writing to `<run>/side_effects/`; `EDITOR`/`VISUAL=true`; identical in both arms
 - [ ] implement staging (minimal `SurfaceSpec` sufficient for bases-only; full c1..c8 mapping deferred to Option B)
 - [ ] run tests - must pass before next task
@@ -296,6 +296,7 @@ flowchart LR
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
 
 **Manual verification**:
+- **pre-pilot spike** (needs `agy` installed + authenticated, ≈ 8 short paid calls): run `scripts/agy_spike.sh`, answer every "assumed" item in `docs/skillbench-spike.md`, diff `tests/fixtures/agy/real/` against the synthetic fixtures; if the decoder, skill-read detection, model field or auth list differ, fix them (a small follow-up change) and re-run the suite before the pilot
 - **corpus review**: user reviews the 6 pilot tasks (rubrics outcome-only, prompts natural) and edits; re-freeze with `--force`
 - **pilot**: `PILOT=1 K=3 bash scripts/run_skillbench.sh` — 3 skills × 2 tasks × 2 arms × 3 reps = 36 opus rollouts + 72 fable judge calls; if judge criterion-level disagreement > ~10%, tighten rubrics, re-freeze, re-run the pilot
 - **cost gate**: extrapolate pilot per-rollout time/tokens to the full run (~432 rollouts + judging); the full run starts only after explicit user approval
