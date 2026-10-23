@@ -14,6 +14,8 @@
 
 """Focused regressions for the paper's execution, evidence, and adoption contracts."""
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -21,6 +23,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from harness2 import config
+from harness2.cli import _common as C
+from harness2.cli import judge as judge_cli
+from harness2.cli import run_sweep as sweep_cli
 from harness2.core import context, judge, recursion, schedule, tree
 from harness2.core.library import Library
 from harness2.core.proposer import Proposer, ProposerError, Reply
@@ -223,6 +228,206 @@ class WorkflowTests(unittest.TestCase):
         )
         self.adapter.score.assert_not_called()
         self.assertEqual((rows[0].graded, rows[0].n_passed), (False, None))
+
+    def test_run_task_bases_only_rolls_bases_and_skips_proposer_and_selector(self):
+        res = schedule.run_task(
+            "ledger-1",
+            2,
+            adapter=self.adapter,
+            prop=self.proposer,
+            runs_root=self.adapter.spec.runs_root,
+            bases_only=True,
+        )
+        self.assertEqual(res.status, "bases-only")
+        self.assertEqual(self.adapter.execution_count, 2)
+        self.assertEqual(self.proposer._calls, [])
+
+        summary_path = self.adapter.spec.runs_root / "demo-oc-agg2/ledger-1/summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        self.assertEqual(summary["status"], "bases-only")
+        self.assertEqual([b["label"] for b in summary["base"]], ["base1", "base2"])
+        self.assertEqual(summary["modes"], {})
+        self.assertEqual(summary["selections"], {})
+        self.assertEqual(summary["errors"], [])
+        for b in summary["base"]:
+            self.assertTrue((Path(b["run_dir"]) / "answer.txt").is_file())
+
+        # prop=None also works when bases_only=True
+        res2 = schedule.run_task(
+            "ledger-2",
+            1,
+            adapter=self.adapter,
+            prop=None,
+            runs_root=self.adapter.spec.runs_root,
+            bases_only=True,
+        )
+        self.assertEqual(res2.status, "bases-only")
+        self.assertEqual(self.adapter.execution_count, 3)
+
+        # Default path (bases_only=False) does not treat bases-only summary as completed recursion
+        full_res = schedule.run_task(
+            "ledger-1",
+            2,
+            adapter=self.adapter,
+            prop=self.proposer,
+            runs_root=self.adapter.spec.runs_root,
+        )
+        self.assertEqual(full_res.status, "ok")
+        self.assertGreater(len(self.proposer._calls), 0)
+        full_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        self.assertEqual(full_summary["status"], "ok")
+
+    def test_bases_only_domain_resume_retry_and_run_sweep(self):
+        dom = schedule.run_domain(
+            "accounting",
+            self.adapter.tasks(),
+            2,
+            adapter=self.adapter,
+            prop=self.proposer,
+            runs_root=self.adapter.spec.runs_root,
+            library_root=self.root / "library/2",
+            bases_only=True,
+        )
+        self.assertEqual((dom["done"], dom["failed"]), (2, 0))
+        self.assertEqual([t["status"] for t in dom["tasks"]], ["bases-only", "bases-only"])
+        self.assertEqual(self.adapter.execution_count, 4)
+        self.assertEqual(self.proposer._calls, [])
+
+        # Second run skips via _resume without re-rolling
+        dom_resumed = schedule.run_domain(
+            "accounting",
+            self.adapter.tasks(),
+            2,
+            adapter=self.adapter,
+            prop=self.proposer,
+            runs_root=self.adapter.spec.runs_root,
+            library_root=self.root / "library/2",
+            bases_only=True,
+        )
+        self.assertEqual((dom_resumed["done"], dom_resumed["failed"]), (2, 0))
+        self.assertEqual([t["status"] for t in dom_resumed["tasks"]], ["skipped", "skipped"])
+        self.assertEqual(self.adapter.execution_count, 4)
+
+        # A base-failed task is retried on the next run
+        real_execute = self.adapter.execute
+
+        def fail_ledger_1(task_id, harness_dir, run_id, **kwargs):
+            if task_id == "ledger-1":
+                raise RuntimeError("transient base failure")
+            return real_execute(task_id, harness_dir, run_id, **kwargs)
+
+        with patch.object(self.adapter, "execute", side_effect=fail_ledger_1):
+            dom_failed = schedule.run_domain(
+                "accounting",
+                self.adapter.tasks(),
+                1,
+                adapter=self.adapter,
+                prop=self.proposer,
+                runs_root=self.adapter.spec.runs_root,
+                library_root=self.root / "library/1",
+                bases_only=True,
+            )
+        self.assertEqual((dom_failed["done"], dom_failed["failed"]), (1, 1))
+        self.assertEqual(
+            [t["status"] for t in dom_failed["tasks"]], ["base-failed", "bases-only"]
+        )
+
+        dom_retried = schedule.run_domain(
+            "accounting",
+            self.adapter.tasks(),
+            1,
+            adapter=self.adapter,
+            prop=self.proposer,
+            runs_root=self.adapter.spec.runs_root,
+            library_root=self.root / "library/1",
+            bases_only=True,
+        )
+        self.assertEqual((dom_retried["done"], dom_retried["failed"]), (2, 0))
+        self.assertEqual(
+            [t["status"] for t in dom_retried["tasks"]], ["bases-only", "skipped"]
+        )
+        retried_summary = json.loads(
+            (self.adapter.spec.runs_root / "demo-oc-agg1/ledger-1/summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(retried_summary["status"], "bases-only")
+        self.assertEqual(retried_summary["errors"], [])
+
+        # run_sweep CLI: --bases-only is False by default, True when passed, and implied by --bench skillbench
+        parser = sweep_cli._build_parser()
+        self.assertFalse(parser.parse_args(["--bench", "jb"]).bases_only)
+        self.assertTrue(parser.parse_args(["--bench", "jb", "--bases-only"]).bases_only)
+        self.assertTrue(parser.parse_args(["--bench", "skillbench", "--arm", "with"]).bases_only)
+
+        # run_sweep CLI with --bases-only exits 0 and never constructs Proposer
+        with (
+            patch.object(C, "make_adapter", return_value=self.adapter),
+            patch("harness2.preflight.require_ready"),
+            patch.object(
+                sweep_cli,
+                "Proposer",
+                side_effect=AssertionError("Proposer must not be constructed for --bases-only"),
+            ),
+            patch.object(schedule, "run_sweep", wraps=schedule.run_sweep) as spy_sweep,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc = sweep_cli.main(["--bench", "jb", "--k", "2", "--bases-only"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(spy_sweep.call_args.kwargs.get("bases_only"))
+
+        # --bench skillbench also implies bases_only=True in schedule.run_sweep
+        with (
+            patch.object(C, "make_adapter", return_value=self.adapter),
+            patch("harness2.preflight.require_ready"),
+            patch.object(sweep_cli, "_check_identity"),
+            patch.object(
+                sweep_cli,
+                "Proposer",
+                side_effect=AssertionError("Proposer must not be constructed for skillbench"),
+            ),
+            patch.object(schedule, "run_sweep", wraps=schedule.run_sweep) as spy_sb_sweep,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc_sb = sweep_cli.main(["--bench", "skillbench", "--arm", "with", "--k", "1"])
+        self.assertEqual(rc_sb, 0)
+        self.assertTrue(spy_sb_sweep.call_args.kwargs.get("bases_only"))
+
+    def test_judge_bases_scores_bases_only_namespace(self):
+        with (
+            patch.object(C, "make_adapter", return_value=self.adapter),
+            patch("harness2.preflight.require_ready"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc_sweep = sweep_cli.main(["--bench", "jb", "--k", "2", "--bases-only"])
+        self.assertEqual(rc_sweep, 0)
+
+        def score_base(run_dir: Path, task_id: str) -> dict[str, int]:
+            self.assertTrue((run_dir / "answer.txt").is_file())
+            return {"n_passed": 1 if task_id == "ledger-1" else 2, "n_criteria": 2}
+
+        self.adapter.score = Mock(side_effect=score_base)
+        with (
+            patch.object(C, "make_adapter", return_value=self.adapter),
+            patch.object(config, "validate_models"),
+            patch.object(config, "JUDGE_MODEL", ""),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc_judge = judge_cli.main(["--bench", "jb", "--k", "2", "--bases"])
+        self.assertEqual(rc_judge, 0)
+        self.assertEqual(self.adapter.score.call_count, 4)
+
+        ns_dir = C.runs_root_for(self.adapter) / "demo-oc-agg2"
+        base_judged = json.loads((ns_dir / "base_judged.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(r["task"], r["label"], r["score"]) for r in base_judged],
+            [
+                ("ledger-1", "base1", {"n_passed": 1, "n_criteria": 2}),
+                ("ledger-1", "base2", {"n_passed": 1, "n_criteria": 2}),
+                ("ledger-2", "base1", {"n_passed": 2, "n_criteria": 2}),
+                ("ledger-2", "base2", {"n_passed": 2, "n_criteria": 2}),
+            ],
+        )
 
 
 if __name__ == "__main__":

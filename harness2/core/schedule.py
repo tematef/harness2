@@ -308,7 +308,11 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
                 merged["errors"] = list(merged.get("errors") or [])
                 seen = {json.dumps(e, sort_keys=True, default=str) for e in merged["errors"]}
                 for e in old.get("errors") or []:
-                    if e == "no base rollout produced anything" and res.status in ("ok", "partial"):
+                    if e == "no base rollout produced anything" and res.status in (
+                        "ok",
+                        "partial",
+                        "bases-only",
+                    ):
                         continue
                     mode = str(e).partition(":")[0]
                     if (
@@ -358,6 +362,8 @@ def _resume(
     tag: str,
     mode_libs: dict[str, library_store.Library],
     res: TaskResult,
+    *,
+    bases_only: bool = False,
 ) -> bool:
     """Fill `res` from a cached summary covering every requested mode; True if it did."""
     try:
@@ -368,6 +374,28 @@ def _resume(
             flush=True,
         )
         return False
+    if bases_only:
+        if got.get("status") not in ("bases-only", "ok"):
+            return False
+        dead_dir = str(summary_path.parent / "missing")
+        base_entries = got.get("base") or []
+        non_dead = [
+            b
+            for b in base_entries
+            if isinstance(b, dict) and b.get("run_dir") and b.get("run_dir") != dead_dir
+        ]
+        if (
+            len(base_entries) < k
+            or not non_dead
+            or not all(Path(b["run_dir"]).is_dir() for b in non_dead)
+        ):
+            return False
+        res.status = "skipped"
+        res.base = base_entries
+        res.modes = _modes_of(got)
+        res.selections = got.get("selections") or {}
+        res.errors = got.get("errors", [])
+        return True
     if got.get("status") != "ok":
         return False
     cached_modes = _modes_of(got)
@@ -568,7 +596,7 @@ def run_task(
     k: int,
     *,
     adapter: BenchmarkAdapter,
-    prop: Proposer,
+    prop: Proposer | None = None,
     runs_root: Path,
     modes: Sequence[str] = MODES,
     seed: int | None = None,
@@ -577,6 +605,7 @@ def run_task(
     libraries: dict[str, library_store.Library] | None = None,
     selector_prop: Proposer | None = None,
     pool_policy: str = "finals",
+    bases_only: bool = False,
 ) -> TaskResult:
     """k shared reference executions -> every mode -> blind selection per mode -> summary.json.
 
@@ -598,7 +627,7 @@ def run_task(
             f"one selection pool, 'finals' (the k composed finals)"
         )
     mode_libs = _resolve_libraries(library, libraries, modes)
-    selector = _selector_for(adapter, prop, selector_prop)
+    selector = None if bases_only else _selector_for(adapter, prop, selector_prop)
     bench, sub = adapter.spec.name, adapter.substrate.name
 
     domain = adapter.domain_of(task_id)
@@ -609,12 +638,19 @@ def run_task(
     summary_path = work / "summary.json"
 
     if summary_path.is_file() and _resume(
-        summary_path, task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res
+        summary_path,
+        task_id,
+        k,
+        adapter,
+        runs_root,
+        modes,
+        seed,
+        tag,
+        mode_libs,
+        res,
+        bases_only=bases_only,
     ):
         return res
-
-    surface = adapter.substrate.surface()
-    base_tree = harness_tree.read_tree(surface, adapter.base_harness())
 
     labels = [f"base{i}" for i in range(1, k + 1)]
     run_ids = [base_ns.run_id(task_id, label) for label in labels]
@@ -631,6 +667,14 @@ def run_task(
         res.errors.append("no base rollout produced anything")
         _write_summary(summary_path, res)
         return res
+
+    if bases_only:
+        res.status = "bases-only"
+        _write_summary(summary_path, res)
+        return res
+
+    surface = adapter.substrate.surface()
+    base_tree = harness_tree.read_tree(surface, adapter.base_harness())
 
     for mode in modes:
         n = Namespace(bench, sub, mode, k, seed, tag)
@@ -672,21 +716,28 @@ def run_domain(
     k: int,
     *,
     adapter: BenchmarkAdapter,
-    prop: Proposer,
+    prop: Proposer | None = None,
     runs_root: Path,
-    library_root: Path,
+    library_root: Path | None = None,
     modes: Sequence[str] = MODES,
     seed: int | None = None,
     tag: str = "",
     selector_prop: Proposer | None = None,
     pool_policy: str = "finals",
+    bases_only: bool = False,
 ) -> dict:
     """Every task in one domain, in `stream_order()` order, threading the library forward."""
     surface = adapter.substrate.surface()
-    libs = {
-        mode: library_store.Library(root=Path(library_root) / mode, domain=domain, surface=surface)
-        for mode in modes
-    }
+    libs = (
+        {}
+        if bases_only or library_root is None
+        else {
+            mode: library_store.Library(
+                root=Path(library_root) / mode, domain=domain, surface=surface
+            )
+            for mode in modes
+        }
+    )
     out = {
         "domain": domain,
         "n_tasks": len(task_ids),
@@ -712,8 +763,9 @@ def run_domain(
                 libraries=libs,
                 selector_prop=selector_prop,
                 pool_policy=pool_policy,
+                bases_only=bases_only,
             )
-            if r.status in ("ok", "skipped"):
+            if r.status in ("ok", "skipped", "bases-only"):
                 out["done"] += 1
                 row = {"task": tid, "status": r.status, "library_entries_before": before}
             else:
@@ -781,9 +833,9 @@ def run_sweep(
     k: int,
     *,
     adapter: BenchmarkAdapter,
-    prop: Proposer,
+    prop: Proposer | None = None,
     runs_root: Path,
-    library_root: Path,
+    library_root: Path | None = None,
     split: str = "all",
     modes: Sequence[str] = MODES,
     seed: int | None = None,
@@ -794,6 +846,7 @@ def run_sweep(
     pool_policy: str = "finals",
     max_tasks: int | None = None,
     only_tasks: Sequence[str] = (),
+    bases_only: bool = False,
 ) -> dict:
     """Run domains concurrently, preserving task order after stream filters are applied."""
     ordered_tasks = task_stream(
@@ -808,7 +861,7 @@ def run_sweep(
 
     started = datetime.now(timezone.utc).isoformat()
     rows = []
-    selector = _selector_for(adapter, prop, selector_prop)
+    selector = None if bases_only else _selector_for(adapter, prop, selector_prop)
     with ThreadPoolExecutor(max_workers=domain_parallel) as pool:
         futs = {
             pool.submit(
@@ -825,6 +878,7 @@ def run_sweep(
                 tag=tag,
                 selector_prop=selector,
                 pool_policy=pool_policy,
+                bases_only=bases_only,
             ): d
             for d in order
         }

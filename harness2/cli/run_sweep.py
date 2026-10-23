@@ -44,8 +44,16 @@ from ..core.proposer import Proposer
 from . import _common as C
 
 
+class _SweepParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        ns, rem = super().parse_known_args(args, namespace)
+        if getattr(ns, "bench", None) == "skillbench":
+            ns.bases_only = True
+        return ns, rem
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _SweepParser(
         prog="harness2.cli.run_sweep", description=__doc__, formatter_class=C.HelpFormatter
     )
     C.add_cell_args(p.add_argument_group("cell"))
@@ -63,6 +71,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="per-domain cap on the stream (the first N tasks of every domain); "
         "drop it for the full run",
+    )
+    g.add_argument(
+        "--bases-only",
+        action="store_true",
+        help="roll only the k reference executions and stop before recursion "
+        "(implied by --bench skillbench)",
     )
     g.add_argument(
         "--dry-run",
@@ -152,9 +166,10 @@ def _main(args: argparse.Namespace) -> int:
     library_root = C.library_root_for(adapter, args.k, seed=args.seed, tag=tag)
     summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)
     _check_identity(adapter, args, runs_root / summary_ns, tag=tag)
+    bases_only = bool(getattr(args, "bases_only", False) or args.bench == "skillbench")
     prop = (
         None
-        if args.bench == "skillbench" or getattr(args, "bases_only", False)
+        if bases_only
         else Proposer(
             adapter.spec.channels["proposer"], audit_dir=runs_root / "_audit" / summary_ns
         )
@@ -180,6 +195,7 @@ def _main(args: argparse.Namespace) -> int:
         only_domains=only,
         max_tasks=args.max_tasks,
         pool_policy="finals",
+        bases_only=bases_only,
     )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

@@ -237,11 +237,11 @@ flowchart LR
 - Modify: `harness2/cli/run_sweep.py` (`--bases-only`; implied by `--bench skillbench`)
 - Modify: `tests/test_workflow.py`
 
-- [ ] write tests (demo adapter): `run_task(..., bases_only=True)` rolls `k` bases, writes `summary.json` with `status="bases-only"`, never calls proposer/selector; default path unchanged
-- [ ] write tests: `run_domain` counts `bases-only` as done (done count = n, `run_sweep` exit code 0); a second run skips via `_resume` without re-rolling; a `base-failed` task is retried
-- [ ] write tests: `harness2-judge --bases` scores a bases-only namespace into `base_judged.json`
-- [ ] implement `bases_only` (exit after the base roll), `_resume` and `run_domain` handling, CLI flag
-- [ ] run tests - must pass before next task
+- [x] write tests (demo adapter): `run_task(..., bases_only=True)` rolls `k` bases, writes `summary.json` with `status="bases-only"`, never calls proposer/selector; default path unchanged
+- [x] write tests: `run_domain` counts `bases-only` as done (done count = n, `run_sweep` exit code 0); a second run skips via `_resume` without re-rolling; a `base-failed` task is retried
+- [x] write tests: `harness2-judge --bases` scores a bases-only namespace into `base_judged.json`
+- [x] implement `bases_only` (exit after the base roll), `_resume` and `run_domain` handling, CLI flag
+- [x] run tests - must pass before next task
 
 ### Task 12: skillbench-report (lift, CI, time-to-skill)
 
