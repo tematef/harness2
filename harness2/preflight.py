@@ -26,6 +26,20 @@ from .substrate.opencode import OpencodeSubstrate
 
 
 def check(adapter, *, judge=False) -> list[str]:
+    bench = adapter.spec.name.split("-", 1)[0]
+    if bench == "skillbench" or getattr(adapter.substrate, "name", None) == "agy":
+        errors = []
+        for validate in (
+            lambda: config.validate_models(judge=judge, bench=bench),
+            adapter.tasks,
+            adapter.preflight,
+        ):
+            try:
+                validate()
+            except (OSError, RuntimeError, ValueError) as exc:
+                errors.append(str(exc))
+        return errors
+
     missing = missing_runners()
     if missing:
         return [missing]
@@ -44,7 +58,7 @@ def check(adapter, *, judge=False) -> list[str]:
             return False
 
     for validate in (
-        lambda: config.validate_models(judge=judge),
+        lambda: config.validate_models(judge=judge, bench=bench),
         adapter.tasks,
         OpencodeSubstrate().preflight,
         adapter.preflight,
@@ -54,7 +68,6 @@ def check(adapter, *, judge=False) -> list[str]:
         except (OSError, RuntimeError, ValueError) as exc:
             errors.append(str(exc))
 
-    bench = adapter.spec.name.split("-", 1)[0]
     name = {"jb": "job-bench-eval", "lab": "harvey-labs", "wb": "workbuddy-bench"}[bench]
     repo = config.DEPENDENCIES / name
     for dependency in (name, "opencode"):

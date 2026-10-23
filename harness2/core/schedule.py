@@ -179,10 +179,10 @@ def _reference_domain_order(
 
 
 def _selector_for(
-    adapter: BenchmarkAdapter, prop: Proposer, selector_prop: Proposer | None
-) -> Proposer:
+    adapter: BenchmarkAdapter, prop: Proposer | None, selector_prop: Proposer | None
+) -> Proposer | None:
     """Honor the selector channel while preserving fake/custom proposers when specs match."""
-    if selector_prop is not None:
+    if selector_prop is not None or prop is None:
         return selector_prop
     spec = adapter.spec.channels["selector"]
     if prop.spec == spec:

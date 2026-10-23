@@ -223,12 +223,12 @@ flowchart LR
 - Modify: `harness2/cli/check.py`
 - Create: `tests/test_skillbench_preflight.py`
 
-- [ ] write tests: `preflight.check()` for skillbench/agy runs only the agy substrate + adapter preflight (no opencode runner/pin/patch probes, no dependency-repo lookup, no KeyError)
-- [ ] write tests: a skillbench run and judge succeed with **no** `HARNESS2_SOLVER_MODEL` / `HARNESS2_JUDGE_MODEL` set (`validate_models` and `Proposer` construction skipped for skillbench); other benches still require them
-- [ ] write tests: `_check_identity` records `SKILLBENCH_EXEC_MODEL`, `SKILLBENCH_JUDGE_MODEL`, effort and manifest hash for skillbench and refuses a resume when any changes; judge identity check compares `SKILLBENCH_JUDGE_MODEL`
-- [ ] write tests: `harness2-check --bench skillbench --substrate agy` works
-- [ ] implement the branches in `preflight.py`, `config.py`, `run_sweep.py`, `judge.py`, `check.py`
-- [ ] run tests - must pass before next task
+- [x] write tests: `preflight.check()` for skillbench/agy runs only the agy substrate + adapter preflight (no opencode runner/pin/patch probes, no dependency-repo lookup, no KeyError)
+- [x] write tests: a skillbench run and judge succeed with **no** `HARNESS2_SOLVER_MODEL` / `HARNESS2_JUDGE_MODEL` set (`validate_models` and `Proposer` construction skipped for skillbench); other benches still require them
+- [x] write tests: `_check_identity` records `SKILLBENCH_EXEC_MODEL`, `SKILLBENCH_JUDGE_MODEL`, effort and manifest hash for skillbench and refuses a resume when any changes; judge identity check compares `SKILLBENCH_JUDGE_MODEL`
+- [x] write tests: `harness2-check --bench skillbench --substrate agy` works
+- [x] implement the branches in `preflight.py`, `config.py`, `run_sweep.py`, `judge.py`, `check.py`
+- [x] run tests - must pass before next task
 
 ### Task 11: Bases-only runs
 

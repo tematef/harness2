@@ -152,7 +152,13 @@ def _main(args: argparse.Namespace) -> int:
     library_root = C.library_root_for(adapter, args.k, seed=args.seed, tag=tag)
     summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)
     _check_identity(adapter, args, runs_root / summary_ns, tag=tag)
-    prop = Proposer(adapter.spec.channels["proposer"], audit_dir=runs_root / "_audit" / summary_ns)
+    prop = (
+        None
+        if args.bench == "skillbench" or getattr(args, "bases_only", False)
+        else Proposer(
+            adapter.spec.channels["proposer"], audit_dir=runs_root / "_audit" / summary_ns
+        )
+    )
 
     only = _csv(args.only_domains)
     lanes = args.workers
@@ -213,21 +219,46 @@ def _main(args: argparse.Namespace) -> int:
 
 def _check_identity(adapter, args, namespace_dir: Path, tag: str = "") -> None:
     """Prevent a resumed run or library from silently mixing models or task partitions."""
-    identity = {
-        "method_version": config.METHOD_VERSION,
-        "executor": config.SOLVER_MODEL_OC if args.substrate == "oc" else config.SOLVER_MODEL_CX,
-        "improver": config.IMPROVER_MODEL,
-        "judge": config.JUDGE_MODEL,
-        "project": config.VERTEX_PROJECT,
-        "location": config.VERTEX_REGION,
-        "judge_endpoint": config.JB_JUDGE_API_BASE,
-        "endpoint": config.CODEX_BASE_URL if args.substrate == "cx" else "",
-        "split": args.split,
-        "tasks": _stream_for(adapter, args)[1],
-        "max_tasks": args.max_tasks,
-        "domains": sorted(_csv(args.only_domains)),
-        "seed": args.seed,
-    }
+    if args.bench == "skillbench":
+        from ..benchmarks.skillbench import check_manifest, judge_model
+        from ..substrate.agy import exec_effort, exec_model
+
+        root = getattr(adapter, "_root", None)
+        manifest_hash = (
+            check_manifest(root)
+            if root is not None
+            else (getattr(adapter, "manifest_hash", None) or check_manifest())
+        )
+        identity = {
+            "method_version": config.METHOD_VERSION,
+            "executor": exec_model(),
+            "judge": judge_model(),
+            "effort": exec_effort(),
+            "manifest_hash": manifest_hash,
+            "split": args.split,
+            "tasks": _stream_for(adapter, args)[1],
+            "max_tasks": args.max_tasks,
+            "domains": sorted(_csv(args.only_domains)),
+            "seed": args.seed,
+        }
+    else:
+        identity = {
+            "method_version": config.METHOD_VERSION,
+            "executor": (
+                config.SOLVER_MODEL_OC if args.substrate == "oc" else config.SOLVER_MODEL_CX
+            ),
+            "improver": config.IMPROVER_MODEL,
+            "judge": config.JUDGE_MODEL,
+            "project": config.VERTEX_PROJECT,
+            "location": config.VERTEX_REGION,
+            "judge_endpoint": config.JB_JUDGE_API_BASE,
+            "endpoint": config.CODEX_BASE_URL if args.substrate == "cx" else "",
+            "split": args.split,
+            "tasks": _stream_for(adapter, args)[1],
+            "max_tasks": args.max_tasks,
+            "domains": sorted(_csv(args.only_domains)),
+            "seed": args.seed,
+        }
     if tag:
         identity["tag"] = tag
     namespace_dir.mkdir(parents=True, exist_ok=True)

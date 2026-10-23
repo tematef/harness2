@@ -178,12 +178,16 @@ TRANSPORT_ATTEMPTS = 2
 PROPOSER_CONCURRENCY = 2
 
 
-def validate_models(*, judge: bool = False) -> None:
-    require("HARNESS2_SOLVER_MODEL", needed_by="executor rollouts")
-    if "/" not in SOLVER_MODEL_OC or "/" not in IMPROVER_MODEL:
+def validate_models(*, judge: bool = False, bench: str | None = None) -> None:
+    if bench == "skillbench":
+        return
+    solver = require("HARNESS2_SOLVER_MODEL", needed_by="executor rollouts")
+    solver_oc = SOLVER_MODEL_OC or solver
+    improver = IMPROVER_MODEL or env("HARNESS2_IMPROVER_MODEL", solver_oc)
+    if "/" not in solver_oc or "/" not in improver:
         raise ConfigError("Executor and improver models must use OpenCode's provider/model syntax")
-    if any(m.startswith("google-vertex") for m in (SOLVER_MODEL_OC, IMPROVER_MODEL)):
-        if not VERTEX_PROJECT:
+    if any(m.startswith("google-vertex") for m in (solver_oc, improver)):
+        if not (VERTEX_PROJECT or env("GOOGLE_CLOUD_PROJECT", env("HARNESS2_VERTEX_PROJECT", ""))):
             raise ConfigError("Set GOOGLE_CLOUD_PROJECT for Vertex AI")
     if judge:
         require("HARNESS2_JUDGE_MODEL", needed_by="benchmark judging")

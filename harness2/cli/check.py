@@ -18,18 +18,17 @@ from __future__ import annotations
 
 import argparse
 
-from harness2.cli._common import make_adapter
+from harness2.cli._common import add_cell_args, make_adapter
 from harness2.preflight import check
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--bench", choices=("jb", "lab", "wb"), required=True)
-    p.add_argument("--subset", choices=("office", "web", "code"))
-    p.add_argument("--substrate", choices=("oc", "cx"), default="oc")
+    add_cell_args(p)
     args = p.parse_args(argv)
+    arm = args.arm or ("with" if args.bench == "skillbench" else None)
     try:
-        adapter = make_adapter(args.bench, args.subset, args.substrate)
+        adapter = make_adapter(args.bench, args.subset, args.substrate, arm=arm)
         errors = check(adapter, judge=True)
     except (OSError, RuntimeError, ValueError) as exc:
         errors = [str(exc)]
@@ -39,7 +38,7 @@ def main(argv=None):
         print(f"Setup incomplete: {len(errors)} issue(s). See docs/BENCHMARKS.md.")
         return 1
     print(
-        f"Ready: {adapter.spec.name}/{args.substrate}; {len(adapter.tasks())} tasks. "
+        f"Ready: {adapter.spec.name}/{adapter.substrate.name}; {len(adapter.tasks())} tasks. "
         "Model access is not exercised; the first real run is the first model call."
     )
     return 0
