@@ -1,0 +1,3 @@
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"checking each criterion against the deliverable\n"}}
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"grading done"}}
+{"event":"result","result":{"structured_output":{"criteria":[{"id":"c1","pass":true,"reason":"The plan file exists under docs/plans/."},{"id":"c2","pass":false,"reason":"No test step is listed."}]},"usage":{"total_tokens":2150}}}

@@ -1,0 +1,4 @@
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"`add(a, b)` returns "}}
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"the sum of both arguments.\n"}}
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"No changes were needed."}}
+{"event":"result","result":{"usage":{"total_tokens":1204}}}

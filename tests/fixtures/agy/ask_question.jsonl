@@ -1,0 +1,6 @@
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"I need one decision before starting.\n"}}
+{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE","tool_name":"ask_question","tool_info":{"name":"ask_question","parameters":{"questions":[{"question":"Which storage backend should the cache use?","options":["(Recommended) In-memory LRU","Redis","SQLite"],"is_multi_select":false}]}}}}
+{"event":"step_update","step_update":{"step_type":"tool","state":"DONE","tool_name":"ask_question"}}
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"No answer is available, so I am proceeding with the recommended option: in-memory LRU.\n"}}
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"Added an in-memory LRU cache around fetch()."}}
+{"event":"result","result":{"usage":{"total_tokens":3410}}}

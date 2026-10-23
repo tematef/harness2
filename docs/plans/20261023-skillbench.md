@@ -106,11 +106,11 @@ flowchart LR
 - Create: `scripts/agy_spike.sh`
 - Create: `docs/skillbench-spike.md`
 
-- [ ] derive the event shape from `~/projects/revmux/app/executor/agy.go` (`event`, `result{structured_output, usage.total_tokens}`, `step_update{step_type, state, tool_name, text_delta, tool_info{name, parameters}}`) and write synthetic fixtures: plain answer; skill read (`view_file` on `.../skills/<x>/SKILL.md`, plus a read of a different skill); `ask_question` call; `--json-schema` structured result; result with and without a model field; one malformed line
-- [ ] write `tests/test_agy_fixtures.py` (stdlib only, no harness2 import): every fixture line except the deliberate malformed one is valid JSON matching the revmux event shape; each scenario named in `docs/skillbench-spike.md` has a fixture
-- [ ] create `scripts/agy_spike.sh` (**not run now**): probes on `--model opus` / `--model fable` — plain answer, skill read, `ask_question`, `--json-schema` — under `HOME=<tmp>` with a staged plugin dir; saves streams to `tests/fixtures/agy/real/` with secrets scrubbed; records auth files read/written
-- [ ] create `docs/skillbench-spike.md`: each open question (model aliases; model field in stream; how a skill read appears; `ask_question` under `-p`; `PreToolUse` answer hook; skills under `--disable-slash-commands`; default `--effort`; auth files and whether agy writes them; plugin discovery only from `<tmp>` HOME) with the **assumed** answer used by the synthetic fixtures, each marked "assumed — verify in pre-pilot spike"
-- [ ] run tests - must pass before next task
+- [x] derive the event shape from `~/projects/revmux/app/executor/agy.go` (`event`, `result{structured_output, usage.total_tokens}`, `step_update{step_type, state, tool_name, text_delta, tool_info{name, parameters}}`) and write synthetic fixtures: plain answer; skill read (`view_file` on `.../skills/<x>/SKILL.md`, plus a read of a different skill); `ask_question` call; `--json-schema` structured result; result with and without a model field; one malformed line
+- [x] write `tests/test_agy_fixtures.py` (stdlib only, no harness2 import): every fixture line except the deliberate malformed one is valid JSON matching the revmux event shape; each scenario named in `docs/skillbench-spike.md` has a fixture
+- [x] create `scripts/agy_spike.sh` (**not run now**): probes on `--model opus` / `--model fable` — plain answer, skill read, `ask_question`, `--json-schema` — under `HOME=<tmp>` with a staged plugin dir; saves streams to `tests/fixtures/agy/real/` with secrets scrubbed; records auth files read/written
+- [x] create `docs/skillbench-spike.md`: each open question (model aliases; model field in stream; how a skill read appears; `ask_question` under `-p`; `PreToolUse` answer hook; skills under `--disable-slash-commands`; default `--effort`; auth files and whether agy writes them; plugin discovery only from `<tmp>` HOME) with the **assumed** answer used by the synthetic fixtures, each marked "assumed — verify in pre-pilot spike"
+- [x] run tests - must pass before next task
 
 ### Task 2: agy stub binary and dev environment
 

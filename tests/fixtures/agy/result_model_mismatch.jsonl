@@ -1,0 +1,2 @@
+{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"Done: the README now documents the --verbose flag."}}
+{"event":"result","result":{"model":"sonnet","usage":{"total_tokens":980}}}
