@@ -934,9 +934,7 @@ class TestSkillbenchReportCliAndFiles(_ReportCase):
             rc = SR.main(["--k", "1", "--draws", "100"])
         self.assertEqual(rc, 0)
 
-        # Default out-dir writes to both <runs_dir>/skillbench/adapt and <runs_dir>/skillbench
-        self.assertTrue((adapt_root / "report.json").is_file())
-        self.assertTrue((adapt_root / "report.md").is_file())
+        # Default out-dir writes to <runs_dir>/skillbench
         self.assertTrue((self.runs_dir / "skillbench" / "report.json").is_file())
         self.assertTrue((self.runs_dir / "skillbench" / "report.md").is_file())
 

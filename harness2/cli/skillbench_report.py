@@ -767,10 +767,7 @@ def _resolve_ns_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
     with_ns = SCHED.ns("skillbench", "agy", "agg", args.k, seed=args.seed, tag="with")
     without_ns = SCHED.ns("skillbench", "agy", "agg", args.k, seed=args.seed, tag="without")
     base = Path(args.runs_root) if args.runs_root is not None else _default_runs_root()
-    for candidate in (base, base / "adapt", base / "skillbench" / "adapt"):
-        if (candidate / with_ns).is_dir() or (candidate / without_ns).is_dir():
-            return (candidate / with_ns, candidate / without_ns)
-    adapt = base if base.name == "adapt" else base / "adapt"
+    adapt = base / "adapt"
     return (adapt / with_ns, adapt / without_ns)
 
 
@@ -818,9 +815,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="directory where report.json and report.md are written",
     )
-    p.add_argument("--bench", choices=("skillbench",), default="skillbench", help=argparse.SUPPRESS)
-    p.add_argument("--substrate", choices=("agy",), default="agy", help=argparse.SUPPRESS)
-    p.add_argument("--mode", "--modes", dest="modes", default="parallel", help=argparse.SUPPRESS)
     return p
 
 
@@ -839,14 +833,13 @@ def main(argv: list[str] | None = None) -> int:
             draws=args.draws,
             pilot=True if args.pilot else None,
         )
-        if args.out_dir is not None:
-            json_path, md_path = write_report(report, args.out_dir)
-        else:
-            primary = with_dir.parent
-            json_path, md_path = write_report(report, primary)
-            if primary.name == "adapt" and primary.parent != primary:
-                json_path, md_path = write_report(report, primary.parent)
-        print(render_markdown(report), end="")
+        out_dir = (
+            args.out_dir
+            if args.out_dir is not None
+            else (with_dir.parent.parent if with_dir.parent.name == "adapt" else with_dir.parent)
+        )
+        json_path, md_path = write_report(report, out_dir)
+        print(md_path.read_text(encoding="utf-8"), end="")
         print(f"wrote {md_path} and {json_path}")
         return 0
     except (FileNotFoundError, ValueError, config.ConfigError) as e:

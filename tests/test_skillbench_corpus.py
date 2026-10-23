@@ -173,12 +173,9 @@ class PilotCorpusTest(unittest.TestCase):
         self.assertEqual(len(manifest_hash), 64)
         tasks_manifest = SB.TASKS_ROOT / SB.MANIFEST
         self.assertTrue(tasks_manifest.is_file())
-        parent_manifest = SB.TASKS_ROOT.parent / SB.MANIFEST
-        self.assertTrue(parent_manifest.is_file())
-        self.assertEqual(
-            json.loads(tasks_manifest.read_text(encoding="utf-8")),
-            json.loads(parent_manifest.read_text(encoding="utf-8")),
-        )
+        data = json.loads(tasks_manifest.read_text(encoding="utf-8"))
+        self.assertEqual(data["hash"], manifest_hash)
+        self.assertEqual(set(data["tasks"]), set(self.tasks))
 
     def test_each_pilot_skill_has_exactly_two_pilot_tasks(self) -> None:
         by_skill: dict[str, list[SB.SkillbenchTask]] = {s: [] for s in PILOT_SKILLS}

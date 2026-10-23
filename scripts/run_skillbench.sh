@@ -42,6 +42,7 @@ for arg in "$@"; do
 done
 
 run=(--bench skillbench --substrate "$SUBSTRATE" --k "$K" --mode "$MODE")
+pilot_args=()
 report=(--k "$K")
 check_args=(--bench skillbench --substrate "$SUBSTRATE")
 
@@ -52,15 +53,15 @@ fi
 
 if [[ "$PILOT" == "1" || "$PILOT" == "true" || "$PILOT" == "yes" || " $* " == *" --pilot "* ]]; then
   export SKILLBENCH_JUDGE_REPEAT=${SKILLBENCH_JUDGE_REPEAT:-2}
-  run+=(--pilot)
+  pilot_args+=(--pilot)
   report+=(--pilot)
   check_args+=(--pilot)
 fi
 
 harness2-check "${check_args[@]}" || exit
-harness2 "${run[@]}" --arm with "$@"
+harness2 "${run[@]}" "${pilot_args[@]}" --arm with "$@"
 status_with=$?
-harness2 "${run[@]}" --arm without "$@"
+harness2 "${run[@]}" "${pilot_args[@]}" --arm without "$@"
 status_without=$?
 status=$((status_with ? status_with : status_without))
 [[ " $* " == *" --dry-run "* ]] && exit $status

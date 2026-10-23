@@ -193,9 +193,9 @@ class TestPilotCliWiring(_E2ECase):
             mock.patch.dict(os.environ, self.base_env()),
             mock.patch.object(SB, "TASKS_ROOT", tasks_root),
         ):
-            # pilot_only alias and pilot kwarg on SkillbenchAdapter
-            a_alias = SB.SkillbenchAdapter("with", pilot_only=True)
-            self.assertEqual(a_alias.tasks(), ["make-plan/p1"])
+            # pilot kwarg on SkillbenchAdapter
+            a_direct = SB.SkillbenchAdapter("with", pilot=True)
+            self.assertEqual(a_direct.tasks(), ["make-plan/p1"])
 
             # make_adapter(..., pilot=True) filters to pilot tasks
             a_pilot = C.make_adapter("skillbench", None, "agy", arm="with", pilot=True)

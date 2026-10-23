@@ -80,8 +80,7 @@ from .tasks import discover, select
 
 # The bundled corpus. A `skillbench/` directory next to this module holds only data (no
 # `__init__.py`), so `harness2.benchmarks.skillbench` still imports this file.
-_BUNDLED_TASKS_ROOT = Path(__file__).resolve().with_name("skillbench") / "tasks"
-TASKS_ROOT = _BUNDLED_TASKS_ROOT
+TASKS_ROOT = Path(__file__).resolve().with_name("skillbench") / "tasks"
 MANIFEST = "manifest.json"
 MANIFEST_VERSION = 1
 
@@ -103,7 +102,6 @@ _NAME = re.compile(r"[a-z0-9][a-z0-9_\-]*")
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]*")
 # Never part of a task's identity: copying a fixture drops them too (agy.init_work).
 _HASH_IGNORED = frozenset({".git", "__pycache__"})
-_LOADED_RUBRIC_HASH: dict[tuple[Path, tuple[Criterion, ...]], str] = {}
 
 PREAMBLE_HEAD = "The user is unavailable."
 PREAMBLE_TAIL = (
@@ -304,11 +302,9 @@ def load_task(task_dir: Path) -> SkillbenchTask:
             f"{toml_path}: prompt invokes the skill explicitly ({'; '.join(problems)}); "
             f"describe the task in natural words"
         )
-    rubric_path = task_dir / RUBRIC_FILE
-    rubric = _load_rubric(rubric_path)
+    rubric = _load_rubric(task_dir / RUBRIC_FILE)
     if not (task_dir / FIXTURE_DIR).is_dir():
         raise TaskError(f"{task_dir / FIXTURE_DIR}: missing (the repo copied into each rollout)")
-    _LOADED_RUBRIC_HASH[(task_dir, rubric)] = hashlib.sha256(rubric_path.read_bytes()).hexdigest()
     return SkillbenchTask(
         task_id=f"{skill}/{task_dir.name}",
         target_skill=skill,
@@ -385,10 +381,7 @@ def freeze(root: Path = TASKS_ROOT, *, force: bool = False) -> dict:
         raise ManifestError(f"no skillbench tasks under {root} (expected <skill>/<id>/task.toml)")
     hashes = {tid: hash_task_dir(t.dir) for tid, t in tasks.items()}
     manifest = {"version": MANIFEST_VERSION, "hash": _manifest_hash(hashes), "tasks": hashes}
-    text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    path.write_text(text, encoding="utf-8")
-    if root.resolve() == _BUNDLED_TASKS_ROOT.resolve():
-        (root.parent / MANIFEST).write_text(text, encoding="utf-8")
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
 
 
@@ -621,20 +614,6 @@ def _resolve_task(task: SkillbenchTask | str | Path, root: Path) -> SkillbenchTa
     raise TypeError(f"task must be SkillbenchTask, str, or Path, got {type(task).__name__}")
 
 
-def _effective_rubric(task: SkillbenchTask) -> tuple[Criterion, ...]:
-    """Use updated on-disk `rubric.json` when `task` came from `load_task` and the file changed."""
-    rubric_path = task.dir / RUBRIC_FILE if task.dir != Path() else None
-    loaded_hash = _LOADED_RUBRIC_HASH.get((task.dir, task.rubric))
-    if rubric_path is not None and loaded_hash is not None and rubric_path.is_file():
-        try:
-            current_hash = hashlib.sha256(rubric_path.read_bytes()).hexdigest()
-            if current_hash != loaded_hash:
-                return _load_rubric(rubric_path)
-        except (OSError, TaskError):
-            pass
-    return task.rubric
-
-
 def _rubric_sha256(rubric: tuple[Criterion, ...]) -> str:
     payload = json.dumps(
         [{"id": c.id, "criterion": c.criterion} for c in rubric],
@@ -857,7 +836,7 @@ def score(
     resolved = _resolve_task(task, root)
     model = judge_model()
     repeat = judge_repeat()
-    rubric = _effective_rubric(resolved)
+    rubric = resolved.rubric
     rubric_sha = _rubric_sha256(rubric)
     scrubbed = scrub_deliverable(
         deliverable_text(run_dir),
@@ -993,7 +972,6 @@ class SkillbenchAdapter:
         split_file: Path | None = None,
         *,
         pilot: bool | None = None,
-        pilot_only: bool | None = None,
         root: Path | None = None,
         runs_root: Path | None = None,
     ):
@@ -1003,7 +981,7 @@ class SkillbenchAdapter:
             raise ValueError(f"skillbench requires substrate 'agy', got {substrate!r}")
         self.arm = arm
         self.split_file = split_file
-        self._pilot = pilot if pilot is not None else pilot_only
+        self._pilot = pilot
         self._root = Path(TASKS_ROOT if root is None else root)
         self.manifest_hash = check_manifest(self._root)
         self._tasks = load_tasks(self._root)

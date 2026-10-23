@@ -159,18 +159,10 @@ def main(argv: list[str] | None = None) -> int:
         help="score this namespace's reference executions into base_judged.json "
         "instead of the selected runs",
     )
-    p.add_argument(
-        "--pilot",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
     args = p.parse_args(argv)
     modes = C.parse_modes(args.modes)
 
-    adapter_kw: dict[str, object] = {"arm": args.arm}
-    if getattr(args, "pilot", False):
-        adapter_kw["pilot"] = True
-    adapter = C.make_adapter(args.bench, args.subset, args.substrate, **adapter_kw)
+    adapter = C.make_adapter(args.bench, args.subset, args.substrate, arm=args.arm)
     config.validate_models(judge=True, bench=args.bench)
     tag = C.arm_tag(args.bench, args.arm)
     ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)

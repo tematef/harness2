@@ -153,7 +153,7 @@ Tasks live under `harness2/benchmarks/skillbench/tasks/<skill>/<task-id>/`:
 
 Prompts are checked on load (`check_prompt`): explicit invocations (`<name> skill`, `/<name>`, `skills/<name>`, `SKILL.md`, or any `forbidden_terms`) are rejected, while ordinary English uses of a skill word ("add this to the backlog") are allowed. Both arms append the identical simulated-user preamble supplying `user_answers` in order and instructing the agent never to open an editor or interactive review.
 
-The corpus is frozen into `harness2/benchmarks/skillbench/manifest.json` (and `tasks/manifest.json`) with per-task SHA-256 hashes. Runs and `harness2-check` refuse to start on manifest drift:
+The corpus is frozen into `harness2/benchmarks/skillbench/tasks/manifest.json` with per-task SHA-256 hashes. Runs and `harness2-check` refuse to start on manifest drift:
 
 ```bash
 python -m harness2.benchmarks.skillbench check

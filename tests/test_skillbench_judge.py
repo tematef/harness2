@@ -505,13 +505,13 @@ class TestJudgeCacheAndRepeats(_JudgeCase):
             {"id": f"c{i}", "criterion": f"Updated disk criterion {i}."} for i in range(4)
         ]
         (self.task_dir / "rubric.json").write_text(json.dumps(disk_rubric), encoding="utf-8")
-        self.assertEqual(SB.score(rd, self.task), {"n_passed": 3, "n_criteria": 4})
+        self.assertEqual(SB.score(rd, self.task_dir), {"n_passed": 3, "n_criteria": 4})
         self.assertEqual(len(self.stub_calls()), 4)
         self.assertIn("Updated disk criterion 0.", self.stub_calls()[-1]["flags"]["prompt"])
 
         # Changing deliverable on disk invalidates cache.
         (rd / "final.md").write_text("Different final summary.\n", encoding="utf-8")
-        self.assertEqual(SB.score(rd, self.task), {"n_passed": 3, "n_criteria": 4})
+        self.assertEqual(SB.score(rd, self.task_dir), {"n_passed": 3, "n_criteria": 4})
         self.assertEqual(len(self.stub_calls()), 5)
 
     def test_judge_repeat_stores_multiple_judgments_and_uses_first_for_score(self) -> None:
