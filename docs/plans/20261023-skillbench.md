@@ -287,10 +287,10 @@ flowchart LR
 - [x] run linter: `ruff check .`
 
 ### Task 16: [Final] Update documentation
-- [ ] add a `skillbench` section to `docs/BENCHMARKS.md` (task format, arms, allowlist, shims, metrics, power note, env vars, cost gates) and the agy substrate to `docs/SETUP.md`
-- [ ] add a `skillbench` row to the README benchmark table
-- [ ] add `HARNESS2_AGY_BIN` and `SKILLBENCH_*` keys to `.env.example`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] add a `skillbench` section to `docs/BENCHMARKS.md` (task format, arms, allowlist, shims, metrics, power note, env vars, cost gates) and the agy substrate to `docs/SETUP.md`
+- [x] add a `skillbench` row to the README benchmark table
+- [x] add `HARNESS2_AGY_BIN` and `SKILLBENCH_*` keys to `.env.example`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*

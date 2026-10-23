@@ -1,8 +1,8 @@
 # Setup guide
 
 Start with the [quick start](../README.md#install). This guide covers benchmark
-dependencies, model credentials, and the optional Codex executor. For individual
-benchmarks, see the [benchmark guides](BENCHMARKS.md).
+dependencies, model credentials, and the optional Codex and AGY executors. For
+individual benchmarks, see the [benchmark guides](BENCHMARKS.md).
 
 ## Requirements
 
@@ -139,6 +139,28 @@ changing either. `harness2-check` reports stale configuration until then.
 
 Codex runs with its sandbox disabled. Review the
 [executor network restrictions](EXPERIMENTS.md#web-access) before evaluation.
+
+## AGY executor
+
+The AGY substrate (`--substrate agy`) drives headless AGY / Jetski (`agy -p <prompt> --output-format stream-json --dangerously-skip-permissions --disable-slash-commands`) and is the default executor for [`skillbench`](BENCHMARKS.md#skillbench). It does not require `HARNESS2_SOLVER_MODEL` or `HARNESS2_JUDGE_MODEL`; instead, configure the AGY binary, plugin checkout, credentials, models, and pinned effort in `.env` or the shell:
+
+| Setting | Meaning |
+|---|---|
+| `HARNESS2_AGY_BIN` | Executable name or path for AGY / Jetski (default `agy`) |
+| `SKILLBENCH_PLUGINS_DIR` | Path to a `cc-thingz` `plugins/` checkout (**required**) |
+| `SKILLBENCH_PLUGINS` | Comma-separated plugin allowlist (default `brainstorm,planning,review,skill-eval,thinking-tools,workflow`) |
+| `SKILLBENCH_AUTH_FILES` | Comma-separated paths relative to `$HOME` copied into each rollout's isolated `HOME` (**required**) |
+| `SKILLBENCH_EXEC_MODEL` | Executor model alias passed to `agy --model` (default `opus`) |
+| `SKILLBENCH_JUDGE_MODEL` | Judge model alias passed to `agy --model` (default `fable`) |
+| `SKILLBENCH_EFFORT` | Reasoning effort pinned via `agy --effort` across both arms (**required**) |
+
+Each rollout runs inside a fresh git repository (`<run>/work`) with a throwaway `HOME` (`<run>/home`) containing only the arm's allowlisted plugins and a copy (never a symlink) of `SKILLBENCH_AUTH_FILES`, plus `PATH` shims for clipboard and diff tools (`xclip`, `xsel`, `wl-copy`, `pbcopy`, `revdiff`). Copied auth files are removed from `<run>/home` when the rollout completes.
+
+Verify the AGY installation, auth files, plugin checkout, and frozen task manifest before running:
+
+```bash
+harness2-check --bench skillbench --substrate agy
+```
 
 ## Network access during setup
 

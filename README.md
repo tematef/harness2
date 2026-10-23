@@ -131,6 +131,7 @@ selection without model calls.
 | JobBench | Professional work | `harness2-setup jb` | [JobBench](docs/BENCHMARKS.md#jobbench) |
 | LAB | Legal work | `harness2-setup lab` | [LAB](docs/BENCHMARKS.md#lab) |
 | WorkBuddy-Bench | Office, web, and code | `harness2-setup wb` | [WorkBuddy](docs/BENCHMARKS.md#workbuddy-bench) |
+| skillbench | Leave-one-out skill lift (`cc-thingz` on AGY) | `harness2-check --bench skillbench` | [skillbench](docs/BENCHMARKS.md#skillbench) |
 
 Choose one benchmark per command. WorkBuddy also takes `--subset office`,
 `--subset web`, or `--subset code` on every command after setup. The
