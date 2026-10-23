@@ -142,11 +142,11 @@ flowchart LR
 - Modify: `harness2/core/spec.py` (add `"agy_home"` to `INSTALL_MODES`)
 - Create: `tests/test_agy_staging.py`
 
-- [ ] write tests: `materialise(tree_dir, spec, ctx={"arm": "with", ...})` stages only allowlisted plugins from `SKILLBENCH_PLUGINS_DIR` (symlinks resolved) into `<run>/home/.gemini/config/plugins/`; unlisted plugins (e.g. `revmux`) never staged; `arm=without, target_skill=X` omits only `skills/X/`; unknown target raises; missing `SKILLBENCH_PLUGINS_DIR` raises with remediation
-- [ ] write tests: auth files (`SKILLBENCH_AUTH_FILES`) copied — never symlinked — and nothing else from the real `$HOME`; missing listed file raises; fingerprint stable for identical trees, different between arms
-- [ ] write tests: shim dir on PATH with `xclip xsel wl-copy pbcopy revdiff` writing to `<run>/side_effects/`; `EDITOR`/`VISUAL=true`; identical in both arms
-- [ ] implement staging (minimal `SurfaceSpec` sufficient for bases-only; full c1..c8 mapping deferred to Option B)
-- [ ] run tests - must pass before next task
+- [x] write tests: `materialise(tree_dir, spec, ctx={"arm": "with", ...})` stages only allowlisted plugins from `SKILLBENCH_PLUGINS_DIR` (symlinks resolved) into `<run>/home/.gemini/config/plugins/`; unlisted plugins (e.g. `revmux`) never staged; `arm=without, target_skill=X` omits only `skills/X/`; unknown target raises; missing `SKILLBENCH_PLUGINS_DIR` raises with remediation
+- [x] write tests: auth files (`SKILLBENCH_AUTH_FILES`) copied — never symlinked — and nothing else from the real `$HOME`; missing listed file raises; fingerprint stable for identical trees, different between arms
+- [x] write tests: shim dir on PATH with `xclip xsel wl-copy pbcopy revdiff` writing to `<run>/side_effects/`; `EDITOR`/`VISUAL=true`; identical in both arms
+- [x] implement staging (minimal `SurfaceSpec` sufficient for bases-only; full c1..c8 mapping deferred to Option B)
+- [x] run tests - must pass before next task
 
 ### Task 5: AgySubstrate execution, model guard and preflight
 
