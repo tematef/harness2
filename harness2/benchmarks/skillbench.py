@@ -80,7 +80,8 @@ from .tasks import discover, select
 
 # The bundled corpus. A `skillbench/` directory next to this module holds only data (no
 # `__init__.py`), so `harness2.benchmarks.skillbench` still imports this file.
-TASKS_ROOT = Path(__file__).resolve().with_name("skillbench") / "tasks"
+_BUNDLED_TASKS_ROOT = Path(__file__).resolve().with_name("skillbench") / "tasks"
+TASKS_ROOT = _BUNDLED_TASKS_ROOT
 MANIFEST = "manifest.json"
 MANIFEST_VERSION = 1
 
@@ -384,7 +385,10 @@ def freeze(root: Path = TASKS_ROOT, *, force: bool = False) -> dict:
         raise ManifestError(f"no skillbench tasks under {root} (expected <skill>/<id>/task.toml)")
     hashes = {tid: hash_task_dir(t.dir) for tid, t in tasks.items()}
     manifest = {"version": MANIFEST_VERSION, "hash": _manifest_hash(hashes), "tasks": hashes}
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    path.write_text(text, encoding="utf-8")
+    if root.resolve() == _BUNDLED_TASKS_ROOT.resolve():
+        (root.parent / MANIFEST).write_text(text, encoding="utf-8")
     return manifest
 
 

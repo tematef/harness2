@@ -263,10 +263,10 @@ flowchart LR
 - Create: `harness2/benchmarks/skillbench/manifest.json`
 - Create: `tests/test_skillbench_corpus.py`
 
-- [ ] draft 2 tasks for each pilot skill with an LLM: small fixture repos (seeded bug, refactor target, feature request), natural prompts, outcome-only rubrics, `user_answers` for `make-plan`
-- [ ] write corpus tests: every task loads, passes the prompt check, each pilot skill has exactly 2 pilot tasks, no rubric criterion mentions a skill name or skill step
-- [ ] freeze with `python -m harness2.benchmarks.skillbench freeze`
-- [ ] run tests - must pass before next task
+- [x] draft 2 tasks for each pilot skill with an LLM: small fixture repos (seeded bug, refactor target, feature request), natural prompts, outcome-only rubrics, `user_answers` for `make-plan`
+- [x] write corpus tests: every task loads, passes the prompt check, each pilot skill has exactly 2 pilot tasks, no rubric criterion mentions a skill name or skill step
+- [x] freeze with `python -m harness2.benchmarks.skillbench freeze`
+- [x] run tests - must pass before next task
 
 ### Task 14: Run script and stub end-to-end chain
 

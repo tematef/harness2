@@ -1,0 +1,9 @@
+target_skill = "code-review-refactor"
+pilot = true
+timeout = 900
+prompt = """orderflow/processor.py has grown difficult to maintain: process_order and estimate_order duplicate validation, discount, shipping, and tax calculations with deeply nested conditionals and magic numbers. Refactor orderflow/processor.py into clean, well-named helpers and constants while preserving the public functions (process_order, estimate_order, format_receipt) and their exact behavior. Ensure the unittest suite in tests/ passes and add test coverage for the extracted helpers."""
+forbidden_terms = [
+  "code-review-refactor",
+  "code-agentic-refactor",
+  "code-review-best-practices",
+]
