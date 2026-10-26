@@ -47,6 +47,15 @@ task-level recursion budget brings further gains.
 The release supports **parallel and sequential recursion**, **OpenCode and
 Codex executors**, and **JobBench, LAB, and WorkBuddy-Bench**.
 
+> [!NOTE]
+> **About this fork.** [`tematef/harness2`](https://github.com/tematef/harness2)
+> is a fork of [`google-research/harness2`](https://github.com/google-research/harness2)
+> that adds a third executor, **AGY / Jetski** (`--substrate agy`), and a new
+> benchmark, **skillbench**. skillbench measures whether the
+> [`cc-thingz`](https://github.com/tematef/cc-thingz) agent skills actually
+> help a local AGY (Jetski) agent. See
+> [AGY / Jetski executor and skillbench](#agy--jetski-executor-and-skillbench).
+
 ## Video overview
 
 https://github.com/user-attachments/assets/76b10548-b14b-4c8f-9aa5-a93662df4d56
@@ -57,6 +66,7 @@ https://github.com/user-attachments/assets/76b10548-b14b-4c8f-9aa5-a93662df4d56
 - [Harness components](#harness-components)
 - [Install](#install)
 - [Run a benchmark](#run-a-benchmark)
+- [AGY / Jetski executor and skillbench](#agy--jetski-executor-and-skillbench)
 - [Experiments](#experiments)
 - [Web access](#web-access)
 - [Results and resume](#results-and-resume)
@@ -138,6 +148,64 @@ Choose one benchmark per command. WorkBuddy also takes `--subset office`,
 [benchmark guides](docs/BENCHMARKS.md) cover each one's data, domains, and
 grading.
 
+## AGY / Jetski executor and skillbench
+
+This fork adapts Harness² to run a **local AGY (Jetski) CLI** as the agent
+executor. Its first use is skillbench, an A/B benchmark that measures how much
+each of the 18 `cc-thingz` skills improves the agent's results.
+
+**How skillbench works**
+
+* **Two arms per task.** Arm `with` stages the full allowlisted `cc-thingz`
+  plugin suite. Arm `without` is identical except that the target skill's
+  directory is removed (leave-one-out). Every other skill and every lifecycle
+  hook stays the same, so the only difference is the skill under test.
+* **Outcome lift.** A separate AGY judge, running in an empty `HOME` with no
+  plugins, grades each deliverable against a binary rubric. The report gives
+  the paired `with` − `without` rubric score per skill, with a 95% two-level
+  bootstrap confidence interval and a verdict (`helps`, `hurts`,
+  `inconclusive`, or `insufficient data`).
+* **Time-to-skill.** For the `with` arm, the report gives the invocation rate
+  and the p50/p90 seconds from process start to the agent's first read of the
+  target `SKILL.md`.
+* **Isolation.** Each rollout runs in a fresh git repository with a throwaway
+  `HOME` that contains only the staged plugins. Clipboard and review tools
+  (`xclip`, `xsel`, `wl-copy`, `pbcopy`, `revdiff`) are replaced with shims
+  that write to `<run>/side_effects/`. Skills that would ask the user a
+  question get answers from an identical simulated-user preamble in both arms.
+* **Bases only.** skillbench runs reference executions only (`--bases-only` is
+  implied); the Propose–Probe–Compose recursion is unchanged.
+
+**Run it with the local Jetski CLI**
+
+The Google-internal Jetski CLI is used as `agy`. Point `HARNESS2_AGY_BIN` at
+the binary itself; a shell function or alias such as `jet` cannot be launched
+by the harness.
+
+```bash
+export HARNESS2_AGY_BIN=/google/bin/releases/jetski-devs/tools/cli
+export SKILLBENCH_PLUGINS_DIR=~/projects/cc-thingz/plugins
+export SKILLBENCH_EXEC_MODEL=opus-5.5-high     # executor
+export SKILLBENCH_JUDGE_MODEL=fable-5.1-high   # judge
+
+harness2-check --bench skillbench --substrate agy
+PILOT=1 K=3 bash scripts/run_skillbench.sh     # 3-skill paid pilot
+K=3 bash scripts/run_skillbench.sh             # full corpus (ask before spending)
+```
+
+Model IDs come from `jet models`; they include the effort level, so
+`SKILLBENCH_EFFORT` is optional. Internal Jetski authenticates without
+credential files, so `SKILLBENCH_AUTH_FILES` is optional too.
+
+**Verified against real Jetski output.** `scripts/agy_spike.sh` records real
+`stream-json` traces into `tests/fixtures/agy/real/`. The decoder, the
+synthetic test fixtures, and the model guard follow those traces; the findings
+are in [docs/skillbench-spike.md](docs/skillbench-spike.md).
+
+See the [skillbench guide](docs/BENCHMARKS.md#skillbench) for the task format,
+metrics, and cost gates, and the [AGY executor setup](docs/SETUP.md#agy-executor)
+for all environment variables.
+
 ## Experiments
 
 Scale task-level recursion in two ways: **parallel recursion** explores multiple
@@ -158,6 +226,7 @@ through successive Propose–Probe–Compose steps.
 | `--k K --mode parallel` | Probe `K` general and `K` domain-specific candidates, then produce `K` compositions |
 | `--k K --mode sequential` | Refine the harness through `K` successive steps |
 | `--substrate cx` | Use Codex instead of the default OpenCode executor |
+| `--substrate agy` | Use the AGY / Jetski CLI (skillbench only; the default for `--bench skillbench`) |
 
 After each task, harnessing-level recursion retains the adopted harness and
 evidence-supported lessons to guide future refinement. See the
