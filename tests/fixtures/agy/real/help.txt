@@ -1,0 +1,95 @@
+Usage of cli:
+  --add-dir                                Add a directory to the workspace (repeatable) (default [])
+  --agent                                  Agent for the current CLI session
+  --analytics_server_url                   Analytics server host
+  --api_server_url                         API server host (default http://0.0.0.0:50001)
+  --app_data_dir                           Path where application data is stored, relative to GeminiDir (default jetski)
+  --beyond_quota_bucket                    Quota bucket to use for Beyond API calls (format: team/bucket)
+  --bg-updater                             Run as background update worker
+  --browser_eval_env                       Whether to enable browser eval environment setup (pre-installed playwright, CA certs, proxy/SSO)
+  -c                                       Short alias for --continue
+  --cdp_port                               Port for Chrome DevTools Protocol (default 9222)
+  --cli_log_file                           Override log file path for CLI mode
+  --cloud_code_endpoint                    CCPA API URL
+  --continue                               Continue the most recent conversation
+  --conversation                           Resume a previous conversation by ID
+  --conversation_path                      Path to a trajectory file to resume from
+  --csrf_token                             CSRF token for language server
+  --dangerously-skip-permissions           Auto-approve all tool permission requests without prompting
+  --debug                                  Enable debug view and line inconsistency checks
+  --disable-slash-commands                 Disable slash command and skill expansion in print mode
+  --disable_telemetry                      If true, disable telemetry logging
+  --effort                                 Reasoning effort for the current CLI session (low|medium|high|xhigh|max)
+  --enable_lsp                             If true, enable LSP
+  --extension_server_csrf_token            CSRF token for extension server
+  --extension_server_port                  Port to connect to the extension server. If unset, the extension server is not used. (default 0)
+  --file_watch_max_dir_count               The max number of directories we will watch. (default 0)
+  --gemini_dir                             Path where Gemini files are stored. If absolute path, will set directly. If relative path, will be resolved relative to HomeDir. (default .gemini)
+  --host_bridge_url                        Loopback base URL of a host that serves HostBridgeService. If unset, no host is asked about itself.
+  --http_server_port                       Port for HTTP language server. 0 means random. (default 0)
+  --https_server_port                      Port for HTTPS language server. 0 means random. (default 0)
+  -i                                       Short alias for --prompt-interactive
+  --include-default-customizations         Include default customizations (default true)
+  --inference_api_server_url               Inference API server host. If unset, uses default if not in enterprise mode
+  --input-format                           Input format for print mode (text, stream-json). stream-json reads one NDJSON message per line from stdin and runs a turn for each; it requires --output-format stream-json (default text)
+  --is_google3_workspace                   Deprecated: no-op.
+  --is_google_internal                     Whether running in a Google internal environment.
+  --isolated_env                           Run in an isolated environment with a temporary app data directory
+  --json-schema                            Optional JSON schema string or path to a schema file to enforce structured output (for stream-json, only applicable to the final result)
+  --limit_go_max_procs                     Cap GOMAXPROCS at this value (default 4)
+  --local_chrome_headless                  Whether Chrome runs in headless mode. (default true)
+  --local_chrome_user_data_dir             Chrome user data directory.
+  --log-file                               Override CLI log file path
+  --lsp_port                               Port for LSP protocol. 0 means random. (default 0)
+  --mode                                   Set the agent execution mode for this session (accept-edits, auto, plan, bestn)
+  --model                                  Model for the current CLI session
+  --model_api_client_type                  Which model client to use: ccpa or gemini. Defaults to ccpa. (default ccpa)
+  --mquery_for_context_module              Whether to enable mquery in the core context module. (default true)
+  --new-project                            Create a new project for this session
+  --output-format                          Output format for print mode (text, json, stream-json) (default text)
+  --override_business_oauth_client_id      Override Business OAuth client ID
+  --override_business_oauth_client_secret  Override Business OAuth client secret
+  --override_ide_name                      Override IDE name in metadata (e.g. 'antigravity')
+  --override_ide_version                   Override IDE version in metadata (e.g. '0.1.0')
+  --override_oauth_client_id               Override OAuth client ID
+  --override_oauth_client_secret           Override OAuth client secret
+  --override_user_agent_name               Override user agent name for HTTP requests (e.g. 'antigravity-dev')
+  -p                                       Short alias for --print
+  --parent_pipe_path                       Parent pipe path for monitoring whether the parent process is still running
+  --persistent_mode                        If true, run in persistent daemon mode: writes discovery file and doesn't exit when extension closes
+  --print                                  Run a single prompt non-interactively and print the response
+  --print-timeout                          Optional time limit for print mode; 0 waits until the turn completes (default 0s)
+  --profile                                write profiles (cpu, heap, block) to files with this prefix
+  --project                                Project ID or project name for the current CLI session
+  --prompt                                 Alias for --print
+  --prompt-interactive                     Run an initial prompt interactively and continue the session
+  --read_host_bridge_token_from_stdin      Read bearer token for the host bridge from stdin
+  --release_base_url                       Base URL of the release server for the auto-updater
+  --repl_mode                              Whether to run CLI in REPL mode (stdin/stdout REPL)
+  --request_criticality                    Override loadshedding criticality for Beyond API calls (allowed values: SHEDDABLE, SHEDDABLE_PLUS, CRITICAL, CRITICAL_PLUS) (default CRITICAL_PLUS)
+  --sandbox                                Run in a sandbox with terminal restrictions enabled
+  --stamp                                  If true, print stamp information and exit
+  --standalone                             Whether to run in standalone mode
+  --use_custom_page_actions                Whether to enable the actuation overlay functionality (default true)
+  --use_host_auth                          Use HostAuthProvider via HostBridgeService for OAuth authentication
+  --use_local_chrome                       Whether to use local chrome
+  --use_ls_chrome_devtools_mcp             Whether to start the Chrome DevTools MCP server (default true)
+  --use_stubby_auth                        Use LOAS auth instead of OAuth browser flow. Only for use in Standalone + internal mode.
+  --use_test_gaia                          Generate a GAIA thinmint in the test domain. Otherwise use the prod domain.
+  --workspace_id                           Workspace ID
+
+Available subcommands:
+  agent           List available agents
+  agents          List available agents
+  changelog       Show changelog and release notes
+  chatski         Connect your Jetski LS to Chatski (internal)
+  help            Show help for subcommands
+  hub             Interact with the Jetski Hub (internal)
+  install         Configure environment paths and shell settings
+  mcp             Manage MCP servers (add, remove, list, enable, disable)
+  mic-serve       Serve this machine's microphone to a CLI on another host
+  models          List available models
+  plugin          Manage plugins (install, uninstall, list, enable, disable)
+  plugins         Alias for plugin
+  remote-control  Manage the remote-control background daemon (start, status, stop)
+  web             Alias for hub
