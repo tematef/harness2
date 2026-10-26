@@ -27,6 +27,9 @@ from typing import Sequence
 from .judge import Scored
 from .schedule import MODE_NAMES
 
+BASE_MODE = "base"
+"""Mode token of reference-execution rows (`cli.judge --bases`); they involve no selection."""
+
 
 @dataclass
 class Summary:
@@ -45,6 +48,8 @@ class Summary:
 
     @property
     def name(self) -> str:
+        if self.mode == BASE_MODE:
+            return f"bases k={self.k}"
         return f"{MODE_NAMES.get(self.mode, self.mode)} k={self.k}"
 
     def line(self, bench: str = "") -> str:
@@ -57,8 +62,12 @@ class Summary:
             else f"score {self.score:6.2f}%"
         )
         pick = (
-            f" | picked output: final {self.chose_final} / candidate {self.chose_candidate} / "
-            f"base {self.kept_base}"
+            ""
+            if self.mode == BASE_MODE
+            else (
+                f" | picked output: final {self.chose_final} / candidate {self.chose_candidate} / "
+                f"base {self.kept_base}"
+            )
         )
         fb = f" | fell back {self.fell_back}" if self.fell_back else ""
         ug = f" | ungraded {self.n_ungraded}" if self.n_ungraded else ""
@@ -131,14 +140,14 @@ def render(summaries: Sequence[Summary], *, title: str = "", bench: str = "") ->
         ]
 
     for s in summaries:
-        if s.n and s.chose_final <= 0.25 * s.n:
+        if s.mode != BASE_MODE and s.n and s.chose_final <= 0.25 * s.n:
             lines += [
                 "",
                 f"  WARNING  {s.name}: the mode's own final was chosen on only "
                 f"{s.chose_final}/{s.n} tasks. These records include outputs outside "
                 f"the published pool of {s.k} composed finals.",
             ]
-    warn = [s for s in summaries if s.n and s.kept_base >= 0.8 * s.n]
+    warn = [s for s in summaries if s.mode != BASE_MODE and s.n and s.kept_base >= 0.8 * s.n]
     for s in warn:
         lines += [
             "",

@@ -19,6 +19,12 @@ one score elsewhere — with pick provenance, the k=1 noise-floor note and the s
 fell-back counts and improver spend come from the task summaries.
 
     python3 -m harness2.cli.report --bench jb --substrate oc --k 1,2
+
+With --bases it reports the reference executions scored by `cli.judge --bases`
+(base_judged.json) instead. skillbench runs reference executions only, so --bases is implied
+for it and --arm picks the arm namespace:
+
+    python3 -m harness2.cli.report --bench skillbench --arm with --k 3
 """
 
 from __future__ import annotations
@@ -30,8 +36,41 @@ from pathlib import Path
 
 from ..core import report as R
 from ..core import schedule as SCHED
+from ..core.judge import Scored
 from . import _common as C
 from .judge import _load_rows
+
+
+def _load_base_rows(path: Path, k: int) -> list[Scored]:
+    """Rows of a base_judged.json (written by `cli.judge --bases`) as `mode="base"` Scored rows;
+    an unscored execution (`score: null`) becomes an ungraded row."""
+    if not path.is_file():
+        return []
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable base judged cache {path}: {exc}; re-run cli.judge --bases")
+    rows = []
+    for row in raw:
+        score = row.get("score") if isinstance(row.get("score"), dict) else None
+        n_passed = score.get("n_passed") if score else None
+        n_criteria = score.get("n_criteria") if score else None
+        rows.append(
+            Scored(
+                task_id=str(row.get("task", "")),
+                mode=R.BASE_MODE,
+                k=k,
+                label=str(row.get("label", "")),
+                run_id=str(row.get("run_id", "")),
+                chosen_is_base=True,
+                n_passed=n_passed,
+                n_criteria=n_criteria,
+                all_pass=bool(score) and n_criteria is not None and n_passed == n_criteria,
+                raw=score or {},
+                error="" if score else "ungraded",
+            )
+        )
+    return rows
 
 
 def _spend_and_fallbacks(ns_dir: Path, modes: tuple[str, ...], k: int) -> tuple[dict, dict]:
@@ -69,6 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         help="stream-order seed of the sweep; omit for the seedless namespace",
     )
     C.add_modes_arg(g)
+    p.add_argument(
+        "--bases",
+        action="store_true",
+        help="report the reference executions scored by `cli.judge --bases` "
+        "(base_judged.json) instead of the selected runs; implied for skillbench",
+    )
     args = p.parse_args(argv)
     modes = C.parse_modes(args.modes)
     try:
@@ -78,10 +123,24 @@ def main(argv: list[str] | None = None) -> int:
     if not ks:
         raise SystemExit("--k named no scale")
 
-    adapter = C.make_adapter(args.bench, args.subset, args.substrate)
+    adapter = C.make_adapter(args.bench, args.subset, args.substrate, arm=args.arm)
+    tag = C.arm_tag(args.bench, args.arm)
+    bases = args.bases or args.bench == "skillbench"
     rows, fell_back, usd = [], {}, {}
     for k in ks:
-        ns_dir = C.runs_root_for(adapter) / C.summary_namespace(adapter, k, seed=args.seed)
+        ns_dir = C.runs_root_for(adapter) / C.summary_namespace(adapter, k, seed=args.seed, tag=tag)
+        if bases:
+            judged = ns_dir / "base_judged.json"
+            got = _load_base_rows(judged, k)
+            if not got:
+                print(
+                    f"  ! no judged reference executions at {judged} — run "
+                    f"cli.judge --bases for k={k} first",
+                    flush=True,
+                )
+                continue
+            rows.extend(got)
+            continue
         judged = ns_dir / "judged.json"
         got = _load_rows(judged)
         if not got:
@@ -96,8 +155,13 @@ def main(argv: list[str] | None = None) -> int:
 
     title = (
         f"{adapter.spec.name}-{adapter.substrate.name}"
+        + (f" arm={tag}" if tag else "")
         + (f" seed={args.seed}" if args.seed is not None else "")
-        + f" modes={','.join(C.mode_label(m) for m in modes)}"
+        + (
+            " reference executions (bases)"
+            if bases
+            else f" modes={','.join(C.mode_label(m) for m in modes)}"
+        )
     )
     summaries = R.summarise(rows, fell_back=fell_back, usd=usd)
     print(R.render(summaries, title=title, bench=adapter.spec.name))

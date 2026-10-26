@@ -179,6 +179,13 @@ python -m harness2.benchmarks.skillbench freeze --force
 - **Model guard**: the stream's leading `init` event names the model that ran (`init.model`, e.g. `opus-5.5-high`); a model that disagrees with the requested one invalidates the rollout. A stream without any model field (`actual_model = null`) keeps the rollout valid and the report header notes `model unverified (agy reports no model)`.
 - **Statistical power**: with 4 tasks per skill, the task-level bootstrap has only $\binom{4+4-1}{4} = 35$ distinct resamples, so only large lifts (roughly $\ge 0.2$ of the rubric) will achieve a `helps` or `hurts` verdict; most skills are expected to land `inconclusive` in the first full run. The report prints this note alongside the table.
 
+`skillbench-report` is added by this fork. The upstream `harness2-report` also reads skillbench runs, one arm at a time: it reports the arm's mean rubric score over its judged reference executions (`base_judged.json`; `--bases` is implied for skillbench). Use it as a plain per-arm cross-check; it does not pair the arms or compute lift:
+
+```bash
+harness2-report --bench skillbench --arm with --k 3
+harness2-report --bench skillbench --arm without --k 3
+```
+
 ### Environment variables
 
 | Variable | Meaning |

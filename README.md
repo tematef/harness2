@@ -202,6 +202,12 @@ credential files, so `SKILLBENCH_AUTH_FILES` is optional too.
 synthetic test fixtures, and the model guard follow those traces; the findings
 are in [docs/skillbench-spike.md](docs/skillbench-spike.md).
 
+**Reports.** `skillbench-report` (added by this fork) writes
+`runs/skillbench/report.md` and `report.json` with the per-skill lift, confidence
+interval, verdict, invocation rate, and time-to-skill. The upstream
+`harness2-report --bench skillbench --arm <with|without>` prints one arm's plain
+mean rubric score as a cross-check.
+
 See the [skillbench guide](docs/BENCHMARKS.md#skillbench) for the task format,
 metrics, and cost gates, and the [AGY executor setup](docs/SETUP.md#agy-executor)
 for all environment variables.

@@ -35,6 +35,7 @@ from harness2 import config
 from harness2.benchmarks import skillbench as SB
 from harness2.cli import _common as C
 from harness2.cli import judge as judge_cli
+from harness2.cli import report as report_cli
 from harness2.cli import run_sweep as sweep_cli
 from harness2.core import schedule
 from harness2.core.proposer import Reply
@@ -531,6 +532,68 @@ class TestJudgeCliArmThreading(_CliCase):
             judge_cli.main(["--bench", "skillbench", "--bases"])
         with self.assertRaisesRegex(ValueError, "--arm"):
             judge_cli.main(["--bench", "jb", "--arm", "without", "--bases"])
+
+
+class TestReportCliArmThreading(_CliCase):
+    """The upstream `harness2-report` reads a skillbench arm's reference executions."""
+
+    def _seed_base_judged(self, arm: str, scores: list[dict | None], k: int = 1) -> Path:
+        adapter = C.make_adapter("skillbench", None, "agy", arm=arm)
+        ns_dir = C.runs_root_for(adapter) / C.summary_namespace(adapter, k, seed=None, tag=arm)
+        ns_dir.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "task": "make-plan/p1",
+                "label": f"base{i}",
+                "run_id": f"{ns_dir.name}/make-plan/p1/base{i}",
+                "score": score,
+            }
+            for i, score in enumerate(scores, start=1)
+        ]
+        _write(ns_dir / "base_judged.json", json.dumps(rows, indent=1))
+        return ns_dir
+
+    def _report(self, *argv: str) -> str:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = report_cli.main(list(argv))
+        self.assertEqual(rc, 0)
+        return buf.getvalue()
+
+    def test_report_reads_each_arm_namespace_bases(self) -> None:
+        self._seed_base_judged("with", [{"n_passed": 4, "n_criteria": 4}] * 2)
+        self._seed_base_judged(
+            "without", [{"n_passed": 2, "n_criteria": 4}, {"n_passed": 1, "n_criteria": 4}]
+        )
+
+        with_out = self._report("--bench", "skillbench", "--arm", "with", "--k", "1")
+        without_out = self._report("--bench", "skillbench", "--arm", "without", "--k", "1")
+
+        self.assertIn("arm=with", with_out)
+        self.assertIn("bases k=1: n=  2 | score 100.00%", with_out)
+        self.assertIn("arm=without", without_out)
+        self.assertIn("bases k=1: n=  2 | score  37.50%", without_out)
+        for out in (with_out, without_out):
+            self.assertNotIn("picked output", out)
+            self.assertNotIn("WARNING", out)
+
+    def test_report_counts_ungraded_bases_and_explicit_bases_flag(self) -> None:
+        self._seed_base_judged("with", [{"n_passed": 3, "n_criteria": 4}, None])
+        out = self._report("--bench", "skillbench", "--arm", "with", "--k", "1", "--bases")
+        self.assertIn("bases k=1: n=  1 | score  75.00% | ungraded 1", out)
+
+    def test_report_without_judged_bases_has_nothing_to_report(self) -> None:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            report_cli.main(["--bench", "skillbench", "--arm", "with", "--k", "1"])
+        self.assertIn("base_judged.json", buf.getvalue())
+        self.assertIn("--bases", buf.getvalue())
+
+    def test_report_requires_arm_for_skillbench_and_rejects_for_other_benches(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--arm"):
+            report_cli.main(["--bench", "skillbench", "--k", "1"])
+        with self.assertRaisesRegex(ValueError, "--arm"):
+            report_cli.main(["--bench", "jb", "--arm", "with", "--k", "1"])
 
 
 if __name__ == "__main__":
