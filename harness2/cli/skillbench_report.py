@@ -42,6 +42,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .. import config
 from ..benchmarks.skillbench import (
+    DEFAULT_JUDGE_MODEL,
     JUDGMENTS_FILE,
     SKILL_TIMING_FILE,
     ManifestError,
@@ -51,7 +52,7 @@ from ..benchmarks.skillbench import (
     judge_model,
 )
 from ..core import schedule as SCHED
-from ..substrate.agy import exec_model
+from ..substrate.agy import DEFAULT_EXEC_MODEL, exec_model
 from . import _common as C
 
 DEFAULT_BOOTSTRAP_DRAWS = 10_000
@@ -668,7 +669,7 @@ def _fmt_invalid(total: int, by_reason: Mapping[str, int]) -> str:
 
 def render_markdown(report: Mapping[str, Any]) -> str:
     """Format `report` as `report.md` (header metadata, power note, and per-skill table)."""
-    req_exec = report.get("requested_exec_model") or "opus"
+    req_exec = report.get("requested_exec_model") or DEFAULT_EXEC_MODEL
     act_exec = report.get("actual_exec_model")
     exec_str = (
         f"requested `{req_exec}`, actual `{act_exec}`"
@@ -676,7 +677,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         else f"requested `{req_exec}`, actual: {MODEL_UNVERIFIED}"
     )
 
-    req_judge = report.get("requested_judge_model") or "fable"
+    req_judge = report.get("requested_judge_model") or DEFAULT_JUDGE_MODEL
     act_judge = report.get("actual_judge_model")
     judge_str = (
         f"requested `{req_judge}`, actual `{act_judge}`"

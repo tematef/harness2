@@ -219,6 +219,19 @@ class _JudgeCase(unittest.TestCase):
 
 
 class TestJudgeIsolationAndPrompt(_JudgeCase):
+    def test_judge_defaults_to_fable_jet_id_and_optional_effort_and_auth(self) -> None:
+        self.assertEqual(SB.DEFAULT_JUDGE_MODEL, "fable-5.1-high")
+        os.environ.pop("SKILLBENCH_JUDGE_MODEL")
+        os.environ.pop("SKILLBENCH_EFFORT")
+        os.environ.pop("SKILLBENCH_AUTH_FILES")
+        self.assertEqual(SB.judge_model(), "fable-5.1-high")
+        rd = self.make_run_dir()
+        self.assertEqual(SB.score(rd, self.task), {"n_passed": 3, "n_criteria": 4})
+        (call,) = self.stub_calls()
+        self.assertEqual(call["flags"]["model"], "fable-5.1-high")
+        self.assertNotIn("--effort", call["argv"])
+        self.assertEqual(sorted(p.name for p in (rd / "judge" / "home").iterdir()), [])
+
     def test_judge_runs_in_empty_home_with_model_and_json_schema(self) -> None:
         rd = self.make_run_dir()
         got = SB.score(rd, self.task)
@@ -231,6 +244,7 @@ class TestJudgeIsolationAndPrompt(_JudgeCase):
         self.assertIs(flags["dangerously_skip_permissions"], True)
         self.assertIs(flags["disable_slash_commands"], True)
         self.assertIn("json_schema", flags)
+        self.assertEqual(flags["effort"], "high")
         schema = json.loads(flags["json_schema"])
         self.assertEqual(schema["required"], ["criteria"])
         self.assertEqual(

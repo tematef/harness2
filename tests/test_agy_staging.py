@@ -287,10 +287,24 @@ class TestAuthAndHome(_StagingCase):
         with self.assertRaisesRegex(ConfigError, "missing.json"):
             self.materialise("with")
 
-    def test_auth_files_required_and_must_stay_in_home(self) -> None:
-        os.environ.pop("SKILLBENCH_AUTH_FILES")
-        with self.assertRaisesRegex(ConfigError, "SKILLBENCH_AUTH_FILES"):
-            self.materialise("with")
+    def test_auth_files_optional(self) -> None:
+        # internal Jetski authenticates without any file under $HOME: nothing is copied
+        for unset in (None, "", " , "):
+            if unset is None:
+                os.environ.pop("SKILLBENCH_AUTH_FILES", None)
+            else:
+                os.environ["SKILLBENCH_AUTH_FILES"] = unset
+            with self.subTest(value=unset):
+                inst = self.materialise("with")
+                home = inst.staging_dir / "home"
+                files = {
+                    str(p.relative_to(home))
+                    for p in home.rglob("*")
+                    if p.is_file() and PLUGINS_REL not in p.relative_to(home).parents
+                }
+                self.assertEqual(files, {".gemini/GEMINI.md"})
+
+    def test_auth_files_must_stay_in_home(self) -> None:
         for bad in ("../etc/passwd", "/etc/passwd"):
             os.environ["SKILLBENCH_AUTH_FILES"] = bad
             with self.assertRaisesRegex(ConfigError, "SKILLBENCH_AUTH_FILES"):

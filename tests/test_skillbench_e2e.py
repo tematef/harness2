@@ -491,7 +491,15 @@ class TestRunSkillbenchEndToEnd(_E2ECase):
         # - base2: invalid rollout due to model mismatch (result_model_mismatch -> invalid, score=None)
         # - base3: valid rollout whose judge call fails (malformed output -> score=None)
         # Verify base2 and base3 are excluded (not zeroed), so WITH mean is 1.0 (not 1/3 or 1/2).
-        with mock.patch.dict(os.environ, self.base_env()):
+        # The stub echoes --model into init.model by default; the WITH arm replays skill_read
+        # without any model field to exercise the fallback.
+        no_model = self.tmp / "skill_read_no_model.jsonl"
+        lines = (STUB.parent / "agy" / "skill_read.jsonl").read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[0])
+        del first["init"]["model"]
+        _write(no_model, "\n".join([json.dumps(first), *lines[1:]]) + "\n")
+        env = {**self.base_env(), "AGY_STUB_WITH_SCENARIO": str(no_model)}
+        with mock.patch.dict(os.environ, env):
             with contextlib.redirect_stdout(io.StringIO()):
                 rc_with = sweep_cli.main(
                     [
@@ -652,7 +660,7 @@ class TestRunSkillbenchEndToEnd(_E2ECase):
             "make-plan",
             "--max-tasks",
             "1",
-            SKILLBENCH_EFFORT="",
+            SKILLBENCH_EFFORT="extreme",
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("SKILLBENCH_EFFORT", proc.stdout + proc.stderr)

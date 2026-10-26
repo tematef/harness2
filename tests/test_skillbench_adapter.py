@@ -463,8 +463,10 @@ class TestExecuteDeliverablesScoreAndPreflight(_AdapterCase):
             with self.assertRaisesRegex(RuntimeError, "HARNESS2_AGY_BIN"):
                 adapter.preflight()
 
-        # Missing effort fails preflight
+        # Unset effort is fine (jet model ids pin it); an unknown value fails preflight
         with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": ""}):
+            adapter.preflight()
+        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": "extreme"}):
             with self.assertRaisesRegex(ConfigError, "SKILLBENCH_EFFORT"):
                 adapter.preflight()
 

@@ -69,8 +69,9 @@ from ..substrate.agy import (
     AgyTask,
     _kill_group,
     agy_argv,
-    agy_bin,
+    agy_bin_missing_message,
     auth_files,
+    exec_effort,
     exec_model,
     model_guard,
     parse_event,
@@ -426,7 +427,8 @@ def check_manifest(root: Path = TASKS_ROOT) -> str:
 # Judge (fable via agy): deliverable extraction, scrubbing, schema validation, and cache
 # --------------------------------------------------------------------------------------------
 
-DEFAULT_JUDGE_MODEL = "fable"
+# A jet model id: the effort is part of the id, there is no plain `fable`.
+DEFAULT_JUDGE_MODEL = "fable-5.1-high"
 DEFAULT_JUDGE_REPEAT = 1
 DEFAULT_JUDGE_TIMEOUT_S = 300
 JUDGMENTS_FILE = "judgments.json"
@@ -487,7 +489,7 @@ _PATH_PATTERNS = (
 
 
 def judge_model() -> str:
-    """The judge model requested from agy (SKILLBENCH_JUDGE_MODEL, default `fable`)."""
+    """The judge model requested from agy (SKILLBENCH_JUDGE_MODEL, default `fable-5.1-high`)."""
     return str(config.env("SKILLBENCH_JUDGE_MODEL", DEFAULT_JUDGE_MODEL))
 
 
@@ -674,8 +676,7 @@ def _validate_judgment(
 
 
 def _stage_judge_auth(home: Path) -> list[Path]:
-    if not config.env("SKILLBENCH_AUTH_FILES"):
-        return []
+    """Copy the optional SKILLBENCH_AUTH_FILES (none by default) into the judge's HOME."""
     real = Path.home()
     copied: list[Path] = []
     for rel in auth_files():
@@ -715,10 +716,7 @@ def _run_judge_once(
 ) -> dict[str, Any] | None:
     binary = resolve_agy_bin()
     if binary is None:
-        raise RuntimeError(
-            f"agy binary {agy_bin()!r} not found or not executable: install AGY/Jetski or set "
-            f"HARNESS2_AGY_BIN to the agy (or jetski) executable"
-        )
+        raise RuntimeError(agy_bin_missing_message())
     judge_root = run_dir / "judge"
     home = judge_root / "home"
     work = judge_root / "work"
@@ -741,7 +739,7 @@ def _run_judge_once(
         prompt,
         model=model,
         timeout=timeout,
-        effort=config.env("SKILLBENCH_EFFORT"),
+        effort=exec_effort(),
         json_schema=JUDGE_SCHEMA_JSON,
     )
     copied = _stage_judge_auth(home)

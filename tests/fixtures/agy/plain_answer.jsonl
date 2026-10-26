@@ -1,4 +1,6 @@
-{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"`add(a, b)` returns "}}
-{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"the sum of both arguments.\n"}}
-{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"No changes were needed."}}
-{"event":"result","result":{"usage":{"total_tokens":1204}}}
+{"event":"init","conversation_id":"00000000-0000-4000-8000-000000000001","init":{"model":"<requested-model>","cwd":"/tmp/skillbench-run/work","tools":["ask_question","finish","read_file","run_command","view_file","write_file","write_to_file"],"permission_mode":"always-proceed"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-4000-8000-000000000001","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-4000-8000-000000000001","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"`add(a, b)` returns "}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-4000-8000-000000000001","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"the sum of both arguments.\n"}}
+{"event":"step_update","step_update":{"conversation_id":"00000000-0000-4000-8000-000000000001","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"No changes were needed.","duration_seconds":1.5,"usage":{"input_tokens":900,"output_tokens":100,"total_tokens":1204}}}
+{"event":"result","result":{"conversation_id":"00000000-0000-4000-8000-000000000001","status":"SUCCESS","response":"`add(a, b)` returns the sum of both arguments.\nNo changes were needed.","duration_seconds":12.5,"num_turns":1,"usage":{"input_tokens":1004,"output_tokens":200,"total_tokens":1204}}}

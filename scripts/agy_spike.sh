@@ -14,16 +14,19 @@
 # limitations under the License.
 
 # Pre-pilot spike: record real agy stream-json for the scenarios the synthetic fixtures in
-# tests/fixtures/agy/ assume (see docs/skillbench-spike.md). NOT run during implementation.
-#   SKILLBENCH_PLUGINS_DIR=~/projects/cc-thingz/plugins SKILLBENCH_AUTH_FILES=<list> \
-#     bash scripts/agy_spike.sh             # run every probe on every model
+# tests/fixtures/agy/ encode (see docs/skillbench-spike.md). Makes paid model calls; never run
+# by the test suite. With the Google-internal Jetski CLI (a `jet` alias cannot be used):
+#   HARNESS2_AGY_BIN=/google/bin/releases/jetski-devs/tools/cli \
+#     SKILLBENCH_PLUGINS_DIR=~/projects/cc-thingz/plugins bash scripts/agy_spike.sh
 #   bash scripts/agy_spike.sh --dry-run     # print the probes, call nothing, write nothing
 # Settings: HARNESS2_AGY_BIN (default agy), SKILLBENCH_PLUGINS (allowlist),
-#   SKILLBENCH_AUTH_FILES (comma list relative to $HOME, copied, never symlinked),
-#   SPIKE_MODELS (default "opus fable"), SPIKE_TIMEOUT (default 5m),
+#   SKILLBENCH_AUTH_FILES (optional comma list relative to $HOME, copied, never symlinked;
+#   internal Jetski needs none), SPIKE_MODELS (default "opus-5.5-high fable-5.1-high", jet
+#   model ids that pin the effort), SPIKE_TIMEOUT (default 5m),
 #   SPIKE_OUT (default tests/fixtures/agy/real).
 # Every probe runs under a fresh throwaway HOME holding only the staged plugins and copies of
-# the auth files; streams and stderr are scrubbed of secrets and home paths before saving.
+# any auth files; streams and stderr are scrubbed of secrets, home paths and the local user and
+# group names before saving.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -38,10 +41,12 @@ AGY=${HARNESS2_AGY_BIN:-agy}
 PLUGINS_DIR=${SKILLBENCH_PLUGINS_DIR:?set SKILLBENCH_PLUGINS_DIR to a cc-thingz plugins/ checkout}
 PLUGINS=${SKILLBENCH_PLUGINS:-brainstorm,planning,review,skill-eval,thinking-tools,workflow}
 AUTH_FILES=${SKILLBENCH_AUTH_FILES:-}
-MODELS=${SPIKE_MODELS:-opus fable}
+MODELS=${SPIKE_MODELS:-opus-5.5-high fable-5.1-high}
 TIMEOUT=${SPIKE_TIMEOUT:-5m}
 OUT=${SPIKE_OUT:-tests/fixtures/agy/real}
 REAL_HOME=$HOME
+USER_NAME=$(id -un 2>/dev/null || true)
+GROUP_NAME=$(id -gn 2>/dev/null || true)
 PROBES=(plain_answer skill_read skill_read_slash_enabled ask_question json_schema)
 SCHEMA='{"type":"object","required":["criteria"],"properties":{"criteria":{"type":"array","items":{"type":"object","required":["id","pass","reason"],"properties":{"id":{"type":"string"},"pass":{"type":"boolean"},"reason":{"type":"string"}}}}}}'
 
@@ -54,8 +59,9 @@ for p in "${PLUGIN_NAMES[@]}"; do
   [[ -d $PLUGINS_DIR/$p ]] || die "allowlisted plugin not found: $PLUGINS_DIR/$p"
 done
 if [[ $DRY_RUN == 0 ]]; then
-  command -v "$AGY" >/dev/null || die "agy binary not found: $AGY (set HARNESS2_AGY_BIN)"
-  [[ -n $AUTH_FILES ]] || die "set SKILLBENCH_AUTH_FILES (comma list relative to \$HOME)"
+  command -v "$AGY" >/dev/null ||
+    die "agy binary not found: $AGY (set HARNESS2_AGY_BIN to its path, e.g." \
+      "/google/bin/releases/jetski-devs/tools/cli; a shell alias such as jet cannot be used)"
   for f in "${AUTH_NAMES[@]}"; do
     [[ -z $f || -f $REAL_HOME/$f ]] || die "auth file missing: ~/$f"
   done
@@ -116,9 +122,13 @@ probe_prompt() {
 }
 
 scrub() {
+  local ids=()
+  [[ -n $USER_NAME ]] && ids+=(-e "s#\\b${USER_NAME}\\b#<user>#g")
+  [[ -n $GROUP_NAME && $GROUP_NAME != "$USER_NAME" ]] && ids+=(-e "s#\\b${GROUP_NAME}\\b#<group>#g")
   sed -E \
     -e "s#${TMP}#<TMP>#g" \
     -e "s#${REAL_HOME}#<HOME>#g" \
+    "${ids[@]}" \
     -e 's#("(access_token|refresh_token|id_token|client_secret|api_key|apikey|token|authorization)"[[:space:]]*:[[:space:]]*")[^"]*"#\1[scrubbed]"#gI' \
     -e 's#ya29\.[A-Za-z0-9._-]+#[scrubbed]#g' \
     -e 's#1//[A-Za-z0-9._-]{20,}#[scrubbed]#g' \
@@ -155,7 +165,9 @@ report_auth() {
     else
       echo "opened files: not recorded (strace unavailable)"
     fi
-    if [[ $(auth_digest) == "$before" ]]; then
+    if [[ -z $AUTH_FILES ]]; then
+      echo "real-HOME auth files: none listed (SKILLBENCH_AUTH_FILES empty)"
+    elif [[ $(auth_digest) == "$before" ]]; then
       echo "real-HOME auth files: unchanged"
     else
       echo "real-HOME auth files: CHANGED"
@@ -208,7 +220,7 @@ if [[ $DRY_RUN == 0 ]]; then
   : >"$OUT/auth-files.txt"
   { "$AGY" --help 2>&1 || true; } | scrub >"$OUT/help.txt"
 else
-  echo "[dry-run] plugins: ${PLUGIN_NAMES[*]}; auth files copied: ${AUTH_FILES:-<none set>}"
+  echo "[dry-run] plugins: ${PLUGIN_NAMES[*]}; auth files copied: ${AUTH_FILES:-<none>}"
 fi
 for model in $MODELS; do
   for probe in "${PROBES[@]}"; do

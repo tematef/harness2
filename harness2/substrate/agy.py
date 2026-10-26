@@ -33,13 +33,26 @@ Execution (one rollout per run_id):
                               events.jsonl, final.md, diff.patch, new_files/, skill_timing.json
     AgySubstrate.execute      run_rollout for each run_id (task resolver + runs root supplied
                               by the benchmark adapter)
-    AgySubstrate.preflight    binary, git, pinned effort, plugins dir and auth files present
+    AgySubstrate.preflight    binary, git, effort value, plugins dir and any listed auth files
 
-The event shape follows revmux's agy decoder (`event`, `result{structured_output, model?,
-usage.total_tokens}`, `step_update{step_type, state, tool_name, text_delta, tool_info{name,
-parameters}}`). Fields marked "assumed" in docs/skillbench-spike.md (the optional
-`result.model`, skill reads as plain `view_file` steps) are verified in the pre-pilot spike.
-Lines in a run's events.jsonl additionally carry `t`, seconds since the agy process spawned.
+The event shape is verified against real `jet` streams (tests/fixtures/agy/real/, see
+docs/skillbench-spike.md):
+
+    init         {event: "init", conversation_id, init{model, cwd, tools, permission_mode}}
+                 -- the first line; `init.model` is the only place the stream names the model
+                 (a full jet id such as `opus-5.5-high`)
+    step_update  {step_type, state, tool_name, text_delta, tool_info{name, parameters, output?}}
+                 -- step types `user_input`, `unknown`, `agent_response`, `tool`; a skill read
+                 is a `read_file` tool step whose `Path` is <HOME>/.gemini/config/plugins/
+                 <plugin>/skills/<skill>/SKILL.md; a tool's DONE step repeats its parameters
+                 and adds `output`
+    result       {response, status, num_turns, duration_seconds, usage.total_tokens,
+                 structured_output?} -- the last line; `response` holds the full final answer
+                 (the last DONE text delta is often just "\n") and there is no model field
+
+Older shapes stay decodable (`result.model`, `view_file`/`AbsolutePath` reads, DONE tool steps
+without `tool_info`). Lines in a run's events.jsonl additionally carry `t`, seconds since the
+agy process spawned.
 """
 
 from __future__ import annotations
@@ -64,8 +77,9 @@ from ..core import tree as HT
 from ..core.tree import SurfaceSpec
 from .base import Install
 
-# Tools whose call counts as reading a skill (spike question 3: a skill read is an ordinary
-# file read of <HOME>/.gemini/config/plugins/<plugin>/skills/<skill>/SKILL.md).
+# Tools whose call counts as reading a skill (spike question 3: jet reads a skill with an
+# ordinary `read_file` of <HOME>/.gemini/config/plugins/<plugin>/skills/<skill>/SKILL.md;
+# `view_file` is the older AGY name for the same tool).
 READ_TOOLS = frozenset({"view_file", "read_file"})
 
 _THINKING_STEPS = frozenset({"thinking", "reasoning", "planner_thought"})
@@ -87,6 +101,8 @@ class AgyEvent:
     model: str | None = None
     error: str | None = None
     t: float | None = None
+    response: str | None = None
+    tool_output: str | None = None
 
     @property
     def is_result(self) -> bool:
@@ -121,6 +137,7 @@ def parse_event(line: str) -> AgyEvent | None:
     kind = obj["event"]
     su = _dict(obj.get("step_update"))
     res = _dict(obj.get("result"))
+    init = _dict(obj.get("init"))
     info = _dict(su.get("tool_info"))
     params = info.get("parameters")
     structured = res.get("structured_output")
@@ -142,9 +159,11 @@ def parse_event(line: str) -> AgyEvent | None:
         text=su.get("text_delta") if isinstance(su.get("text_delta"), str) else None,
         structured_output=structured,
         total_tokens=tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None,
-        model=_str(res.get("model")) or _str(obj.get("model")),
+        model=_str(res.get("model")) or _str(obj.get("model")) or _str(init.get("model")),
         error=_str(err) if err is not None else None,
         t=t,
+        response=res.get("response") if isinstance(res.get("response"), str) else None,
+        tool_output=info.get("output") if isinstance(info.get("output"), str) else None,
     )
 
 
@@ -194,8 +213,9 @@ def render_trajectory(
     """Render decoded agy events into the shared trajectory grammar.
 
     Streamed `ACTIVE` text deltas of one response are merged into a single line; a `DONE`
-    response delta (agy's final message) gets its own line. agy streams no tool output, so a
-    tool call renders as `[ACTION]` only, plus `[OBSERVATION ERROR]` when the step fails.
+    response delta gets its own line. A tool call renders as `[ACTION]` when it starts; its
+    `DONE` step (which repeats the parameters) renders only its `output`, as `[OBSERVATION]`,
+    and a failed step renders `[OBSERVATION ERROR]`.
     """
     lines: list[str] = []
     buf: list[str] = []
@@ -219,6 +239,9 @@ def render_trajectory(
                 lines.append(
                     f"[OBSERVATION ERROR] {ev.tool_name or 'tool'}: {_clip(detail, obs_trunc)}"
                 )
+            elif ev.state == "DONE":
+                if ev.tool_output and ev.tool_output.strip():
+                    lines.append(f"[OBSERVATION] {_clip(ev.tool_output.strip(), obs_trunc)}")
             elif ev.tool_args is not None or ev.state == "ACTIVE":
                 args = (
                     json.dumps(ev.tool_args, default=str, ensure_ascii=False)
@@ -350,12 +373,12 @@ def plugin_allowlist() -> tuple[str, ...]:
 
 
 def auth_files() -> tuple[str, ...]:
-    """SKILLBENCH_AUTH_FILES as normalised paths relative to `$HOME` (required)."""
-    raw = config.require(
-        "SKILLBENCH_AUTH_FILES",
-        needed_by="the agy substrate (agy credentials copied into each rollout's throwaway "
-        "HOME; comma list relative to $HOME, confirmed in the pre-pilot spike)",
-    )
+    """SKILLBENCH_AUTH_FILES as normalised paths relative to `$HOME` (optional, default none).
+
+    Internal Jetski authenticates without any file under `$HOME` (spike question 8), so an
+    unset or empty value copies nothing. A listed entry must be a path inside `$HOME`.
+    """
+    raw = str(config.env("SKILLBENCH_AUTH_FILES") or "")
     out = []
     for item in (s.strip() for s in raw.split(",")):
         if not item:
@@ -369,8 +392,6 @@ def auth_files() -> tuple[str, ...]:
                 f"SKILLBENCH_AUTH_FILES entries must be paths relative to $HOME, got {item!r}"
             )
         out.append(rel)
-    if not out:
-        raise config.ConfigError("SKILLBENCH_AUTH_FILES lists no files")
     return tuple(dict.fromkeys(out))
 
 
@@ -424,20 +445,22 @@ def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
 
 
 def checked_auth_files() -> tuple[Path, tuple[str, ...]]:
-    """`(real $HOME, auth_files())` after checking every listed auth file exists there."""
+    """`(real $HOME, auth_files())` after checking every listed auth file exists there (an
+    empty list passes)."""
     real = Path.home()
     rels = auth_files()
     missing = [r for r in rels if not (real / r).is_file()]
     if missing:
         raise config.ConfigError(
             f"auth file(s) {missing} listed in SKILLBENCH_AUTH_FILES not found under {real}: "
-            f"log in with `agy` once, or fix SKILLBENCH_AUTH_FILES"
+            f"log in with `agy` once, or fix SKILLBENCH_AUTH_FILES (internal Jetski needs "
+            f"none; leave it empty)"
         )
     return real, rels
 
 
 def stage_auth(home: Path) -> list[str]:
-    """Copy (never link) the SKILLBENCH_AUTH_FILES from the real `$HOME` into `home`."""
+    """Copy (never link) the SKILLBENCH_AUTH_FILES, if any, from the real `$HOME` into `home`."""
     real, rels = checked_auth_files()
     for rel in rels:
         dst = home / rel
@@ -516,7 +539,12 @@ def _digest(*parts: str) -> str:
 # --------------------------------------------------------------------------------------------
 
 DEFAULT_AGY_BIN = "agy"
-DEFAULT_EXEC_MODEL = "opus"
+# The Google-internal Jetski CLI (same flags as `agy`); `jet` is usually a shell alias for it.
+JETSKI_CLI = "/google/bin/releases/jetski-devs/tools/cli"
+# jet model ids embed the effort (spike question 1): there is no plain `opus`.
+DEFAULT_EXEC_MODEL = "opus-5.5-high"
+# Values `--effort` accepts (spike question 7).
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Used when a caller passes no positive timeout (adapters pass `int(timeout or 0)`).
 DEFAULT_TIMEOUT_S = 1800
 # Upper bound on draining agy's stdout after the process (group) is gone.
@@ -547,6 +575,16 @@ def agy_bin() -> str:
     return str(config.env("HARNESS2_AGY_BIN", DEFAULT_AGY_BIN))
 
 
+def agy_bin_missing_message() -> str:
+    """The remediation for an unusable HARNESS2_AGY_BIN (shared with the skillbench judge)."""
+    return (
+        f"agy binary {agy_bin()!r} not found or not executable: install AGY so `agy` is on "
+        f"PATH, or set HARNESS2_AGY_BIN to the executable's path (Google-internal Jetski CLI: "
+        f"HARNESS2_AGY_BIN={JETSKI_CLI}); a shell alias or function such as `jet` cannot be "
+        f"used because harness2 starts the binary directly"
+    )
+
+
 def resolve_agy_bin() -> Path | None:
     """HARNESS2_AGY_BIN as an executable path (a bare name is looked up on PATH), else None."""
     raw = agy_bin()
@@ -558,16 +596,19 @@ def resolve_agy_bin() -> Path | None:
 
 
 def exec_model() -> str:
-    """The executor model requested from agy (SKILLBENCH_EXEC_MODEL, default `opus`)."""
+    """The executor model requested from agy (SKILLBENCH_EXEC_MODEL, default `opus-5.5-high`)."""
     return str(config.env("SKILLBENCH_EXEC_MODEL", DEFAULT_EXEC_MODEL))
 
 
 def exec_effort() -> str:
-    """SKILLBENCH_EFFORT (required): agy's default effort is unknown, so it is always pinned."""
-    return config.require(
-        "SKILLBENCH_EFFORT",
-        needed_by="the agy substrate (pinned --effort, identical in both skillbench arms)",
-    )
+    """SKILLBENCH_EFFORT (optional): `""` passes no `--effort`, since a jet model id such as
+    `opus-5.5-high` already pins the effort. A set value must be one of EFFORTS."""
+    raw = str(config.env("SKILLBENCH_EFFORT") or "").strip()
+    if raw and raw not in EFFORTS:
+        raise config.ConfigError(
+            f"SKILLBENCH_EFFORT must be empty or one of {'|'.join(EFFORTS)}, got {raw!r}"
+        )
+    return raw
 
 
 def agy_argv(
@@ -625,11 +666,14 @@ def model_guard(events: Iterable[AgyEvent], requested: str) -> tuple[str | None,
 
 
 def final_text(events: Iterable[AgyEvent]) -> str:
-    """agy's final message: the last `DONE` response delta, else the response text streamed
-    after the last tool call."""
+    """agy's final message: the last non-blank `result.response` (jet's full answer), else the
+    last `DONE` response delta, else the response text streamed after the last tool call."""
     last_done: str | None = None
+    last_response: str | None = None
     tail: list[str] = []
     for ev in events:
+        if ev.response is not None and ev.response.strip():
+            last_response = ev.response
         if ev.is_tool:
             tail = []
             continue
@@ -639,6 +683,8 @@ def final_text(events: Iterable[AgyEvent]) -> str:
             last_done = ev.text
         else:
             tail.append(ev.text)
+    if last_response is not None:
+        return last_response
     return last_done if last_done is not None else "".join(tail)
 
 
@@ -770,10 +816,7 @@ def run_rollout(
         raise ValueError("install has no target_skill; materialise it with ctx['target_skill']")
     binary = resolve_agy_bin()
     if binary is None:
-        raise RuntimeError(
-            f"agy binary {agy_bin()!r} not found or not executable: install AGY/Jetski or set "
-            f"HARNESS2_AGY_BIN to the agy (or jetski) executable"
-        )
+        raise RuntimeError(agy_bin_missing_message())
     model, effort = exec_model(), exec_effort()
     timeout = int(timeout) if timeout and int(timeout) > 0 else DEFAULT_TIMEOUT_S
     run_dir = Path(run_dir)
@@ -885,9 +928,9 @@ class AgySubstrate:
 
         Layout of `staging_dir`: `home/.gemini/config/plugins/<plugin>/` (allowlisted plugins,
         target skill omitted for arm `without`), `home/.gemini/GEMINI.md` (the tree's always-on
-        text, when non-blank), `home/<auth files>` (copies) and `shims/<tool>`. The fingerprint
-        digests the source tree, the staged plugins and the shims -- never the auth files, so a
-        token refresh does not move the harness identity.
+        text, when non-blank), `home/<auth files>` (copies, if any) and `shims/<tool>`. The
+        fingerprint digests the source tree, the staged plugins and the shims -- never the auth
+        files, so a token refresh does not move the harness identity.
         """
         if spec.install_mode != INSTALL_MODE:
             raise ValueError(
@@ -958,13 +1001,10 @@ class AgySubstrate:
         )
 
     def preflight(self) -> None:
-        """Checks the agy binary, git, the pinned effort, the plugins checkout and the auth
-        files; starts nothing (agy is not even asked for --version)."""
+        """Checks the agy binary, git, the effort value, the plugins checkout and any listed
+        auth files; starts nothing (agy is not even asked for --version)."""
         if resolve_agy_bin() is None:
-            raise RuntimeError(
-                f"agy binary {agy_bin()!r} not found or not executable: install AGY/Jetski so "
-                f"`agy` is on PATH, or set HARNESS2_AGY_BIN to its path (e.g. the jetski alias)"
-            )
+            raise RuntimeError(agy_bin_missing_message())
         if shutil.which("git") is None:
             raise RuntimeError("git not found on PATH: install git (fixtures run as git repos)")
         exec_effort()

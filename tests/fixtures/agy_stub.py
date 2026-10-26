@@ -16,7 +16,9 @@
 """Fake ``agy`` binary for tests (stdlib only); select it with ``HARNESS2_AGY_BIN``.
 
 It accepts any ``agy`` command line, records the call and replays a synthetic stream-json
-fixture on stdout. Behaviour is driven by environment variables:
+fixture on stdout. The fixtures follow the real ``jet`` stream shape (a leading ``init`` event,
+``read_file``/``write_file`` steps with ``Path``, a ``result`` with ``response``). Behaviour is
+driven by environment variables:
 
 - ``AGY_STUB_SCENARIO`` — fixture to replay: a name under ``tests/fixtures/agy/``
   (``skill_read`` → ``skill_read.jsonl``) or a path to any ``.jsonl`` file. Default
@@ -29,12 +31,20 @@ fixture on stdout. Behaviour is driven by environment variables:
   replay instead of exiting, so callers can exercise their timeout.
 - ``AGY_STUB_EXIT_CODE`` — exit status after the replay (default 0); non-zero also prints an
   error to stderr.
+- ``AGY_STUB_JUDGE_SCENARIO`` / ``AGY_STUB_WITH_SCENARIO`` / ``AGY_STUB_WITHOUT_SCENARIO`` —
+  per-role overrides (``--json-schema`` calls, and runs under ``/results/with/`` or
+  ``/results/without/``); ``auto`` for the judge synthesizes a passing grade.
+
+The placeholder ``<requested-model>`` (normally ``init.model``) is replaced by the ``--model``
+value, so a replay reports the model that was asked for; fixtures that name a model literally
+(``result_with_model``, ``result_model_mismatch``) keep it.
 
 The fixtures use the placeholder rollout root ``/tmp/skillbench-run/``: ``home/`` is rewritten
-to ``$HOME`` and ``work/`` to the current directory in every emitted event. A ``write_to_file``
-tool call whose ``TargetFile`` resolves inside the current directory is applied (its
-``CodeContent`` is written), so a scenario can produce a diff; targets outside cwd are skipped
-with a warning on stderr. Malformed fixture lines are emitted verbatim.
+to ``$HOME`` and ``work/`` to the current directory in every emitted event. An ACTIVE
+``write_file`` (``Path`` + ``Content``) or ``write_to_file`` (``TargetFile`` + ``CodeContent``)
+step whose target resolves inside the current directory is applied, so a scenario can produce a
+diff; targets outside cwd are skipped with a warning on stderr, and a step without content (real
+jet streams omit it) writes nothing. Malformed fixture lines are emitted verbatim.
 """
 
 import json
@@ -47,6 +57,9 @@ FIXTURES = Path(__file__).resolve().parent / "agy"
 DEFAULT_SCENARIO = "plain_answer"
 PLACEHOLDER_HOME = "/tmp/skillbench-run/home"
 PLACEHOLDER_WORK = "/tmp/skillbench-run/work"
+PLACEHOLDER_MODEL = "<requested-model>"
+# tool name -> (target parameter, content parameter)
+WRITE_TOOLS = {"write_file": ("Path", "Content"), "write_to_file": ("TargetFile", "CodeContent")}
 VALUE_FLAGS = {
     "-p": "prompt",
     "--prompt": "prompt",
@@ -112,15 +125,16 @@ def rewrite(value, mapping):
 
 
 def apply_write(event, cwd):
-    """Write the file of an ACTIVE ``write_to_file`` step when its target lies inside ``cwd``."""
+    """Write the file of an ACTIVE write step when its target lies inside ``cwd``."""
     step = event.get("step_update") if isinstance(event, dict) else None
     if not isinstance(step, dict) or step.get("state") != "ACTIVE":
         return
     info = step.get("tool_info")
-    if not isinstance(info, dict) or info.get("name") != "write_to_file":
+    if not isinstance(info, dict) or info.get("name") not in WRITE_TOOLS:
         return
+    target_key, content_key = WRITE_TOOLS[info["name"]]
     params = info.get("parameters") or {}
-    target, content = params.get("TargetFile"), params.get("CodeContent", "")
+    target, content = params.get(target_key), params.get(content_key)
     if not isinstance(target, str) or not isinstance(content, str):
         return
     path = (cwd / target).resolve()
@@ -145,7 +159,7 @@ def emit(line, mapping, cwd):
     apply_write(rewritten, cwd)
 
 
-def auto_judge_events(prompt):
+def auto_judge_events(prompt, model=""):
     """Synthesize a valid judge stream matching the criterion IDs in ``prompt``."""
     rubric_block = prompt or ""
     if "## Rubric\n" in rubric_block:
@@ -175,7 +189,13 @@ def auto_judge_events(prompt):
         }
         for i, cid in enumerate(cids)
     ]
+    structured = {"criteria": criteria}
     return [
+        {
+            "event": "init",
+            "conversation_id": "00000000-0000-4000-8000-0000000000aa",
+            "init": {"model": model, "cwd": str(Path.cwd()), "tools": ["finish"]},
+        },
         {
             "event": "step_update",
             "step_update": {
@@ -187,7 +207,10 @@ def auto_judge_events(prompt):
         {
             "event": "result",
             "result": {
-                "structured_output": {"criteria": criteria},
+                "status": "SUCCESS",
+                "response": "grading done\n" + json.dumps(structured, separators=(",", ":")),
+                "num_turns": 1,
+                "structured_output": structured,
                 "usage": {"total_tokens": 512},
             },
         },
@@ -227,11 +250,16 @@ def main(argv):
     cwd = Path.cwd().resolve()
     mode, scenario = select_scenario(flags, cwd)
     sleep_s = float(os.environ.get("AGY_STUB_SLEEP") or 0)
-    mapping = [(PLACEHOLDER_HOME, home), (PLACEHOLDER_WORK, str(cwd))]
+    model = flags.get("model") if isinstance(flags.get("model"), str) else ""
+    mapping = [
+        (PLACEHOLDER_HOME, home),
+        (PLACEHOLDER_WORK, str(cwd)),
+        (PLACEHOLDER_MODEL, model),
+    ]
     if mode == "auto":
         lines = [
             json.dumps(ev, ensure_ascii=False, separators=(",", ":"))
-            for ev in auto_judge_events(flags.get("prompt", ""))
+            for ev in auto_judge_events(flags.get("prompt", ""), model)
         ]
     else:
         fixture = resolve_scenario(scenario)

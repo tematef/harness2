@@ -142,21 +142,21 @@ Codex runs with its sandbox disabled. Review the
 
 ## AGY executor
 
-The AGY substrate (`--substrate agy`) drives headless AGY / Jetski (`agy -p <prompt> --output-format stream-json --dangerously-skip-permissions --disable-slash-commands`) and is the default executor for [`skillbench`](BENCHMARKS.md#skillbench). It does not require `HARNESS2_SOLVER_MODEL` or `HARNESS2_JUDGE_MODEL`; instead, configure the AGY binary, plugin checkout, credentials, models, and pinned effort in `.env` or the shell:
+The AGY substrate (`--substrate agy`) drives headless AGY / Jetski (`agy -p <prompt> --output-format stream-json --dangerously-skip-permissions --disable-slash-commands`) and is the default executor for [`skillbench`](BENCHMARKS.md#skillbench). It does not require `HARNESS2_SOLVER_MODEL` or `HARNESS2_JUDGE_MODEL`; instead, configure the AGY binary, plugin checkout and models (credentials and effort are optional) in `.env` or the shell:
 
 | Setting | Meaning |
 |---|---|
-| `HARNESS2_AGY_BIN` | Executable name or path for AGY / Jetski (default `agy`) |
+| `HARNESS2_AGY_BIN` | Executable name or path for AGY (default `agy`); for Google-internal Jetski use `/google/bin/releases/jetski-devs/tools/cli` (a shell alias or function such as `jet` cannot be used) |
 | `SKILLBENCH_PLUGINS_DIR` | Path to a `cc-thingz` `plugins/` checkout (**required**) |
 | `SKILLBENCH_PLUGINS` | Comma-separated plugin allowlist (default `brainstorm,planning,review,skill-eval,thinking-tools,workflow`) |
-| `SKILLBENCH_AUTH_FILES` | Comma-separated paths relative to `$HOME` copied into each rollout's isolated `HOME` (**required**) |
-| `SKILLBENCH_EXEC_MODEL` | Executor model alias passed to `agy --model` (default `opus`) |
-| `SKILLBENCH_JUDGE_MODEL` | Judge model alias passed to `agy --model` (default `fable`) |
-| `SKILLBENCH_EFFORT` | Reasoning effort pinned via `agy --effort` across both arms (**required**) |
+| `SKILLBENCH_AUTH_FILES` | Comma-separated paths relative to `$HOME` copied into each rollout's isolated `HOME` (optional, default none: internal Jetski authenticates without files) |
+| `SKILLBENCH_EXEC_MODEL` | Executor model id passed to `agy --model` (default `opus-5.5-high`; `jet models` lists the ids, which embed the effort) |
+| `SKILLBENCH_JUDGE_MODEL` | Judge model id passed to `agy --model` (default `fable-5.1-high`) |
+| `SKILLBENCH_EFFORT` | Extra `agy --effort` value (`low`, `medium`, `high`, `xhigh`, `max`) for both arms (optional, default empty: no `--effort`, the model id pins it) |
 
-Each rollout runs inside a fresh git repository (`<run>/work`) with a throwaway `HOME` (`<run>/home`) containing only the arm's allowlisted plugins and a copy (never a symlink) of `SKILLBENCH_AUTH_FILES`, plus `PATH` shims for clipboard and diff tools (`xclip`, `xsel`, `wl-copy`, `pbcopy`, `revdiff`). Copied auth files are removed from `<run>/home` when the rollout completes.
+Each rollout runs inside a fresh git repository (`<run>/work`) with a throwaway `HOME` (`<run>/home`) containing only the arm's allowlisted plugins and a copy (never a symlink) of any `SKILLBENCH_AUTH_FILES`, plus `PATH` shims for clipboard and diff tools (`xclip`, `xsel`, `wl-copy`, `pbcopy`, `revdiff`). Copied auth files are removed from `<run>/home` when the rollout completes.
 
-Verify the AGY installation, auth files, plugin checkout, and frozen task manifest before running:
+Verify the AGY installation, any listed auth files, the plugin checkout, and the frozen task manifest before running:
 
 ```bash
 harness2-check --bench skillbench --substrate agy

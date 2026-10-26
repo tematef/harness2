@@ -205,7 +205,11 @@ class TestSkillbenchPreflight(_PreflightCase):
             with self.assertRaises(config.ConfigError):
                 preflight.require_ready(adapter, judge=True)
 
-        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": ""}):
+        # SKILLBENCH_EFFORT and SKILLBENCH_AUTH_FILES are optional with jet model ids
+        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": "", "SKILLBENCH_AUTH_FILES": ""}):
+            self.assertEqual(preflight.check(adapter, judge=True), [])
+
+        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": "extreme"}):
             errs = preflight.check(adapter, judge=True)
             self.assertEqual(len(errs), 1)
             self.assertIn("SKILLBENCH_EFFORT", errs[0])
@@ -411,12 +415,13 @@ class TestSkillbenchIdentityCheck(_PreflightCase):
                 self.assertEqual(self._run_mocked_sweep("with"), 1)
             self.assertIn("different models or tasks", err.getvalue())
 
-        # Changing SKILLBENCH_EFFORT refuses resume
-        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": "low"}):
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                self.assertEqual(self._run_mocked_sweep("with"), 1)
-            self.assertIn("different models or tasks", err.getvalue())
+        # Changing SKILLBENCH_EFFORT refuses resume, including unsetting it
+        for effort in ("low", ""):
+            with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": effort}):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(self._run_mocked_sweep("with"), 1)
+                self.assertIn("different models or tasks", err.getvalue())
 
         # Changing corpus + re-freezing (manifest_hash change) refuses resume
         _write(self.tasks_root / "make-plan" / "p1" / "fixture" / "changed.py", "x = 2\n")
@@ -424,6 +429,18 @@ class TestSkillbenchIdentityCheck(_PreflightCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(self._run_mocked_sweep("with"), 1)
+        self.assertIn("different models or tasks", err.getvalue())
+
+    def test_unset_effort_is_recorded_as_empty_and_resumes(self) -> None:
+        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": ""}):
+            self.assertEqual(self._run_mocked_sweep("with"), 0)
+            ns_dir = self.runs_dir / "skillbench" / "adapt" / "skillbench-agy-agg1-with"
+            cfg = json.loads((ns_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg["effort"], "")
+            self.assertEqual(self._run_mocked_sweep("with"), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self._run_mocked_sweep("with"), 1)  # effort is "high" again
         self.assertIn("different models or tasks", err.getvalue())
 
     def test_judge_identity_check_compares_skillbench_judge_model(self) -> None:
@@ -510,7 +527,7 @@ class TestCheckCliSkillbench(_PreflightCase):
         self.assertIn("Ready: skillbench/agy; 2 tasks.", buf.getvalue())
 
     def test_harness2_check_skillbench_reports_failures(self) -> None:
-        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": ""}):
+        with mock.patch.dict(os.environ, {"SKILLBENCH_EFFORT": "extreme"}):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = check_cli.main(["--bench", "skillbench", "--substrate", "agy"])

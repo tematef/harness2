@@ -32,9 +32,14 @@ from unittest import mock
 from harness2.config import ConfigError
 from harness2.core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from harness2.substrate.agy import (
+    DEFAULT_EXEC_MODEL,
     INSTALL_MODE,
+    JETSKI_CLI,
     PLUGINS_REL,
     AgyTask,
+    agy_argv,
+    exec_effort,
+    exec_model,
     final_text,
     model_guard,
     model_matches,
@@ -103,7 +108,7 @@ class _ExecCase(unittest.TestCase):
             "SKILLBENCH_PLUGINS_DIR": str(self.plugins),
             "SKILLBENCH_AUTH_FILES": ",".join(AUTH),
             "HARNESS2_AGY_BIN": str(STUB),
-            "SKILLBENCH_EXEC_MODEL": "opus",
+            "SKILLBENCH_EXEC_MODEL": "opus-5.5-high",
             "SKILLBENCH_EFFORT": "high",
             "AGY_STUB_LOG": str(self.stub_log),
             "AGY_STUB_SCENARIO": "skill_read",
@@ -184,7 +189,7 @@ class TestExecute(_ExecCase):
                 "--dangerously-skip-permissions",
                 "--disable-slash-commands",
                 "--model",
-                "opus",
+                "opus-5.5-high",
                 "--effort",
                 "high",
                 "--print-timeout",
@@ -193,7 +198,7 @@ class TestExecute(_ExecCase):
         )
         flags = call["flags"]
         self.assertEqual(flags["prompt"], PROMPT)
-        self.assertEqual(flags["model"], "opus")
+        self.assertEqual(flags["model"], "opus-5.5-high")
         self.assertEqual(flags["effort"], "high")
         self.assertEqual(flags["output_format"], "stream-json")
         self.assertEqual(flags["print_timeout"], "90s")
@@ -211,12 +216,37 @@ class TestExecute(_ExecCase):
 
     def test_effort_and_model_follow_env(self) -> None:
         os.environ["SKILLBENCH_EFFORT"] = "low"
-        os.environ["SKILLBENCH_EXEC_MODEL"] = "fable"
+        os.environ["SKILLBENCH_EXEC_MODEL"] = "fable-5.1-high"
         os.environ["AGY_STUB_SCENARIO"] = "plain_answer"
         rd = self.run_one()
         (call,) = self.stub_calls()
-        self.assertEqual((call["flags"]["model"], call["flags"]["effort"]), ("fable", "low"))
-        self.assertEqual(self.timing(rd)["requested_model"], "fable")
+        self.assertEqual(
+            (call["flags"]["model"], call["flags"]["effort"]), ("fable-5.1-high", "low")
+        )
+        t = self.timing(rd)
+        self.assertEqual(t["requested_model"], "fable-5.1-high")
+        self.assertEqual(t["actual_model"], "fable-5.1-high")  # the stub echoes init.model
+
+    def test_effort_unset_passes_no_effort_flag(self) -> None:
+        # jet model ids pin the effort (opus-5.5-high), so SKILLBENCH_EFFORT is optional
+        for unset in (None, ""):
+            if unset is None:
+                os.environ.pop("SKILLBENCH_EFFORT", None)
+            else:
+                os.environ["SKILLBENCH_EFFORT"] = unset
+            with self.subTest(value=unset):
+                rd = self.run_one(run_id=f"r-{unset!r}")
+                call = self.stub_calls()[-1]
+                self.assertNotIn("--effort", call["argv"])
+                self.assertNotIn("effort", call["flags"])
+                self.assertIs(self.timing(rd)["valid"], True)
+
+    def test_auth_files_unset_runs_without_credentials(self) -> None:
+        os.environ.pop("SKILLBENCH_AUTH_FILES")
+        rd = self.run_one()
+        self.assertIs(self.timing(rd)["valid"], True)
+        for rel in AUTH:
+            self.assertFalse((rd / "home" / rel).exists(), rel)
 
     def test_events_jsonl_has_monotonic_t(self) -> None:
         os.environ["AGY_STUB_SLEEP"] = "0.01"
@@ -232,8 +262,11 @@ class TestExecute(_ExecCase):
 
     def test_final_diff_new_files_and_skill_timing(self) -> None:
         rd = self.run_one()
+        # the last DONE delta is "\n"; final.md is the full answer from result.response
         self.assertEqual(
-            (rd / "final.md").read_text(), "Wrote the plan to docs/plans/20261023-add-cache.md."
+            (rd / "final.md").read_text(),
+            "Looking at the repository first.\nWriting the plan file.\n"
+            "Wrote the plan to docs/plans/20261023-add-cache.md.\n",
         )
         diff = (rd / "diff.patch").read_text()
         self.assertIn("docs/plans/20261023-add-cache.md", diff)
@@ -246,15 +279,40 @@ class TestExecute(_ExecCase):
         )
         t = self.timing(rd)
         self.assertIs(t["invoked"], True)
-        self.assertEqual(t["step_idx"], 5)  # the make-plan read, not the brainstorm one
+        self.assertEqual(t["step_idx"], 6)  # the make-plan read, not the brainstorm one
         self.assertIsInstance(t["t_skill_s"], float)
         self.assertGreaterEqual(t["t_total_s"], t["t_skill_s"])
-        self.assertEqual(t["requested_model"], "opus")
-        self.assertIsNone(t["actual_model"])
+        self.assertEqual(t["requested_model"], "opus-5.5-high")
+        self.assertEqual(t["actual_model"], "opus-5.5-high")
         self.assertIs(t["valid"], True)
         self.assertIsNone(t["invalid_reason"])
         self.assertEqual(t["exit_code"], 0)
         self.assertEqual(t["total_tokens"], 8731)
+
+    def test_write_file_with_path_is_applied(self) -> None:
+        scen = _scenario(
+            self.tmp / "write_file.jsonl",
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE",
+                    "tool_name": "write_file",
+                    "tool_info": {
+                        "name": "write_file",
+                        "parameters": {
+                            "Path": "/tmp/skillbench-run/work/app.py",
+                            "Content": "def fetch(key):\n    return memo(key)\n",
+                        },
+                    },
+                },
+            },
+            {"event": "result", "result": {"response": "Done.", "usage": {"total_tokens": 5}}},
+        )
+        os.environ["AGY_STUB_SCENARIO"] = str(scen)
+        rd = self.run_one()
+        self.assertIn("+    return memo(key)", (rd / "diff.patch").read_text())
+        self.assertEqual((rd / "final.md").read_text(), "Done.")
 
     def test_modified_file_shows_in_diff_not_new_files(self) -> None:
         scen = _scenario(
@@ -292,7 +350,10 @@ class TestExecute(_ExecCase):
         self.assertIs(t["valid"], True)
         self.assertEqual((rd / "diff.patch").read_text(), "")
         self.assertTrue((rd / "new_files").is_dir())
-        self.assertEqual((rd / "final.md").read_text(), "No changes were needed.")
+        self.assertEqual(
+            (rd / "final.md").read_text(),
+            "`add(a, b)` returns the sum of both arguments.\nNo changes were needed.",
+        )
 
     def test_malformed_line_kept_verbatim_and_rep_valid(self) -> None:
         os.environ["AGY_STUB_SCENARIO"] = "malformed_line"
@@ -337,9 +398,9 @@ class TestExecute(_ExecCase):
         with self.assertRaisesRegex(RuntimeError, "task resolver"):
             AgyFromModule().execute("make-plan/t1", self.install(), ["r0"], 60)
 
-    def test_missing_effort_raises(self) -> None:
+    def test_invalid_effort_raises(self) -> None:
         inst = self.install()
-        del os.environ["SKILLBENCH_EFFORT"]
+        os.environ["SKILLBENCH_EFFORT"] = "extreme"
         with self.assertRaisesRegex(ConfigError, "SKILLBENCH_EFFORT"):
             self.run_one(inst=inst)
         self.assertEqual(self.stub_calls(), [])
@@ -347,25 +408,33 @@ class TestExecute(_ExecCase):
     def test_missing_binary_raises(self) -> None:
         inst = self.install()
         os.environ["HARNESS2_AGY_BIN"] = str(self.tmp / "no-such-agy")
-        with self.assertRaisesRegex(RuntimeError, "HARNESS2_AGY_BIN"):
+        with self.assertRaisesRegex(RuntimeError, "HARNESS2_AGY_BIN") as cm:
             self.run_one(inst=inst)
+        self.assertIn(JETSKI_CLI, str(cm.exception))
 
 
 class TestModelGuardAndFailures(_ExecCase):
     def test_model_field_disagreeing_invalidates(self) -> None:
         os.environ["AGY_STUB_SCENARIO"] = "result_model_mismatch"
         t = self.timing(self.run_one())
-        self.assertEqual(t["actual_model"], "sonnet")
+        self.assertEqual(t["actual_model"], "sonnet-4-high")
         self.assertIs(t["valid"], False)
         self.assertIn("model mismatch", t["invalid_reason"])
-        self.assertIn("'opus'", t["invalid_reason"])
-        self.assertIn("'sonnet'", t["invalid_reason"])
+        self.assertIn("'opus-5.5-high'", t["invalid_reason"])
+        self.assertIn("'sonnet-4-high'", t["invalid_reason"])
 
     def test_model_field_agreeing_is_recorded(self) -> None:
         os.environ["AGY_STUB_SCENARIO"] = "result_with_model"
         t = self.timing(self.run_one())
-        self.assertEqual(t["actual_model"], "opus")
+        self.assertEqual(t["actual_model"], "opus-5.5-high")
         self.assertIs(t["valid"], True)
+
+    def test_init_model_of_another_jet_model_invalidates(self) -> None:
+        os.environ["SKILLBENCH_EXEC_MODEL"] = "fable-5.1-high"
+        os.environ["AGY_STUB_SCENARIO"] = "result_with_model"  # init.model = opus-5.5-high
+        t = self.timing(self.run_one())
+        self.assertIs(t["valid"], False)
+        self.assertIn("model mismatch", t["invalid_reason"])
 
     def test_model_field_absent_keeps_rep_valid(self) -> None:
         os.environ["AGY_STUB_SCENARIO"] = "result_without_model"
@@ -434,6 +503,42 @@ class TestPureHelpers(unittest.TestCase):
         self.assertEqual(actual, "sonnet")
         self.assertIn("mismatch", reason)
 
+    def test_defaults_match_jet_model_ids(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKILLBENCH_EXEC_MODEL", None)
+            os.environ.pop("SKILLBENCH_EFFORT", None)
+            self.assertEqual(DEFAULT_EXEC_MODEL, "opus-5.5-high")
+            self.assertEqual(exec_model(), "opus-5.5-high")
+            self.assertEqual(exec_effort(), "")
+            for value in ("low", "medium", "high", "xhigh", "max"):
+                os.environ["SKILLBENCH_EFFORT"] = value
+                self.assertEqual(exec_effort(), value)
+            os.environ["SKILLBENCH_EFFORT"] = "turbo"
+            with self.assertRaisesRegex(ConfigError, "low|medium|high|xhigh|max"):
+                exec_effort()
+
+    def test_agy_argv_without_effort(self) -> None:
+        argv = agy_argv("agy", "p", model="opus-5.5-high", timeout=5, effort="")
+        self.assertNotIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opus-5.5-high")
+
+    def test_final_text_prefers_result_response(self) -> None:
+        done = parse_event(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_type": "agent_response",
+                        "state": "DONE",
+                        "text_delta": "\n",
+                    },
+                }
+            )
+        )
+        res = parse_event(json.dumps({"event": "result", "result": {"response": "full answer"}}))
+        self.assertEqual(final_text([done, res]), "full answer")
+        self.assertEqual(final_text([done]), "\n")
+
     def test_final_text_fallback_without_done(self) -> None:
         def ev(text, state="ACTIVE", step_type="agent_response"):
             su = {"step_type": step_type, "state": state, "text_delta": text}
@@ -461,8 +566,11 @@ class TestPreflight(_ExecCase):
 
     def test_missing_binary_path(self) -> None:
         os.environ["HARNESS2_AGY_BIN"] = str(self.tmp / "nope" / "agy")
-        with self.assertRaisesRegex(RuntimeError, "HARNESS2_AGY_BIN"):
+        with self.assertRaisesRegex(RuntimeError, "HARNESS2_AGY_BIN") as cm:
             self.sub.preflight()
+        # points at the Jetski CLI and warns that a shell alias/function cannot be used
+        self.assertIn(JETSKI_CLI, str(cm.exception))
+        self.assertIn("alias", str(cm.exception))
 
     def test_missing_binary_on_path(self) -> None:
         os.environ["HARNESS2_AGY_BIN"] = "agy-definitely-not-installed-xyz"
@@ -483,8 +591,14 @@ class TestPreflight(_ExecCase):
         self.assertIn(".gemini/missing.json", str(cm.exception))
         self.assertIn("log in with `agy`", str(cm.exception))
 
-    def test_auth_files_unset(self) -> None:
+    def test_auth_files_unset_passes(self) -> None:
         del os.environ["SKILLBENCH_AUTH_FILES"]
+        self.sub.preflight()
+        os.environ["SKILLBENCH_AUTH_FILES"] = ""
+        self.sub.preflight()
+
+    def test_bad_auth_entry_fails(self) -> None:
+        os.environ["SKILLBENCH_AUTH_FILES"] = "../outside.json"
         with self.assertRaisesRegex(RuntimeError, "SKILLBENCH_AUTH_FILES"):
             self.sub.preflight()
 
@@ -501,8 +615,12 @@ class TestPreflight(_ExecCase):
         with self.assertRaisesRegex(RuntimeError, "revmux"):
             self.sub.preflight()
 
-    def test_missing_effort(self) -> None:
+    def test_effort_unset_passes(self) -> None:
         del os.environ["SKILLBENCH_EFFORT"]
+        self.sub.preflight()
+
+    def test_invalid_effort(self) -> None:
+        os.environ["SKILLBENCH_EFFORT"] = "extreme"
         with self.assertRaisesRegex(RuntimeError, "SKILLBENCH_EFFORT"):
             self.sub.preflight()
 

@@ -29,6 +29,7 @@ BENCHMARKS_MD = ROOT / "docs" / "BENCHMARKS.md"
 SETUP_MD = ROOT / "docs" / "SETUP.md"
 README_MD = ROOT / "README.md"
 ENV_EXAMPLE = ROOT / ".env.example"
+JETSKI_CLI = "/google/bin/releases/jetski-devs/tools/cli"
 
 REQUIRED_ENV_KEYS = (
     "HARNESS2_AGY_BIN",
@@ -133,6 +134,27 @@ class TestSkillbenchDocumentation(unittest.TestCase):
                 )
         with mock.patch.dict(os.environ, {}, clear=True):
             config.load_dotenv(ENV_EXAMPLE)
+
+    def test_env_example_matches_jet_defaults(self) -> None:
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        self.assertRegex(text, r"(?m)^HARNESS2_AGY_BIN=agy$")
+        self.assertRegex(text, rf"(?m)^#.*{re.escape(JETSKI_CLI)}")
+        self.assertRegex(text, r"(?m)^SKILLBENCH_EXEC_MODEL=opus-5\.5-high$")
+        self.assertRegex(text, r"(?m)^SKILLBENCH_JUDGE_MODEL=fable-5\.1-high$")
+        self.assertRegex(text, r"(?m)^SKILLBENCH_EFFORT=$")
+        self.assertRegex(text, r"(?m)^SKILLBENCH_AUTH_FILES=$")
+
+    def test_docs_mark_auth_and_effort_optional_with_jet_defaults(self) -> None:
+        for doc in (SETUP_MD, BENCHMARKS_MD):
+            text = doc.read_text(encoding="utf-8")
+            with self.subTest(doc=doc.name):
+                for key in ("SKILLBENCH_AUTH_FILES", "SKILLBENCH_EFFORT"):
+                    row = next(ln for ln in text.splitlines() if ln.startswith(f"| `{key}`"))
+                    self.assertNotIn("**required**", row)
+                    self.assertIn("optional", row)
+                self.assertIn("opus-5.5-high", text)
+                self.assertIn("fable-5.1-high", text)
+                self.assertIn(JETSKI_CLI, text)
 
 
 if __name__ == "__main__":

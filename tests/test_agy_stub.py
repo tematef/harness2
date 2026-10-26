@@ -49,6 +49,13 @@ ARGV = [
     "--print-timeout",
     "600s",
 ]
+MODEL_PLACEHOLDER = "<requested-model>"
+
+
+def replayed(name, work, model="opus"):
+    """A fixture as the stub replays it in cwd ``work`` for ``--model <model>``."""
+    text = (FIXTURES / f"{name}.jsonl").read_text(encoding="utf-8")
+    return text.replace(MODEL_PLACEHOLDER, model).replace("/tmp/skillbench-run/work", str(work))
 
 
 class AgyStubTests(unittest.TestCase):
@@ -96,14 +103,27 @@ class AgyStubTests(unittest.TestCase):
     def test_replays_named_fixture_verbatim(self):
         proc = self.run_stub(AGY_STUB_SCENARIO="plain_answer")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        expected = (FIXTURES / "plain_answer.jsonl").read_text(encoding="utf-8")
-        self.assertEqual(proc.stdout, expected)
+        self.assertEqual(proc.stdout, replayed("plain_answer", self.work))
 
     def test_default_scenario_is_plain_answer(self):
         proc = self.run_stub()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        expected = (FIXTURES / "plain_answer.jsonl").read_text(encoding="utf-8")
-        self.assertEqual(proc.stdout, expected)
+        self.assertEqual(proc.stdout, replayed("plain_answer", self.work))
+
+    def test_init_model_echoes_requested_model(self):
+        argv = [*ARGV]
+        argv[argv.index("--model") + 1] = "fable-5.1-high"
+        proc = self.run_stub(argv, AGY_STUB_SCENARIO="skill_read")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        first = json.loads(proc.stdout.splitlines()[0])
+        self.assertEqual(first["event"], "init")
+        self.assertEqual(first["init"]["model"], "fable-5.1-high")
+        self.assertNotIn(MODEL_PLACEHOLDER, proc.stdout)
+
+    def test_explicit_init_model_is_kept(self):
+        proc = self.run_stub(AGY_STUB_SCENARIO="result_model_mismatch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout.splitlines()[0])["init"]["model"], "sonnet-4-high")
 
     def test_replays_fixture_given_as_path(self):
         custom = self.root / "custom.jsonl"
@@ -134,16 +154,18 @@ class AgyStubTests(unittest.TestCase):
         self.assertNotIn("/tmp/skillbench-run/", proc.stdout)
         events = [json.loads(line) for line in proc.stdout.splitlines()]
         paths = [
-            ev["step_update"]["tool_info"]["parameters"].get("AbsolutePath")
+            params.get("Path") or params.get("AbsolutePath")
             for ev in events
             if "tool_info" in ev.get("step_update", {})
+            for params in [ev["step_update"]["tool_info"]["parameters"]]
         ]
         target = f"{self.home}/.gemini/config/plugins/planning/skills/make-plan/SKILL.md"
         self.assertIn(target, paths)
         self.assertIn(f"{self.work}/app.py", paths)
-        self.assertEqual(
-            events[-1], {"event": "result", "result": {"usage": {"total_tokens": 8731}}}
-        )
+        self.assertEqual(events[0]["init"]["cwd"], str(self.work))
+        result = events[-1]["result"]
+        self.assertEqual(result["usage"]["total_tokens"], 8731)
+        self.assertTrue(result["response"].strip())
 
     def test_writes_file_into_cwd_when_scenario_asks(self):
         proc = self.run_stub(AGY_STUB_SCENARIO="skill_read")
@@ -226,7 +248,7 @@ class AgyStubTests(unittest.TestCase):
     def test_non_zero_exit_still_emits_events_and_logs(self):
         proc = self.run_stub(AGY_STUB_SCENARIO="plain_answer", AGY_STUB_EXIT_CODE="3")
         self.assertEqual(proc.returncode, 3)
-        self.assertEqual(proc.stdout, (FIXTURES / "plain_answer.jsonl").read_text())
+        self.assertEqual(proc.stdout, replayed("plain_answer", self.work))
         self.assertIn("simulated failure", proc.stderr)
         self.assertEqual(len(self.log_records()), 1)
 
@@ -241,7 +263,7 @@ class AgyStubTests(unittest.TestCase):
         )
         try:
             first = proc.stdout.readline()
-            self.assertEqual(json.loads(first)["event"], "step_update")
+            self.assertEqual(json.loads(first)["event"], "init")
             with self.assertRaises(subprocess.TimeoutExpired):
                 proc.wait(timeout=1)
             self.assertEqual(len(self.log_records()), 1)
