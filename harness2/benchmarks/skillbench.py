@@ -27,12 +27,15 @@ Task model and agy judge (the benchmark adapter builds on both):
     scrub_deliverable  redacts skill names, SKILL.md paths and plugin paths to `[redacted]`
     score              runs the isolated agy judge (`--model $SKILLBENCH_JUDGE_MODEL --json-schema`)
                        and caches judgments in `<run_dir>/judgments.json`
+    run_verify         optional deterministic check (`verify` command) -> `<run_dir>/verify.json`
+    diff_stats         files / lines added / lines removed in a rollout's `diff.patch`
     SkillbenchAdapter  BenchmarkAdapter for leave-one-out skill lift (`arm="with" | "without"`)
 
 Task layout::
 
     <root>/<skill>/<task-id>/
-        task.toml    target_skill, prompt, timeout, [user_answers], [forbidden_terms], [pilot]
+        task.toml    target_skill, prompt, timeout, [user_answers], [forbidden_terms], [pilot],
+                     [verify], [verify_restore]
         rubric.json  [{"id": ..., "criterion": ...}], 4-8 binary outcome-based criteria
         fixture/     small repo copied into every rollout's working directory
 
@@ -47,10 +50,12 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,7 +103,7 @@ MIN_CRITERIA = 4
 MAX_CRITERIA = 8
 
 _REQUIRED_KEYS = ("target_skill", "prompt", "timeout")
-_OPTIONAL_KEYS = ("user_answers", "forbidden_terms", "pilot")
+_OPTIONAL_KEYS = ("user_answers", "forbidden_terms", "pilot", "verify", "verify_restore")
 _NAME = re.compile(r"[a-z0-9][a-z0-9_\-]*")
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]*")
 # Never part of a task's identity: copying a fixture drops them too (agy.init_work).
@@ -138,6 +143,8 @@ class SkillbenchTask:
     forbidden_terms: tuple[str, ...] = ()
     pilot: bool = False
     dir: Path = Path()
+    verify: tuple[str, ...] = ()
+    verify_restore: tuple[str, ...] = ()
 
     @property
     def fixture(self) -> Path:
@@ -306,6 +313,7 @@ def load_task(task_dir: Path) -> SkillbenchTask:
     rubric = _load_rubric(task_dir / RUBRIC_FILE)
     if not (task_dir / FIXTURE_DIR).is_dir():
         raise TaskError(f"{task_dir / FIXTURE_DIR}: missing (the repo copied into each rollout)")
+    verify, verify_restore = _load_verify(meta, toml_path, task_dir / FIXTURE_DIR)
     return SkillbenchTask(
         task_id=f"{skill}/{task_dir.name}",
         target_skill=skill,
@@ -316,7 +324,35 @@ def load_task(task_dir: Path) -> SkillbenchTask:
         forbidden_terms=forbidden,
         pilot=pilot,
         dir=task_dir,
+        verify=verify,
+        verify_restore=verify_restore,
     )
+
+
+def _load_verify(
+    meta: dict, toml_path: Path, fixture: Path
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`verify` (a command, split like a shell would, never run through one) and
+    `verify_restore` (fixture-relative files put back before it runs)."""
+    raw = meta.get("verify")
+    restore = _str_list(meta, "verify_restore", toml_path)
+    if raw is None:
+        if restore:
+            raise TaskError(f"{toml_path}: verify_restore needs a verify command")
+        return ((), ())
+    if not isinstance(raw, str) or not raw.strip():
+        raise TaskError(f"{toml_path}: verify must be a non-empty command string")
+    try:
+        argv = tuple(shlex.split(raw))
+    except ValueError as e:
+        raise TaskError(f"{toml_path}: verify is not a valid command ({e})") from None
+    for rel in restore:
+        p = Path(rel)
+        if p.is_absolute() or ".." in p.parts or not (fixture / p).is_file():
+            raise TaskError(
+                f"{toml_path}: verify_restore entry {rel!r} must be a file under fixture/"
+            )
+    return (argv, restore)
 
 
 def task_dirs(root: Path) -> dict[str, Path]:
@@ -561,6 +597,116 @@ def deliverable_text(run_dir: Path) -> str:
         parts = [f"#### {k}\n{files[k].strip() or '(empty)'}" for k in side_keys]
         sections.append("### side_effects\n" + "\n\n".join(parts))
     return "\n\n".join(sections)
+
+
+VERIFY_FILE = "verify.json"
+VERIFY_TIMEOUT_S = 300
+_VERIFY_TAIL = 4000
+
+
+def diff_stats(run_dir: Path) -> dict[str, int] | None:
+    """`{files, added, removed}` of `<run_dir>/diff.patch` (None when the file is missing)."""
+    p = Path(run_dir) / "diff.patch"
+    if not p.is_file():
+        return None
+    files = added = removed = 0
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("diff --git "):
+            files += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return {"files": files, "added": added, "removed": removed}
+
+
+def run_verify(
+    run_dir: Path,
+    task: SkillbenchTask | str | Path,
+    *,
+    root: Path = TASKS_ROOT,
+    timeout: int = VERIFY_TIMEOUT_S,
+) -> dict[str, Any] | None:
+    """Run the task's deterministic `verify` command against the agent's work tree.
+
+    Copies `<run_dir>/work` to a scratch tree, puts the `verify_restore` files back from the
+    fixture (so an agent cannot pass by editing the tests), runs the command there and caches
+    `{command, restored, exit_code, passed, timed_out, t_s, output_tail}` in
+    `<run_dir>/verify.json`. Returns None when the task has no `verify` or the rollout is
+    invalid; never calls a model.
+    """
+    run_dir = Path(run_dir)
+    resolved = _resolve_task(task, root)
+    if not resolved.verify or not rollout_valid(run_dir):
+        return None
+    cache = run_dir / VERIFY_FILE
+    command = list(resolved.verify)
+    restored = list(resolved.verify_restore)
+    if cache.is_file():
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached = None
+        if (
+            isinstance(cached, dict)
+            and cached.get("command") == command
+            and cached.get("restored") == restored
+            and isinstance(cached.get("passed"), bool)
+        ):
+            return cached
+    work = run_dir / "work"
+    if not work.is_dir():
+        return None
+    scratch = run_dir / "verify"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    tree = scratch / "work"
+    home = scratch / "home"
+    shutil.copytree(
+        work, tree, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__")
+    )
+    home.mkdir(parents=True)
+    for rel in restored:
+        dst = tree / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(resolved.fixture / rel, dst)
+    env = dict(os.environ)
+    env.update(HOME=str(home), PYTHONDONTWRITEBYTECODE="1", EDITOR="true", VISUAL="true")
+    start = time.monotonic()
+    timed_out = False
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=tree,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+        exit_code: int | None = proc.returncode
+        output = proc.stdout.decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired as e:
+        timed_out = True
+        exit_code = None
+        output = (e.stdout or b"").decode("utf-8", errors="replace")
+    except OSError as e:
+        exit_code = None
+        output = f"could not run verify command: {e}"
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    record = {
+        "command": command,
+        "restored": restored,
+        "exit_code": exit_code,
+        "passed": exit_code == 0,
+        "timed_out": timed_out,
+        "t_s": round(time.monotonic() - start, 3),
+        "output_tail": output[-_VERIFY_TAIL:],
+    }
+    cache.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return record
 
 
 def scrub_deliverable(
@@ -827,11 +973,17 @@ def score(
     rollout itself is invalid or any judge call fails (timeout, non-zero exit, malformed output,
     unknown/missing criterion ids, or a disagreeing model field). Valid judgments are cached in
     `<run_dir>/judgments.json` keyed by judge model + rubric sha256 + scrubbed-deliverable sha256.
+    The task's deterministic `verify` check (if any) runs first, even when judgments are cached;
+    its result goes to `verify.json` and is never shown to the judge.
     """
     run_dir = Path(run_dir)
     if not rollout_valid(run_dir):
         return None
     resolved = _resolve_task(task, root)
+    try:
+        run_verify(run_dir, resolved, root=root)
+    except OSError as e:
+        print(f"skillbench: verify failed for {run_dir}: {e}", file=sys.stderr)
     model = judge_model()
     repeat = judge_repeat()
     rubric = resolved.rubric

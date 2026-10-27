@@ -147,7 +147,7 @@ K=3 bash scripts/run_skillbench.sh           # full corpus
 
 Tasks live under `harness2/benchmarks/skillbench/tasks/<skill>/<task-id>/`:
 
-- `task.toml`: `target_skill`, `prompt`, `timeout` (seconds), optional `user_answers = [...]` (required for the 8 interactive `ask_question` skills: `brainstorm`, `exec`, `make-plan`, `dialectic`, `backlog`, `clarify`, `learn`, `wrong`), optional `forbidden_terms = [...]`, and `pilot = true|false`.
+- `task.toml`: `target_skill`, `prompt`, `timeout` (seconds), optional `user_answers = [...]` (required for the 8 interactive `ask_question` skills: `brainstorm`, `exec`, `make-plan`, `dialectic`, `backlog`, `clarify`, `learn`, `wrong`), optional `forbidden_terms = [...]`, `pilot = true|false`, and an optional deterministic check: `verify = "<command>"` (split like a shell would, never run through one) plus `verify_restore = ["<fixture-relative file>", ...]`.
 - `rubric.json`: 4–8 binary, outcome-based criteria (`[{"id": "...", "criterion": "..."}]`) that grade the deliverable rather than skill rituals or step headers.
 - `fixture/`: small self-contained repository copied into a fresh `git init` working directory (`<run>/work`) for each rollout.
 
@@ -171,6 +171,8 @@ python -m harness2.benchmarks.skillbench freeze --force
 ### Metrics, judging, and statistical power
 
 `harness2-judge --bench skillbench --arm <with|without> --bases` runs an isolated `agy` judge (`--model $SKILLBENCH_JUDGE_MODEL --json-schema`) in an empty `HOME` with no plugins. Its prompt contains only the task's `rubric.json` and the scrubbed deliverable (`final.md`, `diff.patch`, `new_files/`, `side_effects/` with skill names, `SKILL.md` paths, and plugin paths replaced by `[redacted]`) — never the trajectory or arm label. Judgments are cached in `<run>/judgments.json`.
+
+Before judging, tasks with a `verify` command get a deterministic check: the agent's work tree is copied to a scratch dir, the `verify_restore` files are put back from `fixture/` (so editing the tests cannot make them pass), and the command runs there with a 300 s timeout. The result (`passed`, `exit_code`, `timed_out`, output tail) is cached in `<run>/verify.json`; the judge never sees it. The two `code-review-refactor` tasks use it to check that the original unit tests still pass after the refactor.
 
 `skillbench-report` reads both namespaces and writes `runs/skillbench/report.json` and `runs/skillbench/report.md`:
 

@@ -1,8 +1,8 @@
 {
-  "hash": "66ceaaed6289f85955bce259091fd6788eec04f80a8664d6623858752010e30b",
+  "hash": "55460efa4365c061e1b0ed9f9357a555eef1a92a3b2bffaab79c809b54cdbc4f",
   "tasks": {
-    "code-review-refactor/log-alert-analyzer": "b28a3670d47f77a7754da8eff039f0d5ffa60112d74988e69b3682e112f30975",
-    "code-review-refactor/order-pricing-processor": "fc6518fc0555441469a119846312a54af7c1ea99381c2722ec5716e2cd5800d4",
+    "code-review-refactor/log-alert-analyzer": "8ea355a19761c9a0c9fcc0a95da97990d3f7d96709c74488fb14914e070fd1de",
+    "code-review-refactor/order-pricing-processor": "b3549e854cd9ed32d2c0e9e0ed39e601d366eee98cfd337e72d55ce8a1afba5f",
     "make-plan/token-bucket-limiter": "ebb44daab95176dd6cadd03ddd4e777a6f04de1dc028c828337ac83cb673ba9f",
     "make-plan/webhook-retry-queue": "7600f9f0672b2a8240a05ba1e39bf5c31b0b28be1b6ea13a9d88c9117233ed7a",
     "root-cause-investigator/batch-retry-duplicate-charge": "93b08fd2133a3e9fe4ff4e04fbd7b53d1445043e7160c65bc1bbdeffbd4aa81a",
