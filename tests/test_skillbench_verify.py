@@ -177,6 +177,26 @@ class DiffStatsTest(_Case):
         )
         self.assertEqual(SB.diff_stats(run_dir), {"files": 2, "added": 3, "removed": 1})
 
+    def test_ignores_pycache_and_strips_null_bytes(self) -> None:
+        run_dir = self.tmp / "run"
+        (run_dir / "new_files" / "pkg" / "__pycache__").mkdir(parents=True)
+        (run_dir / "new_files" / "pkg" / "__pycache__" / "m.cpython-313.pyc").write_bytes(
+            b"\x00\x01compiled\x00"
+        )
+        (run_dir / "new_files" / "pkg" / "m.py").write_bytes(b"x = 1\x00\n")
+        (run_dir / "final.md").write_bytes(b"done\x00\n")
+        (run_dir / "diff.patch").write_text(
+            "diff --git a/pkg/m.py b/pkg/m.py\n--- /dev/null\n+++ b/pkg/m.py\n@@ -0,0 +1 @@\n+x = 1\n"
+            "diff --git a/pkg/__pycache__/m.cpython-313.pyc b/pkg/__pycache__/m.cpython-313.pyc\n"
+            "new file mode 100644\n+binary\x00line\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(SB.diff_stats(run_dir), {"files": 1, "added": 1, "removed": 0})
+        files = SB.deliverable_files(run_dir)
+        self.assertEqual(sorted(files), ["diff.patch", "final.md", "new_files/pkg/m.py"])
+        self.assertFalse(any("\x00" in v for v in files.values()))
+        self.assertNotIn("__pycache__", files["diff.patch"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -715,6 +715,10 @@ def init_work(work: Path, fixture: Path | None, env: Mapping[str, str]) -> str:
     else:
         work.mkdir(parents=True)
     _git(work, env, "init", "-q")
+    exclude = work / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as f:
+        f.write("\n__pycache__/\n*.py[cod]\n")
     _git(work, env, "add", "-A")
     _git(
         work,

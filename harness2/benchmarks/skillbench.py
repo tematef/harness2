@@ -559,15 +559,36 @@ def _discovered_skills() -> set[str]:
     return names
 
 
+def _is_bytecode_path(rel_path: str) -> bool:
+    parts = Path(rel_path).parts
+    return "__pycache__" in parts or rel_path.endswith((".pyc", ".pyo"))
+
+
+def _strip_bytecode_diffs(patch: str) -> str:
+    """Drop `diff --git` sections for `__pycache__` / `.pyc` files and strip NUL bytes."""
+    kept: list[str] = []
+    skip = False
+    for line in patch.replace("\x00", "").splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            tokens = line.split()
+            a_path = tokens[2][2:] if len(tokens) > 2 and tokens[2].startswith("a/") else ""
+            b_path = tokens[3][2:] if len(tokens) > 3 and tokens[3].startswith("b/") else ""
+            skip = _is_bytecode_path(a_path) or _is_bytecode_path(b_path)
+        if not skip:
+            kept.append(line)
+    return "".join(kept)
+
+
 def deliverable_files(run_dir: Path) -> dict[str, str]:
     """Extract agent deliverables from `run_dir` (`final.md`, `diff.patch`, `new_files/`,
-    `side_effects/`). Never reads `events.jsonl` or `home/`."""
+    `side_effects/`). Never reads `events.jsonl`, `home/`, or Python bytecode (`__pycache__`)."""
     run_dir = Path(run_dir)
     out: dict[str, str] = {}
     for name in ("final.md", "diff.patch"):
         p = run_dir / name
         if p.is_file():
-            out[name] = p.read_text(encoding="utf-8", errors="replace")
+            raw = p.read_text(encoding="utf-8", errors="replace").replace("\x00", "")
+            out[name] = _strip_bytecode_diffs(raw) if name == "diff.patch" else raw
     for sub in ("new_files", "side_effects"):
         base = run_dir / sub
         if not base.is_dir():
@@ -575,7 +596,11 @@ def deliverable_files(run_dir: Path) -> dict[str, str]:
         for p in sorted(base.rglob("*")):
             if p.is_file() and not p.is_symlink():
                 rel = p.relative_to(base).as_posix()
-                out[f"{sub}/{rel}"] = p.read_text(encoding="utf-8", errors="replace")
+                if sub == "new_files" and _is_bytecode_path(rel):
+                    continue
+                out[f"{sub}/{rel}"] = (
+                    p.read_text(encoding="utf-8", errors="replace").replace("\x00", "")
+                )
     return out
 
 
@@ -610,7 +635,8 @@ def diff_stats(run_dir: Path) -> dict[str, int] | None:
     if not p.is_file():
         return None
     files = added = removed = 0
-    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+    cleaned = _strip_bytecode_diffs(p.read_text(encoding="utf-8", errors="replace"))
+    for line in cleaned.splitlines():
         if line.startswith("diff --git "):
             files += 1
         elif line.startswith("+") and not line.startswith("+++"):
@@ -741,7 +767,9 @@ def build_judge_prompt(rubric: Iterable[Criterion], scrubbed_deliverable: str) -
         "Evaluate the deliverable below against each rubric criterion.\n"
         "Return a JSON object matching the required schema: an object containing `criteria`, "
         "where each entry has `id` (the criterion id), `pass` (true or false), and `reason` "
-        "(a brief explanation grounded in the deliverable).\n\n"
+        "(a brief explanation grounded in the deliverable).\n"
+        "Do not call any tools or inspect any files; grade solely from the Deliverable section "
+        "below and call finish immediately.\n\n"
         "## Rubric\n"
         + "\n".join(crit_lines)
         + "\n\n## Deliverable\n"
