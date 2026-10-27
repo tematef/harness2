@@ -416,11 +416,27 @@ def checked_plugins() -> tuple[Path, tuple[str, ...]]:
     return root, allow
 
 
-def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
+def target_skill_file(target_skill: str) -> Path:
+    """Path to `skills/<target_skill>/SKILL.md` in the allowlisted plugins checkout."""
+    root, allow = checked_plugins()
+    targets = _target_dirs(root, allow, target_skill)
+    if not targets:
+        raise ValueError(
+            f"target skill {target_skill!r} not found as skills/{target_skill}/SKILL.md in the "
+            f"allowlisted plugins {list(allow)} under {root}"
+        )
+    return targets[0] / "SKILL.md"
+
+
+def stage_plugins(
+    dest: Path, *, arm: str, target_skill: str, skill_override: Path | str | None = None
+) -> list[str]:
     """Copy the allowlisted plugins (symlinks resolved) into `dest`.
 
     Arm `without` omits `skills/<target_skill>/` from every staged plugin that has it; hooks
-    and every other file stay. Returns the omitted paths relative to `dest`.
+    and every other file stay. When `skill_override` (a `Path` to a candidate `SKILL.md` or
+    raw markdown text) is given for arm `with`, replaces the staged `skills/<target_skill>/SKILL.md`
+    in place. Returns the omitted paths relative to `dest`.
     """
     root, allow = checked_plugins()
     targets = _target_dirs(root, allow, target_skill)
@@ -429,6 +445,8 @@ def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
             f"target skill {target_skill!r} not found as skills/{target_skill}/SKILL.md in the "
             f"allowlisted plugins {list(allow)} under {root}"
         )
+    if skill_override is not None and arm != "with":
+        raise ValueError(f"skill_override requires arm='with', got arm={arm!r}")
     omit = set(targets) if arm == "without" else set()
     dest.mkdir(parents=True, exist_ok=True)
     for name in allow:
@@ -441,6 +459,16 @@ def stage_plugins(dest: Path, *, arm: str, target_skill: str) -> list[str]:
             return drop
 
         shutil.copytree(src, dest / name, symlinks=False, ignore=ignore)
+    if skill_override is not None:
+        text = (
+            skill_override.read_text(encoding="utf-8")
+            if isinstance(skill_override, Path)
+            else Path(skill_override).read_text(encoding="utf-8")
+            if os.sep in skill_override and Path(skill_override).is_file()
+            else str(skill_override)
+        )
+        for t in targets:
+            (dest / t.relative_to(root) / "SKILL.md").write_text(text, encoding="utf-8")
     return sorted(str(t.relative_to(root)) for t in omit)
 
 
@@ -942,13 +970,16 @@ class AgySubstrate:
                 f"exactly one: {INSTALL_MODE!r}"
             )
         arm, target = _arm_ctx(ctx)
+        override = ctx.get("skill_override")
         tree_dir = Path(tree_dir)
         if not HT.is_tree(AGY_SURFACE, tree_dir):
             raise ValueError(f"{tree_dir} is not an agy harness tree (no GEMINI.md)")
         staged = Path(tempfile.mkdtemp(prefix=f"adapt-agy-{arm}-"))
         try:
             home = staged / "home"
-            omitted = stage_plugins(home / PLUGINS_REL, arm=arm, target_skill=target)
+            omitted = stage_plugins(
+                home / PLUGINS_REL, arm=arm, target_skill=target, skill_override=override
+            )
             rules = (tree_dir / "GEMINI.md").read_text(encoding="utf-8", errors="replace")
             if rules.strip():
                 (home / RULES_REL).write_text(rules, encoding="utf-8")

@@ -210,6 +210,24 @@ side-by-side WITH / WITHOUT answers. The upstream
 `harness2-report --bench skillbench --arm <with|without>` prints one arm's plain
 mean rubric score as a cross-check.
 
+**Skill Improvement (`skillbench-improve`).** When a skill shows weak lift,
+missed criteria, or high token/time overhead in `report.json`,
+`skillbench-improve --skill <name>` (or `--auto`) runs a targeted
+**Propose → Probe → Verify/Judge** loop:
+
+1. Builds a contrastive evidence packet from the `WITH` and `WITHOUT`
+   trajectories, deliverables, and `verify.json` (excluding `rubric.json` and
+   judge verdicts by default; pass `--include-verdicts` for diagnostic runs).
+2. Prompts an isolated `agy` improver session (`$SKILLBENCH_IMPROVER_MODEL`) for
+   a revised `SKILL.md` and validates its YAML frontmatter, headless fallback,
+   and AGY tool names.
+3. Stages the candidate `SKILL.md` over the plugin suite, probes it across the
+   skill's tasks (`k` reps), runs deterministic `verify` and the blinded judge,
+   and writes a 3-way comparison (`WITHOUT` vs `Current WITH` vs
+   `Candidate WITH`) to `runs/skillbench/improve/improve_report.{json,md,html}`
+   plus `best.patch` (pass `--apply` to write accepted improvements back to
+   `$SKILLBENCH_PLUGINS_DIR`).
+
 See the [skillbench guide](docs/BENCHMARKS.md#skillbench) for the task format,
 metrics, and cost gates, and the [AGY executor setup](docs/SETUP.md#agy-executor)
 for all environment variables.

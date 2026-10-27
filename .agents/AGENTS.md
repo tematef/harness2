@@ -16,6 +16,11 @@ Project rules for AGY / Jetski agents working in this repository.
 - `harness2/cli/skillbench_report.py` (`skillbench-report`) — paired lift, two-level bootstrap
   CI, verdicts, time-to-skill, `verify` pass rate, diff/token medians;
   `harness2/cli/skillbench_html.py` renders `report.html`.
+- `harness2/cli/skillbench_improve.py` (`skillbench-improve`) — targeted Propose–Probe–Judge
+  loop for weak skills: builds contrastive `WITH` vs `WITHOUT` evidence (no rubric leak unless
+  `--include-verdicts`), proposes a candidate `SKILL.md` via `agy`, stages it with
+  `skill_override`, probes & grades across tasks, and emits a 3-way report
+  (`improve_report.{json,md,html}`) and `best.patch`.
 - `scripts/run_skillbench.sh` (full chain), `scripts/agy_spike.sh` (records real streams).
 - Docs: `docs/BENCHMARKS.md#skillbench`, `docs/SETUP.md#agy-executor`, `docs/skillbench-spike.md`.
 
