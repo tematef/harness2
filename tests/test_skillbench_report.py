@@ -956,5 +956,109 @@ class TestSkillbenchReportCliAndFiles(_ReportCase):
             SR.bootstrap_ci([([0.5], [0.5])], draws=0)
 
 
+
+class TestDeterministicChecksAndHtml(_ReportCase):
+    def _seed(self) -> tuple[Path, Path]:
+        good = _judgment_entry([True, True, True, False])
+        bad = _judgment_entry([True, False, False, False])
+        with_ns = self._seed_arm(
+            self.tmp / "ns-with",
+            "with",
+            {
+                f"code-review-refactor/t{i}": [
+                    {"score": {"n_passed": 3, "n_criteria": 4}, "judgments": [good],
+                     "invoked": True, "t_skill_s": 3.0},
+                    {"score": {"n_passed": 3, "n_criteria": 4}, "judgments": [good],
+                     "invoked": True, "t_skill_s": 4.0},
+                ]
+                for i in (1, 2)
+            },
+        )
+        without_ns = self._seed_arm(
+            self.tmp / "ns-without",
+            "without",
+            {
+                f"code-review-refactor/t{i}": [
+                    {"score": {"n_passed": 1, "n_criteria": 4}, "judgments": [bad]},
+                    {"score": {"n_passed": 1, "n_criteria": 4}, "judgments": [bad]},
+                ]
+                for i in (1, 2)
+            },
+        )
+        results = self.tmp / "results"
+        for i, run_dir in enumerate(sorted(results.glob("*/*/*"))):
+            arm = run_dir.parts[-3]
+            _write_json(run_dir / "verify.json", {"passed": arm == "with" or i % 2 == 0})
+            lines = 4 if arm == "with" else 40
+            (run_dir / "diff.patch").write_text(
+                "diff --git a/x b/x\n" + "+l\n" * lines, encoding="utf-8"
+            )
+            (run_dir / "final.md").write_text(
+                f"answer from {arm} <script>alert(1)</script>", encoding="utf-8"
+            )
+        return with_ns, without_ns
+
+    def test_report_carries_verify_diff_tokens_and_rep_details(self) -> None:
+        with_ns, without_ns = self._seed()
+        rep = SR.build_report(with_ns, without_ns, k=2, draws=200, pilot=True)
+        row = rep["by_skill"]["code-review-refactor"]
+        self.assertEqual((row["verify_with_passed"], row["verify_with_total"]), (4, 4))
+        self.assertEqual(row["verify_with_rate"], 1.0)
+        self.assertEqual(row["verify_without_total"], 4)
+        self.assertLess(row["verify_without_passed"], 4)
+        self.assertEqual(row["diff_lines_with_median"], 4.0)
+        self.assertEqual(row["diff_lines_without_median"], 40.0)
+        self.assertEqual(row["tokens_with_median"], 1000.0)
+        self.assertEqual(row["t_total_with_median"], 10.0)
+        task = row["tasks"]["code-review-refactor/t1"]
+        self.assertEqual(task["verify_with"], [2, 2])
+        self.assertEqual(task["criteria_with"]["c1"], 1.0)
+        self.assertEqual(task["criteria_without"]["c1"], 0.0)
+        reps = task["reps"]["with"]
+        self.assertEqual(len(reps), 2)
+        self.assertTrue(reps[0]["verify_passed"])
+        self.assertEqual(reps[0]["diff"], {"files": 1, "added": 4, "removed": 0})
+        self.assertEqual(reps[0]["criteria"][0]["id"], "c0")
+        self.assertIn("answer from with", reps[0]["final_excerpt"])
+        # The rubric lift itself is unchanged by the deterministic checks.
+        self.assertAlmostEqual(row["lift"], 0.5)
+
+        md = SR.render_markdown(rep)
+        self.assertIn("| skill | tests pass WITH | tests pass WITHOUT |", md)
+        self.assertIn("| code-review-refactor | 4/4 (100%) |", md)
+
+    def test_html_report_is_self_contained_escaped_and_written_by_the_cli(self) -> None:
+        with_ns, without_ns = self._seed()
+        rep = SR.build_report(with_ns, without_ns, k=2, draws=200, pilot=True)
+        page = SR.render_html(rep)
+        self.assertTrue(page.startswith("<!DOCTYPE html>"))
+        self.assertIn("tailwindcss.min.js", page)
+        self.assertIn("var(--app-card", page)
+        for tab in ("Skills", "Tasks &amp; criteria", "Side by side", "Diagnostics"):
+            self.assertIn(tab, page)
+        self.assertIn("code-review-refactor/t1", page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        # Only the Tailwind loader and the inline tab script; no other external resources.
+        self.assertEqual(page.count("<script"), 2)
+        self.assertNotIn("http://", page)
+
+        out_dir = self.tmp / "out"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = SR.main(
+                ["--with-dir", str(with_ns), "--without-dir", str(without_ns),
+                 "--out-dir", str(out_dir), "--draws", "100", "--k", "2", "--pilot"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertTrue((out_dir / "report.html").is_file())
+        self.assertIn("report.html", buf.getvalue())
+
+    def test_html_renders_empty_and_missing_values(self) -> None:
+        page = SR.render_html({"skills": [], "k": 1})
+        self.assertIn("No task data.", page)
+        self.assertIn("n/a", page)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Render the skillbench leave-one-out report (`report.json` and `report.md`).
+"""Render the skillbench leave-one-out report (`report.json`, `report.md` and `report.html`).
 
 Reads the `with` and `without` arm namespaces produced by `harness2 --bench skillbench` and
 `harness2-judge --bench skillbench --bases`:
@@ -24,9 +24,14 @@ Reads the `with` and `without` arm namespaces produced by `harness2 --bench skil
   both arms).
 - Time-to-skill: invocation rate (`invoked / valid WITH reps`) and p50 / p90 of `t_skill_s` over
   invoked valid WITH reps.
+- Deterministic checks and cost (reported next to the rubric lift, never mixed into it): pass
+  rate of the task's `verify` command per arm (`verify.json`), median lines changed in
+  `diff.patch`, median total tokens and wall time per valid rep.
 - Diagnostics: invalid rollout counts per reason, judge-noise rate (criterion-level disagreement
   across repeated judgments when `SKILLBENCH_JUDGE_REPEAT >= 2`), model-verification status, and
   the statistical-power note.
+- `report.html`: the same data as a self-contained dashboard (KPI cards, per-skill and per-task
+  tables, criteria pass rates, side-by-side WITH / WITHOUT answers, diagnostics).
 """
 
 from __future__ import annotations
@@ -45,15 +50,18 @@ from ..benchmarks.skillbench import (
     DEFAULT_JUDGE_MODEL,
     JUDGMENTS_FILE,
     SKILL_TIMING_FILE,
+    VERIFY_FILE,
     ManifestError,
     _default_runs_root,
     _env_pilot,
     check_manifest,
+    diff_stats,
     judge_model,
 )
 from ..core import schedule as SCHED
 from ..substrate.agy import DEFAULT_EXEC_MODEL, exec_model
 from . import _common as C
+from .skillbench_html import render_html
 
 DEFAULT_BOOTSTRAP_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_SEED = 0
@@ -69,6 +77,7 @@ POWER_NOTE = (
 )
 
 _IDENTITY_KEYS = ("executor", "judge", "effort", "manifest_hash")
+FINAL_EXCERPT_CHARS = 6000
 
 
 @dataclass(frozen=True)
@@ -88,6 +97,34 @@ class _RepRecord:
     judge_model: str | None = None
     judge_actual_model: str | None = None
     has_judgments_file: bool = False
+    verify_passed: bool | None = None
+    diff: dict[str, int] | None = None
+    total_tokens: int | None = None
+    t_total_s: float | None = None
+    final_excerpt: str = ""
+
+    @property
+    def diff_lines(self) -> int | None:
+        return None if self.diff is None else self.diff["added"] + self.diff["removed"]
+
+    def detail(self) -> dict[str, Any]:
+        """Per-rep entry of `report.json` (`tasks.<id>.reps.<arm>[]`)."""
+        criteria = self.judgments[0].get("criteria") if self.judgments else None
+        return {
+            "label": self.label,
+            "run_id": self.run_id,
+            "valid": self.valid,
+            "invalid_reason": self.invalid_reason,
+            "invoked": self.invoked,
+            "t_skill_s": self.t_skill_s,
+            "frac": self.frac,
+            "verify_passed": self.verify_passed,
+            "diff": self.diff,
+            "total_tokens": self.total_tokens,
+            "t_total_s": self.t_total_s,
+            "criteria": criteria if isinstance(criteria, list) else [],
+            "final_excerpt": self.final_excerpt,
+        }
 
 
 def _quantile(sorted_vals: Sequence[float], q: float) -> float:
@@ -314,6 +351,11 @@ def _load_rep(
     j_model: str | None = None
     j_act_model: str | None = None
     has_judgments_file = False
+    verify_passed: bool | None = None
+    diff: dict[str, int] | None = None
+    total_tokens: int | None = None
+    t_total_s: float | None = None
+    final_excerpt = ""
 
     if run_dir is not None:
         timing_path = run_dir / SKILL_TIMING_FILE
@@ -350,6 +392,34 @@ def _load_rep(
                 raw_act = timing.get("actual_model")
                 if isinstance(raw_act, str) and raw_act:
                     act_model = raw_act
+                raw_tok = timing.get("total_tokens")
+                if isinstance(raw_tok, int) and not isinstance(raw_tok, bool):
+                    total_tokens = raw_tok
+                raw_tt = timing.get("t_total_s")
+                if isinstance(raw_tt, (int, float)) and not isinstance(raw_tt, bool):
+                    t_total_s = float(raw_tt)
+
+        v_path = run_dir / VERIFY_FILE
+        if v_path.is_file():
+            try:
+                v_data = _read_json(v_path)
+            except (OSError, json.JSONDecodeError):
+                v_data = None
+            if isinstance(v_data, Mapping) and isinstance(v_data.get("passed"), bool):
+                verify_passed = v_data["passed"]
+        try:
+            diff = diff_stats(run_dir)
+        except OSError:
+            diff = None
+        final_path = run_dir / "final.md"
+        if final_path.is_file():
+            try:
+                text = final_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            final_excerpt = text[:FINAL_EXCERPT_CHARS]
+            if len(text) > FINAL_EXCERPT_CHARS:
+                final_excerpt += f"\n… ({len(text) - FINAL_EXCERPT_CHARS} more characters)"
 
         j_path = run_dir / JUDGMENTS_FILE
         if j_path.is_file():
@@ -397,7 +467,35 @@ def _load_rep(
         judge_model=j_model,
         judge_actual_model=j_act_model,
         has_judgments_file=has_judgments_file,
+        verify_passed=verify_passed if valid else None,
+        diff=diff,
+        total_tokens=total_tokens,
+        t_total_s=t_total_s,
+        final_excerpt=final_excerpt,
     )
+
+
+def _median(vals: Iterable[float | int | None]) -> float | None:
+    clean = [float(v) for v in vals if v is not None]
+    return float(st.median(clean)) if clean else None
+
+
+def _verify_counts(recs: Sequence[_RepRecord]) -> tuple[int, int, float | None]:
+    checked = [r.verify_passed for r in recs if r.valid and r.verify_passed is not None]
+    passed = sum(1 for v in checked if v)
+    return (passed, len(checked), (passed / len(checked)) if checked else None)
+
+
+def _criteria_rates(recs: Sequence[_RepRecord]) -> dict[str, float]:
+    """Per-criterion pass rate over the first judgment of each valid, judged rep."""
+    seen: dict[str, list[bool]] = {}
+    for r in recs:
+        if not r.valid or not r.judgments:
+            continue
+        for item in r.judgments[0].get("criteria") or []:
+            if isinstance(item, Mapping) and isinstance(item.get("pass"), bool):
+                seen.setdefault(str(item.get("id")), []).append(item["pass"])
+    return {cid: sum(v) / len(v) for cid, v in seen.items()}
 
 
 def _check_arm_configs(with_cfg: Mapping[str, Any], without_cfg: Mapping[str, Any]) -> None:
@@ -529,12 +627,26 @@ def build_report(
                 without_task_means.append(u_mean)
             if len(w_fracs) >= MIN_VALID_REPS_PER_ARM and len(u_fracs) >= MIN_VALID_REPS_PER_ARM:
                 n_qualifying += 1
+            tw_pass, tw_total, _ = _verify_counts(t_with)
+            tu_pass, tu_total, _ = _verify_counts(t_without)
             tasks_detail[tid] = {
                 "with_fracs": w_fracs,
                 "without_fracs": u_fracs,
                 "with_mean": w_mean,
                 "without_mean": u_mean,
                 "delta": delta,
+                "verify_with": [tw_pass, tw_total],
+                "verify_without": [tu_pass, tu_total],
+                "diff_lines_with_median": _median(r.diff_lines for r in t_with if r.valid),
+                "diff_lines_without_median": _median(
+                    r.diff_lines for r in t_without if r.valid
+                ),
+                "criteria_with": _criteria_rates(t_with),
+                "criteria_without": _criteria_rates(t_without),
+                "reps": {
+                    "with": [r.detail() for r in t_with],
+                    "without": [r.detail() for r in t_without],
+                },
             }
 
         if paired_for_boot:
@@ -580,6 +692,10 @@ def build_report(
         ungraded_with = sum(1 for r in s_with if r.valid and r.frac is None)
         ungraded_without = sum(1 for r in s_without if r.valid and r.frac is None)
 
+        vw_pass, vw_total, vw_rate = _verify_counts(s_with)
+        vu_pass, vu_total, vu_rate = _verify_counts(s_without)
+        valid_without = [r for r in s_without if r.valid]
+
         row = {
             "skill": skill,
             "n_tasks": len(task_ids),
@@ -605,6 +721,18 @@ def build_report(
             "ungraded_with": ungraded_with,
             "ungraded_without": ungraded_without,
             "ungraded_total": ungraded_with + ungraded_without,
+            "verify_with_passed": vw_pass,
+            "verify_with_total": vw_total,
+            "verify_with_rate": vw_rate,
+            "verify_without_passed": vu_pass,
+            "verify_without_total": vu_total,
+            "verify_without_rate": vu_rate,
+            "diff_lines_with_median": _median(r.diff_lines for r in valid_with),
+            "diff_lines_without_median": _median(r.diff_lines for r in valid_without),
+            "tokens_with_median": _median(r.total_tokens for r in valid_with),
+            "tokens_without_median": _median(r.total_tokens for r in valid_without),
+            "t_total_with_median": _median(r.t_total_s for r in valid_with),
+            "t_total_without_median": _median(r.t_total_s for r in valid_without),
             "task_deltas": task_deltas,
             "tasks": tasks_detail,
         }
@@ -745,18 +873,67 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             )
             + " |"
         )
+
+    lines += [
+        "",
+        "Deterministic checks and cost (valid reps; not part of the rubric lift):",
+        "",
+        "| skill | tests pass WITH | tests pass WITHOUT | diff lines p50 W/WO "
+        "| tokens p50 W/WO | wall time p50 W/WO |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for row in report.get("skills") or []:
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    str(row["skill"]),
+                    _fmt_verify(row.get("verify_with_passed"), row.get("verify_with_total")),
+                    _fmt_verify(
+                        row.get("verify_without_passed"), row.get("verify_without_total")
+                    ),
+                    _fmt_pair(
+                        row.get("diff_lines_with_median"), row.get("diff_lines_without_median")
+                    ),
+                    _fmt_pair(row.get("tokens_with_median"), row.get("tokens_without_median")),
+                    _fmt_pair(
+                        row.get("t_total_with_median"),
+                        row.get("t_total_without_median"),
+                        suffix="s",
+                    ),
+                )
+            )
+            + " |"
+        )
     return "\n".join(lines) + "\n"
 
 
-def write_report(report: Mapping[str, Any], out_dir: Path) -> tuple[Path, Path]:
-    """Write `report.json` and `report.md` inside `out_dir`."""
+def _fmt_verify(passed: Any, total: Any) -> str:
+    if not isinstance(total, int) or total <= 0 or not isinstance(passed, int):
+        return "n/a"
+    return f"{passed}/{total} ({passed / total * 100:.0f}%)"
+
+
+def _fmt_pair(a: float | None, b: float | None, *, suffix: str = "") -> str:
+    def one(v: float | None) -> str:
+        return "n/a" if v is None else f"{v:.0f}{suffix}"
+
+    if a is None and b is None:
+        return "n/a"
+    return f"{one(a)} / {one(b)}"
+
+
+def write_report(report: Mapping[str, Any], out_dir: Path) -> tuple[Path, Path, Path]:
+    """Write `report.json`, `report.md` and `report.html` inside `out_dir`."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "report.json"
     md_path = out_dir / "report.md"
+    html_path = out_dir / "report.html"
     json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     md_path.write_text(render_markdown(report), encoding="utf-8")
-    return (json_path, md_path)
+    html_path.write_text(render_html(report), encoding="utf-8")
+    return (json_path, md_path, html_path)
 
 
 def _resolve_ns_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -814,7 +991,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out-dir",
         type=Path,
         default=None,
-        help="directory where report.json and report.md are written",
+        help="directory where report.json, report.md and report.html are written",
     )
     return p
 
@@ -839,9 +1016,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.out_dir is not None
             else (with_dir.parent.parent if with_dir.parent.name == "adapt" else with_dir.parent)
         )
-        json_path, md_path = write_report(report, out_dir)
+        json_path, md_path, html_path = write_report(report, out_dir)
         print(md_path.read_text(encoding="utf-8"), end="")
-        print(f"wrote {md_path} and {json_path}")
+        print(f"wrote {md_path}, {json_path} and {html_path}")
         return 0
     except (FileNotFoundError, ValueError, config.ConfigError) as e:
         print(f"error: {e}", file=sys.stderr)

@@ -203,8 +203,10 @@ synthetic test fixtures, and the model guard follow those traces; the findings
 are in [docs/skillbench-spike.md](docs/skillbench-spike.md).
 
 **Reports.** `skillbench-report` (added by this fork) writes
-`runs/skillbench/report.md` and `report.json` with the per-skill lift, confidence
-interval, verdict, invocation rate, and time-to-skill. The upstream
+`runs/skillbench/report.md`, `report.json` and a self-contained `report.html`
+dashboard with the per-skill lift, confidence interval, verdict, invocation rate,
+time-to-skill, deterministic test pass rate (`verify`), diff size, tokens, and
+side-by-side WITH / WITHOUT answers. The upstream
 `harness2-report --bench skillbench --arm <with|without>` prints one arm's plain
 mean rubric score as a cross-check.
 

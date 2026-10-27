@@ -14,7 +14,8 @@ Project rules for AGY / Jetski agents working in this repository.
   a leave-one-out A/B benchmark of the `cc-thingz` skills (arm `with` = full allowlisted plugin
   suite, arm `without` = same suite minus `skills/<target>/`).
 - `harness2/cli/skillbench_report.py` (`skillbench-report`) — paired lift, two-level bootstrap
-  CI, verdicts, time-to-skill.
+  CI, verdicts, time-to-skill, `verify` pass rate, diff/token medians;
+  `harness2/cli/skillbench_html.py` renders `report.html`.
 - `scripts/run_skillbench.sh` (full chain), `scripts/agy_spike.sh` (records real streams).
 - Docs: `docs/BENCHMARKS.md#skillbench`, `docs/SETUP.md#agy-executor`, `docs/skillbench-spike.md`.
 
