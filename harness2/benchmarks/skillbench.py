@@ -35,7 +35,10 @@ Task model and agy judge (the benchmark adapter builds on both):
                        and caches judgments in `<run_dir>/judgments.json`
     run_verify         optional deterministic check (`verify` command) -> `<run_dir>/verify.json`
     diff_stats         files / lines added / lines removed in a rollout's `diff.patch`
-    SkillbenchAdapter  BenchmarkAdapter for leave-one-out skill lift (`arm="with" | "without"`)
+    SkillbenchAdapter  BenchmarkAdapter for one arm: skill arms (`with` / `without`, leave-one-out
+                       lift) run `kind = "skill"` tasks, suite arms (`baseline` / `suite-<name>`,
+                       suite vs built-in behaviour) run `kind = "suite"` tasks; rollouts land in
+                       `results/<executor>/<arm label>/`
 
 Task layout::
 
@@ -78,19 +81,21 @@ from ..core import tree as HT
 from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.agy import (
     AGY_SURFACE,
-    ARMS,
     INSTALL_MODE,
     PLUGINS_REL,
     AgyEvent,
     AgySubstrate,
     AgyTask,
+    ArmSpec,
     _kill_group,
     agy_argv,
     agy_bin_missing_message,
     auth_files,
+    checked_plugins,
     exec_effort,
     exec_model,
     model_guard,
+    parse_arm_label,
     parse_event,
     resolve_agy_bin,
 )
@@ -98,6 +103,7 @@ from .skillbench_suite import (
     SuiteConfig,
     SuiteError,
     active_suite,
+    load_suite,
     redaction_names,
     skill_asks_user,
 )
@@ -1245,19 +1251,28 @@ def skillbench_spec(*, runs_root: Path | None = None) -> BenchSpec:
     )
 
 
+def _path_segment(model_id: str) -> str:
+    """A model id as one results-directory segment (`/` and whitespace replaced)."""
+    return re.sub(r"[\s/\\]+", "_", model_id.strip()) or "unknown-executor"
+
+
 class SkillbenchAdapter:
     """The `BenchmarkAdapter` surface for skillbench on the `agy` substrate.
 
-    Each adapter instance represents one arm (`"with"` or `"without"`) of the active suite
-    (`suite`, from `--suite` / `SKILLBENCH_SUITE` / the env fallback). The task corpus is
-    `root` when given, else `tasks_root(suite=suite)`; constructing the adapter verifies
-    `check_manifest` against it and refuses on drift. Only `kind = "skill"` tasks are
-    scheduled: suite tasks belong to suite arms.
+    Each adapter instance represents one arm of the suite under test (`suite`, from `--suite`
+    / `SKILLBENCH_SUITE` / the env fallback): a skill arm (`"with"` / `"without"`, leave-one-
+    out per task) or a suite arm (`"baseline"` = no plugins, `"suite-<name>"` = the whole
+    named suite -- the suite under test or one of `suites`, the `--suites` extras). `arm` is
+    a label or a resolved `ArmSpec`. The task corpus is `root` when given, else
+    `tasks_root(suite=suite)`; constructing the adapter verifies `check_manifest` against it
+    and refuses on drift. Skill arms schedule `kind = "skill"` tasks only, suite arms
+    `kind = "suite"` tasks only. Rollouts live under
+    `<runs_root>/results/<executor>/<arm label>/`.
     """
 
     def __init__(
         self,
-        arm: str,
+        arm: ArmSpec | str,
         substrate: str = "agy",
         split_file: Path | None = None,
         *,
@@ -1265,24 +1280,47 @@ class SkillbenchAdapter:
         root: Path | None = None,
         runs_root: Path | None = None,
         suite: SuiteConfig | None = None,
+        suites: Iterable[SuiteConfig | Path | str] = (),
+        executor: str | None = None,
     ):
-        if arm not in ARMS:
-            raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
         if substrate != "agy":
             raise ValueError(f"skillbench requires substrate 'agy', got {substrate!r}")
-        self.arm = arm
+        self.suite = suite if suite is not None else active_suite()
+        self.extra_suites: tuple[SuiteConfig, ...] = tuple(
+            s if isinstance(s, SuiteConfig) else load_suite(s) for s in suites
+        )
+        if isinstance(arm, ArmSpec):
+            self.arm_spec = arm
+        else:
+            try:
+                self.arm_spec = parse_arm_label(
+                    arm, suite=self.suite, extra_suites=self.extra_suites
+                )
+            except ValueError as e:
+                raise ValueError(f"arm: {e}") from None
+        self.arm = self.arm_spec.label
+        self.arm_kind = self.arm_spec.kind
         self.split_file = split_file
         self._pilot = pilot
-        self.suite = suite if suite is not None else active_suite()
         self._root = tasks_root(root, self.suite)
         self.manifest_hash = check_manifest(self._root)
         self._tasks = load_tasks(self._root)
         self.spec = skillbench_spec(runs_root=runs_root)
-        self._results_root = self.spec.runs_root / "results" / self.arm
+        self.executor = (
+            executor.strip() if executor and executor.strip() else exec_model()
+        )
+        self._results_root = (
+            self.spec.runs_root / "results" / _path_segment(self.executor) / self.arm
+        )
         self.substrate = AgySubstrate(
             tasks=self._agy_task,
             runs_root=self._results_root,
         )
+
+    def _task_kind(self) -> str:
+        """The task kind this arm schedules: `skill` tasks for skill arms, `suite` tasks for
+        suite arms."""
+        return "skill" if self.arm_kind == "skill" else "suite"
 
     def _get_task(self, task_id: str) -> SkillbenchTask:
         if task_id not in self._tasks:
@@ -1306,8 +1344,9 @@ class SkillbenchAdapter:
             if self._root == tasks_root(suite=self.suite)
             else {tid: t.domain for tid, t in self._tasks.items()}
         )
-        # Suite tasks (`kind = "suite"`) are scheduled by suite arms only.
-        discovered = {tid: d for tid, d in discovered.items() if self._tasks[tid].kind == "skill"}
+        # Skill arms run `kind = "skill"` tasks, suite arms `kind = "suite"` tasks.
+        kind = self._task_kind()
+        discovered = {tid: d for tid, d in discovered.items() if self._tasks[tid].kind == kind}
         selected = select(discovered, split, self.split_file, benchmark="skillbench")
         if pilot_only:
             return [tid for tid in selected if self._tasks[tid].pilot]
@@ -1323,7 +1362,8 @@ class SkillbenchAdapter:
         raise ValueError(f"malformed skillbench task_id {task_id!r} (expected '<skill>/<task-id>')")
 
     def reference_domain_order(self) -> list[str]:
-        return sorted({t.domain for t in self._tasks.values() if t.kind == "skill"})
+        kind = self._task_kind()
+        return sorted({t.domain for t in self._tasks.values() if t.kind == kind})
 
     def task_prompt(self, task_id: str) -> str:
         return build_prompt(self._get_task(task_id))
@@ -1334,6 +1374,21 @@ class SkillbenchAdapter:
 
     def _run_dir(self, run_id: str) -> Path:
         return self._results_root / run_id
+
+    def materialise_ctx(self, task: SkillbenchTask | str) -> dict[str, str]:
+        """The `materialise` ctx for one task of this arm: the arm label, the task's target
+        skill (skill arms) and, for a `suite-<name>` arm of a further suite, its path."""
+        resolved = self._get_task(task) if isinstance(task, str) else task
+        ctx = {"arm": self.arm, "target_skill": resolved.target_skill}
+        staged = self.arm_spec.suite
+        if (
+            self.arm_kind == "suite"
+            and staged is not None
+            and staged is not self.suite
+            and staged.path is not None
+        ):
+            ctx["suite_path"] = str(staged.path)
+        return ctx
 
     def _output_fingerprint(self, run_dir: Path) -> str:
         run_dir = Path(run_dir)
@@ -1375,11 +1430,7 @@ class SkillbenchAdapter:
         ):
             return out
         src = Path(harness_dir) if harness_dir is not None else self.base_harness()
-        install = self.substrate.materialise(
-            src,
-            self.spec,
-            {"arm": self.arm, "target_skill": task.target_skill},
-        )
+        install = self.substrate.materialise(src, self.spec, self.materialise_ctx(task))
         eff_timeout = (
             int(timeout) if timeout is not None and int(timeout) > 0 else task.timeout
         )
@@ -1446,12 +1497,19 @@ class SkillbenchAdapter:
 
     def preflight(self) -> None:
         self.substrate.preflight()
+        if self.arm_spec.suite is not None and self.arm_spec.suite is not self.suite:
+            checked_plugins(self.arm_spec.suite)
         check_manifest(self._root)
         judge_repeat()
 
     def score(self, run_dir: Path, task_id: str) -> dict | None:
         task = self._tasks.get(task_id, task_id)
-        return score(run_dir, task, root=self._root, suite=self.suite)
+        return score(
+            run_dir,
+            task,
+            root=self._root,
+            suite=self.arm_spec.suite or self.suite,
+        )
 
 
 # --------------------------------------------------------------------------------------------

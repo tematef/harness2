@@ -74,9 +74,19 @@ from ..benchmarks.skillbench import (
     judge_model,
     load_tasks,
 )
-from ..benchmarks.skillbench_suite import active_suite
+from ..benchmarks.skillbench_suite import SuiteConfig, active_suite, load_suite
 from ..core import schedule as SCHED
-from ..substrate.agy import DEFAULT_EXEC_MODEL, exec_model
+from ..substrate.agy import (
+    ARM_LABEL_HELP,
+    BASELINE_ARM,
+     DEFAULT_EXEC_MODEL,
+    SUITE_ARM_PREFIX,
+    arm_kind,
+    exec_model,
+    read_events,
+    skills_read,
+    suite_arm_label,
+)
 from . import _common as C
 from .run_sweep import RUN_JSON
 from .skillbench_html import render_html
@@ -125,7 +135,7 @@ FINAL_EXCERPT_CHARS = 6000
 
 # Arm pairs the per-skill block is computed from: treatment label -> control label.
 ARM_PAIRS: dict[str, str] = {"with": "without"}
-CONTROL_LABELS = frozenset(ARM_PAIRS.values())
+CONTROL_LABELS = frozenset({"without", BASELINE_ARM})
 ARM_LABELS = frozenset(ARM_PAIRS) | CONTROL_LABELS
 
 # Per-executor keys mirrored at the top level of `report.json` for schema-v1 consumers.
@@ -144,6 +154,9 @@ _LEGACY_MODEL_KEYS = (
     "invalid_by_reason",
     "skills",
     "by_skill",
+    "suites",
+    "by_family",
+    "suite_arms",
 )
 
 
@@ -236,6 +249,8 @@ class _RepRecord:
     final_excerpt: str = ""
     # Criteria the judge marked failed (`n_criteria - n_passed`); None when ungraded / invalid.
     n_missed: int | None = None
+    # Sorted unique skill names whose `SKILL.md` was read in the rollout.
+    skills_read: tuple[str, ...] = ()
 
     @property
     def diff_lines(self) -> int | None:
@@ -251,6 +266,7 @@ class _RepRecord:
             "invalid_reason": self.invalid_reason,
             "invoked": self.invoked,
             "t_skill_s": self.t_skill_s,
+            "skills_read": list(self.skills_read),
             "frac": self.frac,
             "n_missed": self.n_missed,
             "verify_passed": self.verify_passed,
@@ -410,6 +426,16 @@ def corpus_thresholds() -> dict[str, int]:
     return {tid: int(t.min_baseline_fail) for tid, t in tasks.items()}
 
 
+def corpus_domains() -> dict[str, str]:
+    """`task_id -> domain` (skill name for `kind="skill"`, family for `kind="suite"`) from the
+    resolved task corpus; empty when the corpus cannot be loaded."""
+    try:
+        tasks = load_tasks()
+    except (TaskError, config.ConfigError, OSError, ValueError):
+        return {}
+    return {tid: str(t.domain) for tid, t in tasks.items()}
+
+
 def hardness_rows(
     control_recs: Sequence[_RepRecord], thresholds: Thresholds
 ) -> dict[str, dict[str, Any]]:
@@ -561,6 +587,7 @@ def _load_arm_records(ns_dir: Path) -> tuple[dict[str, Any], list[_RepRecord]]:
             scores_by_run_id[rid] = sc
 
     cfg = _load_cell_meta(ns_dir)
+    known_domains = corpus_domains()
 
     records: list[_RepRecord] = []
     for summary_path in sorted(ns_dir.glob("*/summary.json")):
@@ -573,9 +600,13 @@ def _load_arm_records(ns_dir: Path) -> tuple[dict[str, Any], list[_RepRecord]]:
         task_id = str(summary.get("task_id") or "")
         if not task_id:
             continue
-        skill = str(
-            summary.get("domain") or (task_id.split("/", 1)[0] if "/" in task_id else task_id)
-        )
+        raw_dom = summary.get("family") or summary.get("domain")
+        if isinstance(raw_dom, str) and raw_dom and raw_dom != "_suite":
+            skill = raw_dom
+        elif task_id in known_domains:
+            skill = known_domains[task_id]
+        else:
+            skill = task_id.split("/", 1)[0] if "/" in task_id else task_id
         for entry in summary.get("base") or []:
             if not isinstance(entry, Mapping):
                 continue
@@ -624,6 +655,7 @@ def _load_rep(
     total_tokens: int | None = None
     t_total_s: float | None = None
     final_excerpt = ""
+    s_read: tuple[str, ...] = ()
 
     if run_dir is not None:
         timing_path = run_dir / SKILL_TIMING_FILE
@@ -666,6 +698,18 @@ def _load_rep(
                 raw_tt = timing.get("t_total_s")
                 if isinstance(raw_tt, (int, float)) and not isinstance(raw_tt, bool):
                     t_total_s = float(raw_tt)
+                raw_sr = timing.get("skills_read")
+                if isinstance(raw_sr, list):
+                    s_read = tuple(sorted({str(s) for s in raw_sr if isinstance(s, str) and s}))
+                elif (run_dir / "events.jsonl").is_file():
+                    s_read = tuple(
+                        skills_read(
+                            read_events(run_dir / "events.jsonl"),
+                            plugins_dir=run_dir / "home" / ".gemini" / "config" / "plugins"
+                            if (run_dir / "home" / ".gemini" / "config" / "plugins").exists()
+                            else None,
+                        )
+                    )
 
         v_path = run_dir / VERIFY_FILE
         if v_path.is_file():
@@ -742,6 +786,7 @@ def _load_rep(
         t_total_s=t_total_s,
         final_excerpt=final_excerpt,
         n_missed=n_missed,
+        skills_read=s_read,
     )
 
 
@@ -775,6 +820,13 @@ def _check_arm_configs(
         return
     who = f" of executor {executor!r}" if executor else ""
     for key in _IDENTITY_KEYS:
+        if (
+            key == "suite_hash"
+            and with_cfg.get("suite") is not None
+            and without_cfg.get("suite") is not None
+            and with_cfg.get("suite") != without_cfg.get("suite")
+        ):
+            continue
         v_with = with_cfg.get(key)
         v_without = without_cfg.get(key)
         if v_with is not None and v_without is not None and v_with != v_without:
@@ -793,11 +845,13 @@ class _LoadedCell:
 
 
 def _load_cell(cell: ReportCell) -> _LoadedCell:
-    if cell.arm_label not in ARM_LABELS:
+    try:
+        arm_kind(cell.arm_label)
+    except ValueError as exc:
         raise ValueError(
             f"unknown arm label {cell.arm_label!r} for {cell.ns_dir}; "
-            f"expected one of {sorted(ARM_LABELS)}"
-        )
+            f"expected one of {ARM_LABEL_HELP}"
+        ) from exc
     meta, recs = _load_arm_records(cell.ns_dir)
     meta_exec = _str_or_none(meta.get("executor"))
     meta_judge = _str_or_none(meta.get("judge"))
@@ -830,8 +884,9 @@ def _group_cells(
     loaded: Sequence[_LoadedCell], *, require_pairs: bool = True
 ) -> dict[str, dict[str, _LoadedCell]]:
     """`executor -> arm label -> cell`, in first-seen executor order; every executor must hold
-    exactly one complete treatment / control pair graded by one judge (with `require_pairs`
-    off — the hardness-only path — a control cell alone is enough)."""
+    at least one complete treatment / control pair (`with` + `without`, or `baseline` + one or
+    more `suite-<name>` cells) graded by one judge (with `require_pairs` off — the
+    hardness-only path — a control cell alone is enough)."""
     groups: dict[str, dict[str, _LoadedCell]] = {}
     for lc in loaded:
         arms = groups.setdefault(lc.executor, {})
@@ -863,7 +918,18 @@ def _group_cells(
                 raise ValueError(
                     f"executor {executor!r} has a {have[0]!r} cell but no {missing!r} cell"
                 )
-        if not any(t in arms for t in ARM_PAIRS):
+        suite_arms = [lbl for lbl in arms if lbl.startswith(SUITE_ARM_PREFIX)]
+        has_baseline = BASELINE_ARM in arms
+        if suite_arms and not has_baseline:
+            raise ValueError(
+                f"executor {executor!r} has a {suite_arms[0]!r} cell but no {BASELINE_ARM!r} cell"
+            )
+        if has_baseline and not suite_arms:
+            raise ValueError(
+                f"executor {executor!r} has a {BASELINE_ARM!r} cell but no "
+                f"'{SUITE_ARM_PREFIX}<name>' cell"
+            )
+        if not any(t in arms for t in ARM_PAIRS) and not suite_arms:
             raise ValueError(
                 f"executor {executor!r} has no complete arm pair (labels: {sorted(arms)})"
             )
@@ -871,9 +937,26 @@ def _group_cells(
 
 
 def _check_global_identity(loaded: Sequence[_LoadedCell]) -> None:
+    primary_suite = next(
+        (
+            lc.meta.get("suite")
+            for lc in loaded
+            if not lc.cell.arm_label.startswith(SUITE_ARM_PREFIX)
+            and lc.meta.get("suite") is not None
+        ),
+        _first_meta(loaded, "suite"),
+    )
     for key in _GLOBAL_IDENTITY_KEYS:
         seen: dict[Any, Path] = {}
         for lc in loaded:
+            if (
+                key == "suite_hash"
+                and lc.cell.arm_label.startswith(SUITE_ARM_PREFIX)
+                and lc.meta.get("suite") is not None
+                and primary_suite is not None
+                and lc.meta.get("suite") != primary_suite
+            ):
+                continue
             value = lc.meta.get(key)
             if value is None:
                 continue
@@ -893,8 +976,15 @@ def _first_meta(loaded: Sequence[_LoadedCell], key: str) -> Any:
 def _suite_info(loaded: Sequence[_LoadedCell]) -> dict[str, Any]:
     """`{name, hash}` from `run.json`; the active suite fills in only when no namespace
     recorded a suite at all (older runs)."""
-    name = _str_or_none(_first_meta(loaded, "suite"))
-    suite_hash = _str_or_none(_first_meta(loaded, "suite_hash"))
+    non_suite_arm = [
+        lc for lc in loaded if not lc.cell.arm_label.startswith(SUITE_ARM_PREFIX)
+    ] or list(loaded)
+    name = _str_or_none(_first_meta(non_suite_arm, "suite")) or _str_or_none(
+        _first_meta(loaded, "suite")
+    )
+    suite_hash = _str_or_none(_first_meta(non_suite_arm, "suite_hash")) or _str_or_none(
+        _first_meta(loaded, "suite_hash")
+    )
     if name is None and suite_hash is None:
         try:
             suite = active_suite(quiet=True)
@@ -902,6 +992,65 @@ def _suite_info(loaded: Sequence[_LoadedCell]) -> dict[str, Any]:
         except (config.ConfigError, OSError):
             pass
     return {"name": name, "hash": suite_hash}
+
+
+def _load_extra_suites(
+    suites: Iterable[SuiteConfig | Path | str] | str | Path | None,
+) -> list[SuiteConfig]:
+    if suites is None:
+        return []
+    if isinstance(suites, SuiteConfig):
+        return [suites]
+    if isinstance(suites, (str, Path)):
+        raw_items: list[SuiteConfig | Path | str] = list(C.parse_suites(suites))
+    else:
+        raw_items = []
+        for item in suites:
+            if isinstance(item, SuiteConfig):
+                raw_items.append(item)
+            else:
+                raw_items.extend(C.parse_suites(item))
+    out: list[SuiteConfig] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        sc = item if isinstance(item, SuiteConfig) else load_suite(item)
+        if sc.name not in seen:
+            seen.add(sc.name)
+            out.append(sc)
+    return out
+
+
+def _order_suite_cells(
+    arms: Mapping[str, _LoadedCell],
+    *,
+    primary_suite_name: str | None,
+    extra_suites: Sequence[SuiteConfig],
+    executor: str,
+) -> dict[str, _LoadedCell]:
+    raw_suite_cells = {
+        lbl: lc for lbl, lc in arms.items() if lbl.startswith(SUITE_ARM_PREFIX)
+    }
+    if not raw_suite_cells:
+        return {}
+    ordered: dict[str, _LoadedCell] = {}
+    if primary_suite_name:
+        try:
+            primary_lbl = suite_arm_label(primary_suite_name)
+        except ValueError:
+            primary_lbl = ""
+        if primary_lbl in raw_suite_cells:
+            ordered[primary_lbl] = raw_suite_cells[primary_lbl]
+    for sc in extra_suites:
+        lbl = suite_arm_label(sc.name)
+        if lbl not in raw_suite_cells:
+            raise ValueError(
+                f"executor {executor!r} has no {lbl!r} cell for suite {sc.name!r} "
+                f"(available: {sorted(raw_suite_cells)})"
+            )
+        ordered[lbl] = raw_suite_cells[lbl]
+    for lbl, lc in raw_suite_cells.items():
+        ordered.setdefault(lbl, lc)
+    return ordered
 
 
 def _resolve_cell_list(
@@ -933,13 +1082,14 @@ def build_report(
     draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     pilot: bool | None = None,
     min_baseline_fail: int | Mapping[str, int] | None = None,
+    suites: Iterable[SuiteConfig | Path | str] | str | Path | None = None,
 ) -> dict[str, Any]:
     """Compute the schema-v2 skillbench report dictionary from a list of `ReportCell`s.
 
     Accepted inputs:
     - `build_report(cells)` — any number of `(executor, judge, arm_label, ns_dir)` cells; the
-      cells are grouped per executor and each executor's `with` / `without` pair yields one
-      `models[]` entry;
+      cells are grouped per executor and each executor's `with` / `without` pair (and/or
+      `baseline` + `suite-<name>` cells) yields one `models[]` entry;
     - `build_report(with_ns_dir, without_ns_dir)` — the schema-v1 call: one pair, executor
       and judge taken from the namespaces' `run.json` / `config.json`;
     - `build_report(results_root)` — one path: auto-discovers `<executor>/<arm-label>`
@@ -952,18 +1102,18 @@ def build_report(
     Shape: `{schema_version: 2, suite: {name, hash}, k, seed, bootstrap_*, pilot,
     manifest_hash, power_note, hardness_note, models: [{executor, judge, arms, k,
     requested_* / actual_* model fields, judge_noise_*, invalid_*, skills, by_skill,
-    task_hardness}], ...}` plus the per-executor keys of `models[0]` mirrored at the top
-    level, so schema-v1 consumers keep reading the same `skills` / `by_skill` numbers from a
-    single-model report. Every per-skill row carries `ceiling_tasks`, `informative_tasks`,
-    `unclassified_tasks`, `total_tasks`, `ceiling_share` and `needs_harder_tasks`; every task
-    entry its `hardness`, `baseline_missed` and `min_baseline_fail`.
+    suites, by_family, suite_arms, task_hardness}], ...}` plus the per-executor keys of
+    `models[0]` mirrored at the top level, so schema-v1 consumers keep reading the same
+    `skills` / `by_skill` numbers from a single-model report.
     """
     cell_list = _resolve_cell_list(cells, without_ns_dir)
     thresholds = _thresholds(min_baseline_fail)
+    extra_suites = _load_extra_suites(suites)
 
     loaded = [_load_cell(c) for c in cell_list]
     _check_global_identity(loaded)
     groups = _group_cells(loaded)
+    suite_meta = _suite_info(loaded)
 
     is_pilot = (
         bool(pilot)
@@ -986,15 +1136,29 @@ def build_report(
 
     models: list[dict[str, Any]] = []
     for executor, arms in groups.items():
-        with_cell = arms["with"]
-        without_cell = arms["without"]
-        _check_arm_configs(with_cell.meta, without_cell.meta, executor=executor)
+        with_cell = arms.get("with")
+        without_cell = arms.get("without")
+        if with_cell is not None and without_cell is not None:
+            _check_arm_configs(with_cell.meta, without_cell.meta, executor=executor)
+        baseline_cell = arms.get(BASELINE_ARM)
+        suite_cells = _order_suite_cells(
+            arms,
+            primary_suite_name=_str_or_none(suite_meta.get("name")),
+            extra_suites=extra_suites,
+            executor=executor,
+        )
+        if baseline_cell is not None:
+            for sc in suite_cells.values():
+                _check_arm_configs(sc.meta, baseline_cell.meta, executor=executor)
+        any_cell = with_cell or baseline_cell or next(iter(arms.values()))
         models.append(
             _model_block(
                 executor=executor,
-                judge=with_cell.judge,
+                judge=any_cell.judge,
                 with_cell=with_cell,
                 without_cell=without_cell,
+                baseline_cell=baseline_cell,
+                suite_cells=suite_cells,
                 k=k,
                 draws=draws,
                 boot_seed=eff_boot_seed,
@@ -1005,7 +1169,7 @@ def build_report(
 
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "suite": _suite_info(loaded),
+        "suite": suite_meta,
         "k": int(k) if k is not None else max(m["k"] for m in models),
         "seed": eff_seed,
         "bootstrap_seed": eff_boot_seed,
@@ -1016,6 +1180,10 @@ def build_report(
         "hardness_note": HARDNESS_NOTE,
         "models": models,
     }
+    if extra_suites:
+        report["extra_suites"] = [
+            {"name": sc.name, "hash": sc.suite_hash} for sc in extra_suites
+        ]
     report.update({key: models[0][key] for key in _LEGACY_MODEL_KEYS})
     return report
 
@@ -1043,9 +1211,10 @@ def build_hardness(
 
     models: list[dict[str, Any]] = []
     for executor, arms in groups.items():
-        control_label = next(lbl for lbl in sorted(CONTROL_LABELS) if lbl in arms)
-        control = arms[control_label]
-        tasks = hardness_rows(control.recs, thresholds)
+        control_labels = [lbl for lbl in sorted(CONTROL_LABELS) if lbl in arms]
+        control_recs = [r for lbl in control_labels for r in arms[lbl].recs]
+        first_control = arms[control_labels[0]]
+        tasks = hardness_rows(control_recs, thresholds)
         skills: dict[str, dict[str, Any]] = {}
         for skill in sorted({row["skill"] for row in tasks.values()}):
             skills[skill] = skill_hardness(
@@ -1054,8 +1223,8 @@ def build_hardness(
         models.append(
             {
                 "executor": executor,
-                "judge": control.judge,
-                "control_arm": control_label,
+                "judge": first_control.judge,
+                "control_arm": "/".join(control_labels),
                 "tasks": tasks,
                 "skills": skills,
             }
@@ -1077,8 +1246,9 @@ def hardness_of_report(report: Mapping[str, Any]) -> dict[str, Any]:
     for model in models_of(report):
         tasks: dict[str, dict[str, Any]] = {}
         skills: dict[str, dict[str, Any]] = {}
-        for row in model.get("skills") or []:
-            skill = str(row.get("skill"))
+        rows = list(model.get("skills") or []) + list(model.get("suites") or [])
+        for row in rows:
+            skill = str(row.get("skill") or row.get("family"))
             for tid, t in sorted((row.get("tasks") or {}).items()):
                 tasks[str(tid)] = {
                     "skill": skill,
@@ -1090,11 +1260,17 @@ def hardness_of_report(report: Mapping[str, Any]) -> dict[str, Any]:
             skills[skill] = skill_hardness(
                 t.get("hardness", HARDNESS_UNCLASSIFIED) for t in (row.get("tasks") or {}).values()
             )
+        arms_map = model.get("arms") if isinstance(model.get("arms"), Mapping) else {}
+        control_arm = (
+            BASELINE_ARM
+            if BASELINE_ARM in arms_map and "without" not in arms_map
+            else "without"
+        )
         models.append(
             {
                 "executor": model.get("executor") or model.get("requested_exec_model"),
                 "judge": model.get("judge") or model.get("requested_judge_model"),
-                "control_arm": next(iter(sorted(CONTROL_LABELS))),
+                "control_arm": control_arm,
                 "tasks": tasks,
                 "skills": skills,
             }
@@ -1109,29 +1285,379 @@ def hardness_of_report(report: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _skills_histogram(recs: Iterable[_RepRecord]) -> dict[str, int]:
+    """Count of valid reps in `recs` that read each skill (`skill_name -> rep_count`)."""
+    counts: dict[str, int] = {}
+    for r in recs:
+        if not r.valid:
+            continue
+        for s in set(r.skills_read):
+            if s:
+                counts[s] = counts.get(s, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _build_suites_section(
+    *,
+    baseline_cell: _LoadedCell,
+    suite_cells: Mapping[str, _LoadedCell],
+    draws: int,
+    boot_seed: int,
+    pilot: bool,
+    thresholds: Thresholds,
+    overall_invalid_by_reason: dict[str, int],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], int]:
+    """Compute `(suites_rows, by_family, invalid_count)` for one executor's suite-mode cells."""
+    base_recs = baseline_cell.recs
+    suite_recs_all = [r for sc in suite_cells.values() for r in sc.recs]
+    hardness = hardness_rows(base_recs, thresholds)
+    families = sorted({r.skill for r in base_recs + suite_recs_all})
+    suite_arm_labels = list(suite_cells.keys())
+
+    suite_rows: list[dict[str, Any]] = []
+    by_family: dict[str, dict[str, Any]] = {}
+    suite_invalid_total = 0
+
+    for family in families:
+        f_base = [r for r in base_recs if r.skill == family]
+        task_ids = sorted(
+            {r.task_id for r in f_base}
+            | {
+                r.task_id
+                for sc in suite_cells.values()
+                for r in sc.recs
+                if r.skill == family
+            }
+        )
+        valid_f_base = [r for r in f_base if r.valid]
+        inv_f_base = [r for r in f_base if not r.valid]
+        ungraded_f_base = sum(1 for r in f_base if r.valid and r.frac is None)
+        vb_pass, vb_total, vb_rate = _verify_counts(f_base)
+        tok_base_med = _median(r.total_tokens for r in valid_f_base)
+        wall_base_med = _median(r.t_total_s for r in valid_f_base)
+        diff_base_med = _median(r.diff_lines for r in valid_f_base)
+
+        family_reasons: dict[str, int] = {}
+        for r in inv_f_base:
+            reason = r.invalid_reason or "invalid rollout"
+            family_reasons[reason] = family_reasons.get(reason, 0) + 1
+            overall_invalid_by_reason[reason] = overall_invalid_by_reason.get(reason, 0) + 1
+        suite_invalid_total += len(inv_f_base)
+
+        per_arm_family: dict[str, dict[str, Any]] = {}
+        per_task_by_arm: dict[str, dict[str, dict[str, Any]]] = {tid: {} for tid in task_ids}
+        per_task_reps: dict[str, dict[str, list[dict[str, Any]]]] = {
+            tid: {BASELINE_ARM: [r.detail() for r in f_base if r.task_id == tid]}
+            for tid in task_ids
+        }
+
+        for arm_label, s_cell in suite_cells.items():
+            suite_name = arm_label[len(SUITE_ARM_PREFIX) :]
+            f_suite = [r for r in s_cell.recs if r.skill == family]
+            task_deltas: dict[str, float] = {}
+            paired_for_boot: list[tuple[list[float], list[float]]] = []
+            suite_task_means: list[float] = []
+            base_task_means: list[float] = []
+            n_qualifying = 0
+
+            for tid in task_ids:
+                t_suite = [r for r in f_suite if r.task_id == tid]
+                t_base = [r for r in f_base if r.task_id == tid]
+                s_fracs = [r.frac for r in t_suite if r.valid and r.frac is not None]
+                b_fracs = [r.frac for r in t_base if r.valid and r.frac is not None]
+                s_mean = st.mean(s_fracs) if s_fracs else None
+                b_mean = st.mean(b_fracs) if b_fracs else None
+                delta = (
+                    (s_mean - b_mean)
+                    if (s_mean is not None and b_mean is not None)
+                    else None
+                )
+                if delta is not None and s_mean is not None and b_mean is not None:
+                    task_deltas[tid] = delta
+                    paired_for_boot.append((s_fracs, b_fracs))
+                    suite_task_means.append(s_mean)
+                    base_task_means.append(b_mean)
+                    t_ci_low, t_ci_high = bootstrap_ci(
+                        [(s_fracs, b_fracs)], draws=draws, seed=boot_seed
+                    )
+                else:
+                    t_ci_low, t_ci_high = None, None
+
+                t_qualifies = (
+                    len(s_fracs) >= MIN_VALID_REPS_PER_ARM
+                    and len(b_fracs) >= MIN_VALID_REPS_PER_ARM
+                )
+                if t_qualifies:
+                    n_qualifying += 1
+                if not t_qualifies or t_ci_low is None or t_ci_high is None:
+                    t_verdict = "insufficient data"
+                elif t_ci_low > 0.0:
+                    t_verdict = "helps"
+                elif t_ci_high < 0.0:
+                    t_verdict = "hurts"
+                else:
+                    t_verdict = "inconclusive"
+
+                valid_t_suite = [r for r in t_suite if r.valid]
+                inv_t_suite = [r for r in valid_t_suite if r.invoked]
+                n_valid_ts = len(valid_t_suite)
+                n_inv_ts = len(inv_t_suite)
+                t_inv_rate = (n_inv_ts / n_valid_ts) if n_valid_ts > 0 else None
+                t_skills = sorted(r.t_skill_s for r in inv_t_suite if r.t_skill_s is not None)
+                t_p50 = float(st.median(t_skills)) if t_skills else None
+                t_p90 = _quantile(t_skills, 0.90) if t_skills else None
+                ts_pass, ts_total, _ = _verify_counts(t_suite)
+                t_hist = _skills_histogram(valid_t_suite)
+
+                per_task_by_arm[tid][arm_label] = {
+                    "suite_arm": arm_label,
+                    "suite_name": suite_name,
+                    "suite_fracs": s_fracs,
+                    "with_fracs": s_fracs,
+                    "baseline_fracs": b_fracs,
+                    "without_fracs": b_fracs,
+                    "suite_mean": s_mean,
+                    "with_mean": s_mean,
+                    "baseline_mean": b_mean,
+                    "without_mean": b_mean,
+                    "delta": delta,
+                    "lift": delta,
+                    "ci_low": t_ci_low,
+                    "ci_high": t_ci_high,
+                    "ci": (
+                        [t_ci_low, t_ci_high]
+                        if (t_ci_low is not None and t_ci_high is not None)
+                        else None
+                    ),
+                    "verdict": t_verdict,
+                    "invoked": n_inv_ts,
+                    "valid_suite_reps": n_valid_ts,
+                    "valid_with_reps": n_valid_ts,
+                    "invocation_rate": t_inv_rate,
+                    "t_skill_s": t_skills,
+                    "t_skill_p50": t_p50,
+                    "t_skill_p90": t_p90,
+                    "skills_read_histogram": t_hist,
+                    "verify_suite": [ts_pass, ts_total],
+                    "verify_with": [ts_pass, ts_total],
+                    "diff_lines_suite_median": _median(r.diff_lines for r in valid_t_suite),
+                    "diff_lines_with_median": _median(r.diff_lines for r in valid_t_suite),
+                    "tokens_suite_median": _median(r.total_tokens for r in valid_t_suite),
+                    "tokens_with_median": _median(r.total_tokens for r in valid_t_suite),
+                    "t_total_suite_median": _median(r.t_total_s for r in valid_t_suite),
+                    "t_total_with_median": _median(r.t_total_s for r in valid_t_suite),
+                    "criteria_suite": _criteria_rates(t_suite),
+                    "criteria_with": _criteria_rates(t_suite),
+                }
+                per_task_reps[tid][arm_label] = [r.detail() for r in t_suite]
+
+            if paired_for_boot:
+                fam_suite_mean: float | None = st.mean(suite_task_means)
+                fam_base_mean: float | None = st.mean(base_task_means)
+                lift: float | None = st.mean(task_deltas.values())
+                ci_low, ci_high = bootstrap_ci(
+                    paired_for_boot, draws=draws, seed=boot_seed
+                )
+            else:
+                fam_suite_mean = None
+                fam_base_mean = None
+                lift = None
+                ci_low, ci_high = None, None
+
+            verdict = decide_verdict(
+                ci_low, ci_high, n_qualifying_tasks=n_qualifying, pilot=pilot
+            )
+
+            valid_f_suite = [r for r in f_suite if r.valid]
+            invoked_f_suite = [r for r in valid_f_suite if r.invoked]
+            n_valid_suite = len(valid_f_suite)
+            n_invoked = len(invoked_f_suite)
+            inv_rate = (n_invoked / n_valid_suite) if n_valid_suite > 0 else None
+            t_skills_fam = sorted(
+                r.t_skill_s for r in invoked_f_suite if r.t_skill_s is not None
+            )
+            t_p50_fam = float(st.median(t_skills_fam)) if t_skills_fam else None
+            t_p90_fam = _quantile(t_skills_fam, 0.90) if t_skills_fam else None
+            fam_hist = _skills_histogram(valid_f_suite)
+
+            inv_f_suite = [r for r in f_suite if not r.valid]
+            arm_reasons: dict[str, int] = dict(family_reasons)
+            for r in inv_f_suite:
+                reason = r.invalid_reason or "invalid rollout"
+                arm_reasons[reason] = arm_reasons.get(reason, 0) + 1
+                overall_invalid_by_reason[reason] = overall_invalid_by_reason.get(reason, 0) + 1
+            suite_invalid_total += len(inv_f_suite)
+
+            ungraded_f_suite = sum(1 for r in f_suite if r.valid and r.frac is None)
+            vs_pass, vs_total, vs_rate = _verify_counts(f_suite)
+            tok_suite_med = _median(r.total_tokens for r in valid_f_suite)
+            wall_suite_med = _median(r.t_total_s for r in valid_f_suite)
+            diff_suite_med = _median(r.diff_lines for r in valid_f_suite)
+
+            per_arm_family[arm_label] = {
+                "suite_arm": arm_label,
+                "suite_name": suite_name,
+                "n_tasks": len(task_ids),
+                "n_paired_tasks": len(paired_for_boot),
+                "n_qualifying_tasks": n_qualifying,
+                "suite_mean": fam_suite_mean,
+                "with_mean": fam_suite_mean,
+                "baseline_mean": fam_base_mean,
+                "without_mean": fam_base_mean,
+                "lift": lift,
+                "ci_low": ci_low,
+                "ci_high": ci_high,
+                "ci": (
+                    [ci_low, ci_high]
+                    if (ci_low is not None and ci_high is not None)
+                    else None
+                ),
+                "verdict": verdict,
+                "invoked": n_invoked,
+                "valid_suite_reps": n_valid_suite,
+                "valid_with_reps": n_valid_suite,
+                "invocation_rate": inv_rate,
+                "t_skill_s": t_skills_fam,
+                "t_skill_p50": t_p50_fam,
+                "t_skill_p90": t_p90_fam,
+                "skills_read_histogram": fam_hist,
+                "invalid_suite": len(inv_f_suite),
+                "invalid_with": len(inv_f_suite),
+                "invalid_baseline": len(inv_f_base),
+                "invalid_without": len(inv_f_base),
+                "invalid_total": len(inv_f_suite) + len(inv_f_base),
+                "invalid_by_reason": dict(sorted(arm_reasons.items())),
+                "ungraded_suite": ungraded_f_suite,
+                "ungraded_with": ungraded_f_suite,
+                "ungraded_baseline": ungraded_f_base,
+                "ungraded_without": ungraded_f_base,
+                "ungraded_total": ungraded_f_suite + ungraded_f_base,
+                "verify_suite_passed": vs_pass,
+                "verify_suite_total": vs_total,
+                "verify_suite_rate": vs_rate,
+                "verify_with_passed": vs_pass,
+                "verify_with_total": vs_total,
+                "verify_with_rate": vs_rate,
+                "verify_baseline_passed": vb_pass,
+                "verify_baseline_total": vb_total,
+                "verify_baseline_rate": vb_rate,
+                "verify_without_passed": vb_pass,
+                "verify_without_total": vb_total,
+                "verify_without_rate": vb_rate,
+                "diff_lines_suite_median": diff_suite_med,
+                "diff_lines_with_median": diff_suite_med,
+                "diff_lines_baseline_median": diff_base_med,
+                "diff_lines_without_median": diff_base_med,
+                "tokens_suite_median": tok_suite_med,
+                "tokens_with_median": tok_suite_med,
+                "tokens_baseline_median": tok_base_med,
+                "tokens_without_median": tok_base_med,
+                "t_total_suite_median": wall_suite_med,
+                "t_total_with_median": wall_suite_med,
+                "t_total_baseline_median": wall_base_med,
+                "t_total_without_median": wall_base_med,
+                "task_deltas": task_deltas,
+            }
+
+        primary_arm = suite_arm_labels[0]
+        tasks_detail: dict[str, dict[str, Any]] = {}
+        for tid in task_ids:
+            t_base = [r for r in f_base if r.task_id == tid]
+            valid_t_base = [r for r in t_base if r.valid]
+            b_fracs = [r.frac for r in valid_t_base if r.frac is not None]
+            b_mean = st.mean(b_fracs) if b_fracs else None
+            tb_pass, tb_total, _ = _verify_counts(t_base)
+            hard = hardness.get(tid) or {
+                "hardness": HARDNESS_UNCLASSIFIED,
+                "baseline_missed": [],
+                "min_baseline_fail": thresholds[1].get(tid, thresholds[0]),
+            }
+            primary_task = per_task_by_arm[tid][primary_arm]
+            tasks_detail[tid] = {
+                "task_id": tid,
+                "family": family,
+                **primary_task,
+                "baseline_fracs": b_fracs,
+                "without_fracs": b_fracs,
+                "baseline_mean": b_mean,
+                "without_mean": b_mean,
+                "hardness": hard["hardness"],
+                "baseline_missed": hard["baseline_missed"],
+                "min_baseline_fail": hard["min_baseline_fail"],
+                "verify_baseline": [tb_pass, tb_total],
+                "verify_without": [tb_pass, tb_total],
+                "diff_lines_baseline_median": _median(r.diff_lines for r in valid_t_base),
+                "diff_lines_without_median": _median(r.diff_lines for r in valid_t_base),
+                "tokens_baseline_median": _median(r.total_tokens for r in valid_t_base),
+                "tokens_without_median": _median(r.total_tokens for r in valid_t_base),
+                "t_total_baseline_median": _median(r.t_total_s for r in valid_t_base),
+                "t_total_without_median": _median(r.t_total_s for r in valid_t_base),
+                "criteria_baseline": _criteria_rates(t_base),
+                "criteria_without": _criteria_rates(t_base),
+                "by_arm": per_task_by_arm[tid],
+                "arms": per_task_by_arm[tid],
+                "reps": {
+                    **per_task_reps[tid],
+                    "with": per_task_reps[tid][primary_arm],
+                    "without": per_task_reps[tid][BASELINE_ARM],
+                },
+            }
+
+        primary_fam = per_arm_family[primary_arm]
+        row = {
+            "family": family,
+            "skill": family,
+            **primary_fam,
+            "suite_arms": suite_arm_labels,
+            "by_arm": per_arm_family,
+            "arms": per_arm_family,
+            **skill_hardness(t["hardness"] for t in tasks_detail.values()),
+            "tasks": tasks_detail,
+        }
+        suite_rows.append(row)
+        by_family[family] = row
+
+    return suite_rows, by_family, suite_invalid_total
+
+
 def _model_block(
     *,
     executor: str,
     judge: str,
-    with_cell: _LoadedCell,
-    without_cell: _LoadedCell,
+    with_cell: _LoadedCell | None = None,
+    without_cell: _LoadedCell | None = None,
+    baseline_cell: _LoadedCell | None = None,
+    suite_cells: Mapping[str, _LoadedCell] | None = None,
     k: int | None,
     draws: int,
     boot_seed: int,
     pilot: bool,
     thresholds: Thresholds = (DEFAULT_MIN_BASELINE_FAIL, {}),
 ) -> dict[str, Any]:
-    """One `models[]` entry: the per-skill leave-one-out block of a single executor."""
-    with_recs = with_cell.recs
-    without_recs = without_cell.recs
+    """One `models[]` entry: the per-skill leave-one-out block and/or per-family suite block
+    of a single executor."""
+    suite_cells_map = dict(suite_cells or {})
+    with_recs = with_cell.recs if with_cell is not None else []
+    without_recs = without_cell.recs if without_cell is not None else []
+    base_recs = baseline_cell.recs if baseline_cell is not None else []
+    suite_recs = [r for sc in suite_cells_map.values() for r in sc.recs]
     is_pilot = pilot
     eff_boot_seed = boot_seed
-    all_recs = with_recs + without_recs
-    hardness = hardness_rows(without_recs, thresholds)
+    all_recs = with_recs + without_recs + base_recs + suite_recs
+    hardness = hardness_rows(without_recs, thresholds) if without_recs else {}
     if k is None:
         counts_per_task: dict[str, int] = {}
-        for r in with_recs:
-            counts_per_task[r.task_id] = counts_per_task.get(r.task_id, 0) + 1
+        treatment_lists = (
+            [with_recs]
+            if with_recs
+            else [sc.recs for sc in suite_cells_map.values()]
+        )
+        for rlist in treatment_lists:
+            local_counts: dict[str, int] = {}
+            for r in rlist:
+                local_counts[r.task_id] = local_counts.get(r.task_id, 0) + 1
+            for tid, count in local_counts.items():
+                counts_per_task[tid] = max(counts_per_task.get(tid, 0), count)
         eff_k = max(counts_per_task.values(), default=1)
     else:
         eff_k = int(k)
@@ -1159,7 +1685,7 @@ def _model_block(
 
     noise_rate, noise_disagreed, noise_total = judge_noise(r.judgments for r in valid_recs)
 
-    skills = sorted({r.skill for r in all_recs})
+    skills = sorted({r.skill for r in with_recs + without_recs})
     skill_rows: list[dict[str, Any]] = []
     by_skill: dict[str, dict[str, Any]] = {}
     overall_invalid_by_reason: dict[str, int] = {}
@@ -1313,10 +1839,41 @@ def _model_block(
         skill_rows.append(row)
         by_skill[skill] = row
 
+    if baseline_cell is not None and suite_cells_map:
+        suite_rows, by_family, suite_invalid = _build_suites_section(
+            baseline_cell=baseline_cell,
+            suite_cells=suite_cells_map,
+            draws=draws,
+            boot_seed=eff_boot_seed,
+            pilot=is_pilot,
+            thresholds=thresholds,
+            overall_invalid_by_reason=overall_invalid_by_reason,
+        )
+        overall_invalid_total += suite_invalid
+    else:
+        suite_rows = []
+        by_family = {}
+
+    arms_dict: dict[str, str] = {}
+    if with_cell is not None:
+        arms_dict["with"] = str(with_cell.cell.ns_dir)
+    if without_cell is not None:
+        arms_dict["without"] = str(without_cell.cell.ns_dir)
+    if baseline_cell is not None:
+        arms_dict[BASELINE_ARM] = str(baseline_cell.cell.ns_dir)
+    for arm_label, sc in suite_cells_map.items():
+        arms_dict[arm_label] = str(sc.cell.ns_dir)
+
+    task_hardness_map = {
+        tid: t["hardness"]
+        for row in (skill_rows + suite_rows)
+        for tid, t in row["tasks"].items()
+    }
+
     return {
         "executor": executor,
         "judge": judge,
-        "arms": {"with": str(with_cell.cell.ns_dir), "without": str(without_cell.cell.ns_dir)},
+        "arms": arms_dict,
         "k": eff_k,
         "requested_exec_model": req_exec,
         "actual_exec_model": actual_exec_model,
@@ -1332,9 +1889,10 @@ def _model_block(
         "invalid_by_reason": dict(sorted(overall_invalid_by_reason.items())),
         "skills": skill_rows,
         "by_skill": by_skill,
-        "task_hardness": {
-            tid: t["hardness"] for row in skill_rows for tid, t in row["tasks"].items()
-        },
+        "suites": suite_rows,
+        "by_family": by_family,
+        "suite_arms": list(suite_cells_map.keys()),
+        "task_hardness": task_hardness_map,
     }
 
 
@@ -1469,73 +2027,277 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _render_model_tables(report: Mapping[str, Any]) -> list[str]:
-    """The per-skill outcome table and the deterministic-checks table of one model block."""
+def _fmt_skills_histogram(hist: Mapping[str, int] | None) -> str:
+    if not hist:
+        return "none"
+    return ", ".join(f"{skill}: {count}" for skill, count in sorted(hist.items()))
+
+
+def _fmt_extra_suite_cell(arm_row: Mapping[str, Any], *, is_task: bool = False) -> str:
+    mean_str = _fmt_frac(arm_row.get("suite_mean"))
+    if is_task:
+        delta = arm_row.get("delta")
+        lift_str = "n/a" if delta is None else f"{delta:+.2f}"
+    else:
+        lift_str = _fmt_lift_ci(
+            arm_row.get("lift"), arm_row.get("ci_low"), arm_row.get("ci_high")
+        )
+    verdict = str(arm_row.get("verdict", "insufficient data"))
+    tok = arm_row.get("tokens_suite_median")
+    wall = arm_row.get("t_total_suite_median")
+    tok_str = "n/a" if tok is None else f"{tok:.0f}"
+    wall_str = "n/a" if wall is None else f"{wall:.0f}s"
+    hist_str = _fmt_skills_histogram(arm_row.get("skills_read_histogram"))
+    return (
+        f"{mean_str} ({lift_str}, {verdict}, tok {tok_str}, wall {wall_str}, "
+        f"skills: {hist_str})"
+    )
+
+
+def _render_suite_tables(report: Mapping[str, Any]) -> list[str]:
+    """The per-family and per-task suite outcome tables of one model block."""
+    suite_rows = list(report.get("suites") or [])
+    if not suite_rows:
+        return []
+    suite_arms = list(report.get("suite_arms") or [])
+    if not suite_arms:
+        suite_arms = list(
+            suite_rows[0].get("suite_arms")
+            or [suite_rows[0].get("suite_arm") or "suite"]
+        )
+    primary_arm = str(suite_arms[0])
+    extra_arms = [str(a) for a in suite_arms[1:]]
+
+    fam_headers = [
+        "family",
+        "tasks",
+        primary_arm,
+        BASELINE_ARM,
+        "lift [95% CI]",
+        "verdict",
+        "invoked",
+        "t_skill p50/p90",
+        "tokens p50 S/B",
+        "wall time p50 S/B",
+        "skills read",
+        "ceiling/total",
+        *extra_arms,
+    ]
+    fam_align = [
+        ":---",
+        "---:",
+        "---:",
+        "---:",
+        ":---:",
+        ":---:",
+        ":---:",
+        ":---:",
+        ":---:",
+        ":---:",
+        ":---",
+        ":---",
+        *(":---" for _ in extra_arms),
+    ]
     lines = [
         "",
-        "| skill | tasks | WITH | WITHOUT | lift [95% CI] | verdict | invoked | t_skill p50/p90 "
-        "| invalid | ceiling/total |",
-        "| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- | :--- |",
+        "Suite mode (per family vs built-in baseline):",
+        "",
+        "| " + " | ".join(fam_headers) + " |",
+        "| " + " | ".join(fam_align) + " |",
     ]
+    for row in suite_rows:
+        by_arm = row.get("by_arm") if isinstance(row.get("by_arm"), Mapping) else {}
+        primary = by_arm.get(primary_arm, row)
+        cells = [
+            str(row.get("family") or row.get("skill")),
+            str(row.get("n_tasks", 0)),
+            _fmt_frac(primary.get("suite_mean", row.get("suite_mean"))),
+            _fmt_frac(primary.get("baseline_mean", row.get("baseline_mean"))),
+            _fmt_lift_ci(
+                primary.get("lift", row.get("lift")),
+                primary.get("ci_low", row.get("ci_low")),
+                primary.get("ci_high", row.get("ci_high")),
+            ),
+            str(primary.get("verdict", row.get("verdict", "insufficient data"))),
+            _fmt_invoked(
+                int(primary.get("invoked", row.get("invoked", 0))),
+                int(primary.get("valid_suite_reps", row.get("valid_suite_reps", 0))),
+                primary.get("invocation_rate", row.get("invocation_rate")),
+            ),
+            _fmt_timing(
+                primary.get("t_skill_p50", row.get("t_skill_p50")),
+                primary.get("t_skill_p90", row.get("t_skill_p90")),
+            ),
+            _fmt_pair(
+                primary.get("tokens_suite_median", row.get("tokens_suite_median")),
+                primary.get("tokens_baseline_median", row.get("tokens_baseline_median")),
+            ),
+            _fmt_pair(
+                primary.get("t_total_suite_median", row.get("t_total_suite_median")),
+                primary.get("t_total_baseline_median", row.get("t_total_baseline_median")),
+                suffix="s",
+            ),
+            _fmt_skills_histogram(
+                primary.get("skills_read_histogram", row.get("skills_read_histogram"))
+            ),
+            _fmt_ceiling(row),
+        ]
+        for arm in extra_arms:
+            cells.append(_fmt_extra_suite_cell(by_arm.get(arm) or {}, is_task=False))
+        lines.append("| " + " | ".join(cells) + " |")
 
-    for row in report.get("skills") or []:
-        lines.append(
-            "| "
-            + " | ".join(
-                (
-                    str(row["skill"]),
-                    str(row["n_tasks"]),
-                    _fmt_frac(row.get("with_mean")),
-                    _fmt_frac(row.get("without_mean")),
-                    _fmt_lift_ci(row.get("lift"), row.get("ci_low"), row.get("ci_high")),
-                    str(row.get("verdict", "insufficient data")),
-                    _fmt_invoked(
-                        int(row.get("invoked", 0)),
-                        int(row.get("valid_with_reps", 0)),
-                        row.get("invocation_rate"),
-                    ),
-                    _fmt_timing(row.get("t_skill_p50"), row.get("t_skill_p90")),
-                    _fmt_invalid(
-                        int(row.get("invalid_total", 0)),
-                        row.get("invalid_by_reason") or {},
-                    ),
-                    _fmt_ceiling(row),
-                )
-            )
-            + " |"
-        )
-
+    task_headers = [
+        "family",
+        "task",
+        primary_arm,
+        BASELINE_ARM,
+        "lift [95% CI]",
+        "verdict",
+        "tokens p50 S/B",
+        "wall time p50 S/B",
+        "skills read",
+        "hardness",
+        *extra_arms,
+    ]
+    task_align = [
+        ":---",
+        ":---",
+        "---:",
+        "---:",
+        ":---:",
+        ":---:",
+        ":---:",
+        ":---:",
+        ":---",
+        ":---",
+        *(":---" for _ in extra_arms),
+    ]
     lines += [
         "",
-        "Deterministic checks and cost (valid reps; not part of the rubric lift):",
+        "Suite tasks (per task vs built-in baseline):",
         "",
-        "| skill | tests pass WITH | tests pass WITHOUT | diff lines p50 W/WO "
-        "| tokens p50 W/WO | wall time p50 W/WO |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: |",
+        "| " + " | ".join(task_headers) + " |",
+        "| " + " | ".join(task_align) + " |",
     ]
-    for row in report.get("skills") or []:
-        lines.append(
-            "| "
-            + " | ".join(
-                (
-                    str(row["skill"]),
-                    _fmt_verify(row.get("verify_with_passed"), row.get("verify_with_total")),
-                    _fmt_verify(
-                        row.get("verify_without_passed"), row.get("verify_without_total")
-                    ),
-                    _fmt_pair(
-                        row.get("diff_lines_with_median"), row.get("diff_lines_without_median")
-                    ),
-                    _fmt_pair(row.get("tokens_with_median"), row.get("tokens_without_median")),
-                    _fmt_pair(
-                        row.get("t_total_with_median"),
-                        row.get("t_total_without_median"),
-                        suffix="s",
-                    ),
+    for row in suite_rows:
+        family_name = str(row.get("family") or row.get("skill"))
+        tasks_map = row.get("tasks") if isinstance(row.get("tasks"), Mapping) else {}
+        for tid, task in sorted(tasks_map.items()):
+            t_by_arm = task.get("by_arm") if isinstance(task.get("by_arm"), Mapping) else {}
+            t_primary = t_by_arm.get(primary_arm, task)
+            t_cells = [
+                family_name,
+                str(tid),
+                _fmt_frac(t_primary.get("suite_mean", task.get("suite_mean"))),
+                _fmt_frac(task.get("baseline_mean")),
+                _fmt_lift_ci(
+                    t_primary.get("lift", task.get("lift")),
+                    t_primary.get("ci_low", task.get("ci_low")),
+                    t_primary.get("ci_high", task.get("ci_high")),
+                ),
+                str(t_primary.get("verdict", task.get("verdict", "insufficient data"))),
+                _fmt_pair(
+                    t_primary.get("tokens_suite_median", task.get("tokens_suite_median")),
+                    task.get("tokens_baseline_median"),
+                ),
+                _fmt_pair(
+                    t_primary.get("t_total_suite_median", task.get("t_total_suite_median")),
+                    task.get("t_total_baseline_median"),
+                    suffix="s",
+                ),
+                _fmt_skills_histogram(
+                    t_primary.get(
+                        "skills_read_histogram", task.get("skills_read_histogram")
+                    )
+                ),
+                str(task.get("hardness", HARDNESS_UNCLASSIFIED)),
+            ]
+            for arm in extra_arms:
+                t_cells.append(
+                    _fmt_extra_suite_cell(t_by_arm.get(arm) or {}, is_task=True)
                 )
+            lines.append("| " + " | ".join(t_cells) + " |")
+    return lines
+
+
+def _render_model_tables(report: Mapping[str, Any]) -> list[str]:
+    """The per-skill outcome table, deterministic-checks table, and optional suite tables
+    of one model block."""
+    lines: list[str] = []
+    has_skills = bool(report.get("skills"))
+    has_suites = bool(report.get("suites"))
+
+    if has_skills or not has_suites:
+        lines += [
+            "",
+            "| skill | tasks | WITH | WITHOUT | lift [95% CI] | verdict | invoked | t_skill p50/p90 "
+            "| invalid | ceiling/total |",
+            "| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- | :--- |",
+        ]
+
+        for row in report.get("skills") or []:
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        str(row["skill"]),
+                        str(row["n_tasks"]),
+                        _fmt_frac(row.get("with_mean")),
+                        _fmt_frac(row.get("without_mean")),
+                        _fmt_lift_ci(row.get("lift"), row.get("ci_low"), row.get("ci_high")),
+                        str(row.get("verdict", "insufficient data")),
+                        _fmt_invoked(
+                            int(row.get("invoked", 0)),
+                            int(row.get("valid_with_reps", 0)),
+                            row.get("invocation_rate"),
+                        ),
+                        _fmt_timing(row.get("t_skill_p50"), row.get("t_skill_p90")),
+                        _fmt_invalid(
+                            int(row.get("invalid_total", 0)),
+                            row.get("invalid_by_reason") or {},
+                        ),
+                        _fmt_ceiling(row),
+                    )
+                )
+                + " |"
             )
-            + " |"
-        )
+
+        lines += [
+            "",
+            "Deterministic checks and cost (valid reps; not part of the rubric lift):",
+            "",
+            "| skill | tests pass WITH | tests pass WITHOUT | diff lines p50 W/WO "
+            "| tokens p50 W/WO | wall time p50 W/WO |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: |",
+        ]
+        for row in report.get("skills") or []:
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        str(row["skill"]),
+                        _fmt_verify(row.get("verify_with_passed"), row.get("verify_with_total")),
+                        _fmt_verify(
+                            row.get("verify_without_passed"), row.get("verify_without_total")
+                        ),
+                        _fmt_pair(
+                            row.get("diff_lines_with_median"),
+                            row.get("diff_lines_without_median"),
+                        ),
+                        _fmt_pair(
+                            row.get("tokens_with_median"), row.get("tokens_without_median")
+                        ),
+                        _fmt_pair(
+                            row.get("t_total_with_median"),
+                            row.get("t_total_without_median"),
+                            suffix="s",
+                        ),
+                    )
+                )
+                + " |"
+            )
+    if has_suites:
+        lines += _render_suite_tables(report)
     return lines
 
 
@@ -1725,6 +2487,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "every judged pair becomes one models[] entry (default out-dir: its parent)",
     )
     C.add_suite_arg(p)
+    C.add_suites_arg(p)
     p.add_argument(
         "--hardness-only",
         action="store_true",
@@ -1759,6 +2522,7 @@ def main(argv: list[str] | None = None) -> int:
             bootstrap_seed=args.bootstrap_seed,
             draws=args.draws,
             pilot=True if args.pilot else None,
+            suites=args.suites,
         )
         out_dir = args.out_dir if args.out_dir is not None else default_out
         json_path, md_path, html_path = write_report(report, out_dir)

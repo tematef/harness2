@@ -157,7 +157,11 @@ def _main(args: argparse.Namespace) -> int:
     if args.k < 1 or args.workers < 1:
         raise ValueError("--k and --workers must be positive")
     modes = C.parse_modes(args.modes)
-    adapter_kw: dict[str, object] = {"arm": args.arm, "suite": getattr(args, "suite", None)}
+    adapter_kw: dict[str, object] = {
+        "arm": args.arm,
+        "suite": getattr(args, "suite", None),
+        "suites": getattr(args, "suites", None),
+    }
     if getattr(args, "pilot", False):
         adapter_kw["pilot"] = True
     adapter = C.make_adapter(
@@ -258,12 +262,17 @@ def write_run_json(adapter, namespace_dir: Path) -> Path:
     from ..substrate.agy import exec_effort, exec_model
 
     suite = getattr(adapter, "suite", None)
+    arm_spec = getattr(adapter, "arm_spec", None)
+    staged_suite = getattr(arm_spec, "suite", suite) if arm_spec is not None else suite
     record = {
         "benchmark": adapter.spec.name,
         "arm": getattr(adapter, "arm", None),
+        "arm_kind": getattr(adapter, "arm_kind", None),
         "suite": getattr(suite, "name", None),
         "suite_hash": getattr(suite, "suite_hash", None),
         "suite_path": str(suite.path) if suite is not None and suite.path else None,
+        "staged_suite": getattr(staged_suite, "name", None),
+        "staged_suite_hash": getattr(staged_suite, "suite_hash", None),
         "manifest_hash": getattr(adapter, "manifest_hash", None),
         "executor": exec_model(),
         "judge": judge_model(),

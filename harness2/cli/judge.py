@@ -163,7 +163,12 @@ def main(argv: list[str] | None = None) -> int:
     modes = C.parse_modes(args.modes)
 
     adapter = C.make_adapter(
-        args.bench, args.subset, args.substrate, arm=args.arm, suite=args.suite
+        args.bench,
+        args.subset,
+        args.substrate,
+        arm=args.arm,
+        suite=args.suite,
+        suites=getattr(args, "suites", None),
     )
     config.validate_models(judge=True, bench=args.bench)
     tag = C.arm_tag(args.bench, args.arm)

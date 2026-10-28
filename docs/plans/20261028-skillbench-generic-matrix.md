@@ -307,22 +307,22 @@ Key design decisions:
 - Modify: `harness2/cli/skillbench_report.py`
 - Create: `tests/test_skillbench_suite_arms.py`
 
-- [ ] `ArmSpec(kind="skill"|"suite", label, suite, target_skill)`; `parse_arm_label("with" | "without" |
+- [x] `ArmSpec(kind="skill"|"suite", label, suite, target_skill)`; `parse_arm_label("with" | "without" |
       "baseline" | "suite-<name>")`; `_common.py` arm validation and `arm_tag` accept the new labels
-- [ ] `stage_plugins(dest, arm_spec, ...)`: nothing for `baseline`, the full named suite for `suite-<name>`,
+- [x] `stage_plugins(dest, arm_spec, ...)`: nothing for `baseline`, the full named suite for `suite-<name>`,
       unchanged leave-one-out for `with` / `without`; `materialise` passes the spec
-- [ ] `SkillbenchAdapter` takes an `ArmSpec`; results root `results/<executor>/<label>/` (executor segment
+- [x] `SkillbenchAdapter` takes an `ArmSpec`; results root `results/<executor>/<label>/` (executor segment
       introduced here so Task 6 only adds the loop); `kind = "suite"` tasks are scheduled only for suite
       arms and `kind = "skill"` tasks only for skill arms; `harness2-sweep --arm` / `harness2-judge --arm`
       pass the label through
-- [ ] invocation + `t_skill` for suite arms: first `read_file` / `view_file` of any `SKILL.md` under the staged
+- [x] invocation + `t_skill` for suite arms: first `read_file` / `view_file` of any `SKILL.md` under the staged
       plugins dir; record the set of skills read
-- [ ] `build_report` `suites` section per family and per task: `suite-<name>` vs `baseline` lift, CI,
+- [x] `build_report` `suites` section per family and per task: `suite-<name>` vs `baseline` lift, CI,
       verdict, tokens/time medians, skills-read histogram; `--suites a.toml,b.toml` renders one column per
       extra suite
-- [ ] write tests: staging per arm kind, label parsing errors, scheduling by kind, suite invocation parsing,
+- [x] write tests: staging per arm kind, label parsing errors, scheduling by kind, suite invocation parsing,
       `suites` section with 2 and 3 arms, sweep/judge accept new labels
-- [ ] run tests - must pass before task 6
+- [x] run tests - must pass before task 6
 
 ### Task 6: Model matrix runner with cost estimate
 

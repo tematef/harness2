@@ -33,7 +33,9 @@ SUITE_ENV = "SKILLBENCH_SUITE"
 BENCHES = ("jb", "wb", "lab", "skillbench")
 WB_SUBSETS = ("office", "web", "code")
 SUBSTRATES = ("oc", "cx", "agy")
+# Skill arms; the full label grammar (`baseline`, `suite-<name>`) lives in substrate.agy.
 ARMS = ("with", "without")
+ARM_LABEL_HELP = "with | without | baseline | suite-<name>"
 # Substrates that only some benches support; every other bench rejects them.
 SUBSTRATE_BENCHES: dict[str, tuple[str, ...]] = {"agy": ("skillbench",)}
 
@@ -54,8 +56,14 @@ def default_substrate(bench: str) -> str:
 
 
 def arm_tag(bench: str, arm: str | None) -> str:
-    """Run tag for `(bench, arm)`: the arm name for skillbench, empty for other benches."""
-    return arm or "" if bench == "skillbench" else ""
+    """Run tag for `(bench, arm)`: the validated arm label for skillbench, empty for other
+    benches."""
+    if bench != "skillbench" or not arm:
+        return ""
+    from ..substrate.agy import arm_kind
+
+    arm_kind(arm)
+    return arm
 
 
 class _BenchAction(argparse.Action):
@@ -77,6 +85,27 @@ def apply_suite(suite: Path | str | None) -> Path | None:
     return path
 
 
+def parse_suites(raw: object) -> tuple[object, ...]:
+    """Comma list or iterable of extra `suite.toml` paths / `SuiteConfig`s (`--suites a.toml,b.toml`)."""
+    if raw is None or raw == "":
+        return ()
+    if isinstance(raw, Path):
+        return (raw.expanduser(),)
+    if isinstance(raw, str):
+        return tuple(Path(s.strip()).expanduser() for s in raw.split(",") if s.strip())
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        out: list[object] = []
+        for item in raw:
+            if isinstance(item, str):
+                out.extend(Path(s.strip()).expanduser() for s in item.split(",") if s.strip())
+            elif isinstance(item, Path):
+                out.append(item.expanduser())
+            elif item is not None:
+                out.append(item)
+        return tuple(out)
+    return (raw,)
+
+
 def add_suite_arg(p: argparse._ActionsContainer) -> None:
     """`--suite suite.toml` (skillbench only; alternative: `SKILLBENCH_SUITE`)."""
     p.add_argument(
@@ -85,6 +114,16 @@ def add_suite_arg(p: argparse._ActionsContainer) -> None:
         default=None,
         help="skillbench only: suite.toml describing the plugin suite under test "
         "(default: $SKILLBENCH_SUITE, else the SKILLBENCH_PLUGINS_DIR env fallback)",
+    )
+
+
+def add_suites_arg(p: argparse._ActionsContainer) -> None:
+    """`--suites a.toml,b.toml` (skillbench only: further suites for `suite-<name>` arms)."""
+    p.add_argument(
+        "--suites",
+        default="",
+        help="skillbench only: comma list of extra suite.toml files for `suite-<name>` "
+        "comparisons against `baseline`",
     )
 
 
@@ -97,6 +136,7 @@ def make_adapter(
     *,
     pilot: bool | None = None,
     suite: Path | str | None = None,
+    suites: object = None,
 ) -> BenchmarkAdapter:
     """The one place a CLI turns (--bench, --subset, --substrate, --arm, --suite) into an
     adapter."""
@@ -111,18 +151,31 @@ def make_adapter(
             f"--substrate {substrate} is not supported by --bench {bench}; it is reserved for "
             f"the skillbench benchmark"
         )
+    extra_suites = parse_suites(suites)
     if bench == "skillbench":
         if subset:
             raise ValueError(f"--subset applies to --bench wb only, got {subset!r} for {bench}")
         if substrate != "agy":
             raise ValueError(f"--bench skillbench requires --substrate agy, got {substrate!r}")
-        if arm not in ARMS:
-            raise ValueError(f"--bench skillbench requires --arm from {ARMS}, got {arm!r}")
+        if not arm:
+            raise ValueError(
+                f"--bench skillbench requires --arm ({ARM_LABEL_HELP}), got {arm!r}"
+            )
+        from ..substrate.agy import arm_kind
+
+        try:
+            arm_kind(arm)
+        except ValueError as e:
+            raise ValueError(f"--arm: {e}") from None
         apply_suite(suite)
         from ..benchmarks.skillbench import SkillbenchAdapter
 
         return SkillbenchAdapter(
-            arm, substrate=substrate, split_file=split_file, pilot=pilot
+            arm,
+            substrate=substrate,
+            split_file=split_file,
+            pilot=pilot,
+            suites=extra_suites,
         )
     if arm is not None:
         raise ValueError(f"--arm applies to --bench skillbench only, got {arm!r} for {bench}")
@@ -130,6 +183,10 @@ def make_adapter(
         raise ValueError(f"--pilot applies to --bench skillbench only, got {bench!r}")
     if suite is not None:
         raise ValueError(f"--suite applies to --bench skillbench only, got {suite!r} for {bench}")
+    if extra_suites:
+        raise ValueError(
+            f"--suites applies to --bench skillbench only, got {suites!r} for {bench}"
+        )
     if bench == "wb":
         if subset not in WB_SUBSETS:
             raise ValueError(f"--bench wb needs --subset from {WB_SUBSETS}, got {subset!r} ")
@@ -196,10 +253,11 @@ def add_cell_args(p: argparse._ActionsContainer) -> None:
     p.add_argument(
         "--arm",
         default=None,
-        choices=ARMS,
-        help="skillbench only (required): with | without",
+        metavar="LABEL",
+        help=f"skillbench only (required): {ARM_LABEL_HELP}",
     )
     add_suite_arg(p)
+    add_suites_arg(p)
 
 
 def add_modes_arg(p: argparse._ActionsContainer) -> None:

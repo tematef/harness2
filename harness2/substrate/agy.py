@@ -18,12 +18,20 @@ The stream-json decoder:
 
     parse_event        one stdout line -> AgyEvent | None (non-JSON / non-event lines skipped)
     read_events        events.jsonl -> list[AgyEvent]
-    skill_timing       first read of skills/<target>/SKILL.md -> {invoked, t_skill_s, step_idx}
+    skill_timing       first read of skills/<target>/SKILL.md (any skill when target is None)
+                       -> {invoked, t_skill_s, step_idx, skills_read}
     render_trajectory  AgyEvent list -> the shared [ASSISTANT]/[ACTION]/... trajectory grammar
+
+Arms (`ArmSpec`, `parse_arm_label`): two kinds share one label grammar
+
+    skill   `with` / `without`   leave-one-out of `target_skill` in the suite under test
+    suite   `baseline`           no plugins at all (AGY's built-in behaviour)
+            `suite-<name>`       the whole named suite (the active one or a `--suites` extra)
 
 Staging (install mode `agy_home`, one Install per arm):
 
-    AgySubstrate.materialise  the active suite's plugins (leave-one-out for arm `without`),
+    AgySubstrate.materialise  the arm's plugins (nothing for `baseline`, the full named suite
+                              for `suite-<name>`, leave-one-out for `with` / `without`),
                               copied auth files and side-effect shims -> a HOME template
     prepare_rollout           fresh per-rollout copy of that HOME + the isolated environment
 
@@ -67,12 +75,12 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Any, Callable, Iterable, Mapping
 
 from .. import config
-from ..benchmarks.skillbench_suite import SuiteConfig, active_suite
+from ..benchmarks.skillbench_suite import SuiteConfig, active_suite, load_suite
 from ..core import runmark as RM
 from ..core import tree as HT
 from ..core.tree import SurfaceSpec
@@ -177,24 +185,71 @@ def read_events(path: Path) -> list[AgyEvent]:
     return [ev for ev in map(parse_event, raw.splitlines()) if ev is not None]
 
 
-def _reads_skill(ev: AgyEvent, pattern: re.Pattern[str]) -> bool:
-    if ev.tool_name not in READ_TOOLS or not ev.tool_args:
+_ANY_SKILL_READ = re.compile(r"(?:^|[/\\])skills[/\\]([a-z0-9][a-z0-9_\-]*)[/\\]SKILL\.md$")
+
+
+def _under_plugins_dir(raw_path: str, plugins_dir: Path | str | None) -> bool:
+    """Whether `raw_path` lies under `plugins_dir` (and exists on disk when `plugins_dir`
+    itself exists on disk, so an empty `baseline` plugins dir matches nothing)."""
+    if plugins_dir is None:
+        return True
+    root = Path(plugins_dir)
+    cand = Path(raw_path)
+    if not (
+        cand.is_relative_to(root)
+        or (root.exists() and cand.exists() and cand.resolve().is_relative_to(root.resolve()))
+    ):
         return False
-    return any(isinstance(v, str) and pattern.search(v) for v in ev.tool_args.values())
+    if root.exists():
+        return cand.is_file()
+    return True
 
 
-def skill_timing(events: Iterable[AgyEvent], target_skill: str) -> dict:
-    """Locate the first read of `skills/<target_skill>/SKILL.md`.
+def _skill_read(ev: AgyEvent, plugins_dir: Path | str | None = None) -> str | None:
+    """The skill whose `SKILL.md` this event reads (`skills/<name>/SKILL.md` under
+    `plugins_dir` when given), else None."""
+    if ev.tool_name not in READ_TOOLS or not ev.tool_args:
+        return None
+    for v in ev.tool_args.values():
+        if isinstance(v, str):
+            m = _ANY_SKILL_READ.search(v)
+            if m and _under_plugins_dir(v, plugins_dir):
+                return m.group(1)
+    return None
 
-    Returns `{invoked, t_skill_s, step_idx}`; `step_idx` is the 0-based index in `events`,
-    `t_skill_s` that event's `t` (`None` when the stream carries no timestamps). Reads of other
-    skills, later re-reads and writes to the path are ignored.
+
+def skills_read(
+    events: Iterable[AgyEvent], *, plugins_dir: Path | str | None = None
+) -> list[str]:
+    """Sorted names of every skill whose `SKILL.md` the stream read (re-reads collapsed)."""
+    return sorted({name for ev in events if (name := _skill_read(ev, plugins_dir)) is not None})
+
+
+def skill_timing(
+    events: Iterable[AgyEvent],
+    target_skill: str | None = None,
+    *,
+    plugins_dir: Path | str | None = None,
+) -> dict:
+    """Locate the first read of `skills/<target_skill>/SKILL.md` -- or of any skill's `SKILL.md`
+    under `plugins_dir` when `target_skill` is None (suite arms).
+
+    Returns `{invoked, t_skill_s, step_idx}` for a skill arm (`target_skill` given), and adds
+    `skills_read` (sorted set of every skill read in the stream) when `target_skill` is None.
+    Reads of other skills (for a target), reads outside `plugins_dir` (when given), later
+    re-reads and writes to the path do not count as invocation.
     """
-    pattern = re.compile(rf"(?:^|[/\\])skills[/\\]{re.escape(target_skill)}[/\\]SKILL\.md$")
+    events = list(events)
+    hit: dict = {"invoked": False, "t_skill_s": None, "step_idx": None}
     for idx, ev in enumerate(events):
-        if _reads_skill(ev, pattern):
-            return {"invoked": True, "t_skill_s": ev.t, "step_idx": idx}
-    return {"invoked": False, "t_skill_s": None, "step_idx": None}
+        name = _skill_read(ev, plugins_dir)
+        if name is None or (target_skill is not None and name != target_skill):
+            continue
+        hit = {"invoked": True, "t_skill_s": ev.t, "step_idx": idx}
+        break
+    if target_skill is None:
+        hit["skills_read"] = skills_read(events, plugins_dir=plugins_dir)
+    return hit
 
 
 _TRUNC_FMT = "…(+{n} chars — render truncation)"
@@ -281,19 +336,147 @@ def render_trajectory(
 
 
 # --------------------------------------------------------------------------------------------
-# Staging: the active suite's plugins, leave-one-out arms, isolated HOME, side-effect shims.
+# Arms: two kinds, one label grammar.
 # --------------------------------------------------------------------------------------------
 
 INSTALL_MODE = "agy_home"
+# Skill arms: leave-one-out of `target_skill` in the suite under test.
 ARMS = ("with", "without")
+# Suite arms: `baseline` stages no plugins at all; `suite-<name>` stages the whole named suite.
+BASELINE_ARM = "baseline"
+SUITE_ARM_PREFIX = "suite-"
+ARM_KINDS = ("skill", "suite")
+ARM_LABEL_HELP = f"with | without | {BASELINE_ARM} | {SUITE_ARM_PREFIX}<name>"
+# What the control arm of each treatment label is (report pairing).
+CONTROL_OF = {"with": "without", SUITE_ARM_PREFIX + "<name>": BASELINE_ARM}
+_SUITE_ARM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]*")
+_SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9_\-]*")
+
+
+def arm_kind(label: str) -> str:
+    """`"skill"` for `with` / `without`, `"suite"` for `baseline` / `suite-<name>`;
+    `ValueError` (naming the grammar) for anything else."""
+    if isinstance(label, str):
+        if label in ARMS:
+            return "skill"
+        if label == BASELINE_ARM:
+            return "suite"
+        if label.startswith(SUITE_ARM_PREFIX) and _SUITE_ARM_NAME.fullmatch(
+            label[len(SUITE_ARM_PREFIX) :]
+        ):
+            return "suite"
+    raise ValueError(f"arm label must be one of {ARM_LABEL_HELP}, got {label!r}")
+
+
+def control_label(label: str) -> str:
+    """The control arm a treatment label is compared against (`without` for `with`,
+    `baseline` for `suite-<name>`); control labels map to themselves."""
+    return "without" if arm_kind(label) == "skill" else BASELINE_ARM
+
+
+def is_control_label(label: str) -> bool:
+    return label in ("without", BASELINE_ARM)
+
+
+def suite_arm_label(suite_name: str) -> str:
+    """`suite-<name>` for a suite."""
+    return SUITE_ARM_PREFIX + suite_name
+
+
+@dataclass(frozen=True)
+class ArmSpec:
+    """One arm, resolved: its `kind`, its `label`, the suite staged into the rollout HOME
+    (`None` for `baseline` = no plugins) and, for skill arms, the leave-one-out
+    `target_skill` (set per task with `for_task`)."""
+
+    kind: str
+    label: str
+    suite: SuiteConfig | None = None
+    target_skill: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ARM_KINDS:
+            raise ValueError(f"ArmSpec.kind must be one of {ARM_KINDS}, got {self.kind!r}")
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError(f"ArmSpec.label must be a non-empty string, got {self.label!r}")
+
+    @property
+    def is_control(self) -> bool:
+        return is_control_label(self.label)
+
+    @property
+    def stages_plugins(self) -> bool:
+        return self.suite is not None
+
+    def for_task(self, target_skill: str | None) -> ArmSpec:
+        """The same arm for a task: skill arms take the task's `target_skill`, suite arms
+        carry none."""
+        if self.kind == "suite":
+            return self if self.target_skill is None else replace(self, target_skill=None)
+        if not isinstance(target_skill, str) or not _SKILL_NAME.fullmatch(target_skill):
+            raise ValueError(
+                f"arm {self.label!r} requires a non-empty target_skill directory name, got "
+                f"{target_skill!r}"
+            )
+        return replace(self, target_skill=target_skill)
+
+
+def _as_suite(s: SuiteConfig | Path | str) -> SuiteConfig:
+    return s if isinstance(s, SuiteConfig) else load_suite(s)
+
+
+def parse_arm_label(
+    label: str,
+    *,
+    suite: SuiteConfig | Path | str | None = None,
+    extra_suites: Iterable[SuiteConfig | Path | str] = (),
+    target_skill: str | None = None,
+) -> ArmSpec:
+    """`with` / `without` / `baseline` / `suite-<name>` -> `ArmSpec`.
+
+    `suite` is the suite under test (the active suite when None; resolved lazily, so
+    `baseline` needs none). `suite-<name>` must name that suite or one of `extra_suites`
+    (`--suites`); the suite's own name is checked, not its file name.
+    """
+    kind = arm_kind(label)
+    if kind == "skill":
+        main = _as_suite(suite) if suite is not None else active_suite()
+        spec = ArmSpec("skill", label, main)
+        return spec.for_task(target_skill) if target_skill is not None else spec
+    if target_skill not in (None, ""):
+        raise ValueError(
+            f"target_skill is not valid for suite arm {label!r}, got {target_skill!r}"
+        )
+    if label == BASELINE_ARM:
+        return ArmSpec("suite", label, None)
+    name = label[len(SUITE_ARM_PREFIX) :]
+    main = _as_suite(suite) if suite is not None else active_suite()
+    loaded_extras = [_as_suite(s) for s in extra_suites]
+    candidates = [main, *loaded_extras]
+    for cand in candidates:
+        if cand.name == name:
+            return ArmSpec("suite", label, cand)
+    raise ValueError(
+        f"arm {label!r} names suite {name!r}, but the suite under test is {main.name!r}"
+        + (
+            f" and the further suites are {[s.name for s in loaded_extras]}"
+            if loaded_extras
+            else " and no further suite was given"
+        )
+        + f"; pass --suites <path/to/{name}.toml> to compare a further suite"
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# Staging: the arm's plugins, isolated HOME, side-effect shims.
+# --------------------------------------------------------------------------------------------
+
 SHIM_TOOLS = ("xclip", "xsel", "wl-copy", "pbcopy", "revdiff")
 SIDE_EFFECTS_ENV = "SKILLBENCH_SIDE_EFFECTS_DIR"
 # Where agy discovers plugins, relative to HOME (spike question 9).
 PLUGINS_REL = Path(".gemini") / "config" / "plugins"
 # Where the editable tree's always-on file lands, relative to HOME (AGY's global rules file).
 RULES_REL = Path(".gemini") / "GEMINI.md"
-
-_SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9_\-]*")
 
 # Bases-only surface: the always-on GEMINI.md is installed as AGY's global rules file; the full
 # c1..c8 mapping (skills, hooks, scripts as an AGY plugin) is deferred to Option B.
@@ -406,42 +589,73 @@ def target_skill_file(target_skill: str, suite: SuiteConfig | None = None) -> Pa
     return targets[0] / "SKILL.md"
 
 
+def _copy_plugin(src: Path, dst: Path, omit_skill: str | None = None) -> None:
+    """Copy one plugin directory (symlinks resolved, bytecode dropped), without
+    `skills/<omit_skill>/` when given."""
+
+    def ignore(d: str, entries: list[str]) -> set[str]:
+        drop = {e for e in entries if e == "__pycache__" or e.endswith(".pyc")}
+        if omit_skill is not None and Path(d) == src / "skills":
+            drop.add(omit_skill)
+        return drop
+
+    shutil.copytree(src, dst, symlinks=False, ignore=ignore)
+
+
 def stage_plugins(
     dest: Path,
+    arm: ArmSpec | str,
     *,
-    arm: str,
-    target_skill: str,
+    target_skill: str | None = None,
     skill_override: Path | str | None = None,
     suite: SuiteConfig | None = None,
+    extra_suites: Iterable[SuiteConfig | Path | str] = (),
 ) -> list[str]:
-    """Copy the active suite's plugins (symlinks resolved) into `dest`.
+    """Copy an arm's plugins (symlinks resolved) into `dest`; returns the omitted paths
+    relative to the plugins checkout.
 
-    Arm `without` omits `skills/<target_skill>/` from every staged plugin that has it; hooks
-    and every other file stay. When `skill_override` (a `Path` to a candidate `SKILL.md` or
-    raw markdown text) is given for arm `with`, replaces the staged `skills/<target_skill>/SKILL.md`
-    in place. Returns the omitted paths relative to `dest`.
+    `arm` is an `ArmSpec` or a label (`with` / `without` take `target_skill`; `suite` is the
+    suite under test, default the active one). Arm `baseline` stages nothing (`dest` is
+    created empty); `suite-<name>` stages every plugin of the named suite; `with` stages the
+    suite under test; `without` omits `skills/<target_skill>/` from every staged plugin that
+    has it -- hooks and every other file stay. `skill_override` (a `Path` to a candidate
+    `SKILL.md` or raw markdown text) replaces the staged `skills/<target_skill>/SKILL.md` in
+    place and is accepted for arm `with` only.
     """
-    root, allow = checked_plugins(suite)
-    targets = _target_dirs(root, allow, target_skill)
+    spec = (
+        arm
+        if isinstance(arm, ArmSpec)
+        else parse_arm_label(
+            arm, suite=suite, extra_suites=extra_suites, target_skill=target_skill
+        )
+    )
+    if isinstance(arm, ArmSpec) and target_skill is not None:
+        spec = spec.for_task(target_skill)
+    dest = Path(dest)
+    if skill_override is not None and spec.label != "with":
+        raise ValueError(f"skill_override requires arm='with', got arm={spec.label!r}")
+    dest.mkdir(parents=True, exist_ok=True)
+    if spec.kind == "suite":
+        if spec.suite is None:
+            return []
+        root, allow = checked_plugins(spec.suite)
+        for name in allow:
+            _copy_plugin(root / name, dest / name)
+        return []
+    if spec.target_skill is None:
+        raise ValueError(f"arm {spec.label!r} needs a target_skill")
+    target = spec.target_skill
+    root, allow = checked_plugins(spec.suite)
+    targets = _target_dirs(root, allow, target)
     if not targets:
         raise ValueError(
-            f"target skill {target_skill!r} not found as skills/{target_skill}/SKILL.md in the "
+            f"target skill {target!r} not found as skills/{target}/SKILL.md in the "
             f"suite's plugins {list(allow)} under {root}"
         )
-    if skill_override is not None and arm != "with":
-        raise ValueError(f"skill_override requires arm='with', got arm={arm!r}")
-    omit = set(targets) if arm == "without" else set()
-    dest.mkdir(parents=True, exist_ok=True)
+    omit = set(targets) if spec.label == "without" else set()
     for name in allow:
         src = root / name
-
-        def ignore(d: str, entries: list[str], src: Path = src) -> set[str]:
-            drop = {e for e in entries if e == "__pycache__" or e.endswith(".pyc")}
-            if Path(d) == src / "skills" and (src / "skills" / target_skill) in omit:
-                drop.add(target_skill)
-            return drop
-
-        shutil.copytree(src, dest / name, symlinks=False, ignore=ignore)
+        _copy_plugin(src, dest / name, target if (src / "skills" / target) in omit else None)
     if skill_override is not None:
         text = (
             skill_override.read_text(encoding="utf-8")
@@ -525,20 +739,35 @@ def prepare_rollout(
     return env
 
 
-def _arm_ctx(ctx: Mapping[str, str]) -> tuple[str, str]:
+def _arm_ctx(ctx: Mapping[str, str]) -> ArmSpec:
+    """The arm a `materialise` ctx asks for: `arm` (a label), `target_skill` (skill arms;
+    empty or absent for suite arms) and, for a `suite-<name>` arm of a further suite, its
+    `suite_path`."""
     files = sorted(k for k in ctx if k.startswith("file:"))
     if files:
         raise ValueError(
             f"install mode {INSTALL_MODE!r} takes no `file:` ctx entries (got {files}); the "
             f"rollout's files come from the task fixture"
         )
-    arm = ctx.get("arm")
-    if arm not in ARMS:
-        raise ValueError(f"ctx['arm'] must be one of {ARMS}, got {arm!r}")
+    label = ctx.get("arm")
+    try:
+        kind = arm_kind(label)  # type: ignore[arg-type]
+    except ValueError:
+        raise ValueError(f"ctx['arm'] must be one of {ARM_LABEL_HELP}, got {label!r}") from None
     target = ctx.get("target_skill")
-    if not isinstance(target, str) or not _SKILL_NAME.fullmatch(target):
-        raise ValueError(f"ctx['target_skill'] must be a skill directory name, got {target!r}")
-    return arm, target
+    raw_path = ctx.get("suite_path")
+    extra = (load_suite(raw_path),) if raw_path else ()
+    if kind == "skill":
+        if not isinstance(target, str) or not _SKILL_NAME.fullmatch(target):
+            raise ValueError(f"ctx['target_skill'] must be a skill directory name, got {target!r}")
+        suite = extra[0] if extra else None
+        return parse_arm_label(label, suite=suite, target_skill=target)  # type: ignore[arg-type]
+    if target not in (None, ""):
+        raise ValueError(
+            f"ctx['target_skill'] applies to skill arms (with | without); arm {label!r} takes "
+            f"none, got {target!r}"
+        )
+    return parse_arm_label(label, extra_suites=extra)  # type: ignore[arg-type]
 
 
 def _digest(*parts: str) -> str:
@@ -824,11 +1053,17 @@ def run_rollout(
     `diff.patch`, `new_files/` and `skill_timing.json`. A timeout, a non-zero exit, a reported
     model that disagrees with the requested one, a stream without a result event or an
     unreadable work tree mark the rep invalid (`valid=false`, `invalid_reason`); the run dir is
-    written either way. Infrastructure failures (missing binary, fixture or config) raise.
+    written either way. `skill_timing.json` records the invocation (first read of
+    `skills/<target>/SKILL.md`, or of any skill's `SKILL.md` for a suite arm), the set of
+    skills read, validity, model and cost. Infrastructure failures (missing binary, fixture or
+    config) raise.
     """
-    target = install.extras.get("target_skill")
-    if not target:
+    kind = install.extras.get("arm_kind") or "skill"
+    target: str | None = install.extras.get("target_skill") or None
+    if kind == "skill" and not target:
         raise ValueError("install has no target_skill; materialise it with ctx['target_skill']")
+    if kind == "suite":
+        target = None
     binary = resolve_agy_bin()
     if binary is None:
         raise RuntimeError(agy_bin_missing_message())
@@ -900,8 +1135,13 @@ def run_rollout(
         else:
             reason = None
         tokens = [ev.total_tokens for ev in events if ev.total_tokens is not None]
+        staged_plugins = run_dir / "home" / PLUGINS_REL
+        timing = skill_timing(events, target, plugins_dir=staged_plugins)
         record = {
-            **skill_timing(events, target),
+            **timing,
+            "skills_read": timing.get("skills_read")
+            if "skills_read" in timing
+            else skills_read(events, plugins_dir=staged_plugins),
             "t_total_s": t_total,
             "requested_model": model,
             "actual_model": actual,
@@ -941,34 +1181,33 @@ class AgySubstrate:
     def materialise(self, tree_dir: Path, spec, ctx: Mapping[str, str]) -> Install:
         """Stage a HOME template for one arm.
 
-        Layout of `staging_dir`: `home/.gemini/config/plugins/<plugin>/` (the active suite's
-        plugins, target skill omitted for arm `without`), `home/.gemini/GEMINI.md` (the tree's
-        always-on text, when non-blank), `home/<auth files>` (copies, if any) and
+        `ctx` names the arm (`arm`: `with` / `without` / `baseline` / `suite-<name>`), the
+        leave-one-out `target_skill` (skill arms) and, for a further suite's `suite-<name>`
+        arm, its `suite_path`. Layout of `staging_dir`: `home/.gemini/config/plugins/<plugin>/`
+        (the arm's plugins: the suite under test, minus the target skill for `without`; the
+        named suite for `suite-<name>`; nothing for `baseline`), `home/.gemini/GEMINI.md` (the
+        tree's always-on text, when non-blank), `home/<auth files>` (copies, if any) and
         `shims/<tool>`. The fingerprint digests the source tree, the staged plugins and the
         shims -- never the auth files, so a token refresh does not move the harness identity.
-        `extras` records the suite name and `suite_hash` next to the arm and target skill.
+        `extras` records the arm label and kind, the target skill, the suite under test
+        (`suite`, `suite_hash`) and the staged suite (`staged_suite`, `staged_suite_hash`;
+        empty for `baseline`).
         """
         if spec.install_mode != INSTALL_MODE:
             raise ValueError(
                 f"install_mode {spec.install_mode!r} is not the agy mode; this substrate has "
                 f"exactly one: {INSTALL_MODE!r}"
             )
-        arm, target = _arm_ctx(ctx)
+        arm = _arm_ctx(ctx)
         override = ctx.get("skill_override")
         tree_dir = Path(tree_dir)
         if not HT.is_tree(AGY_SURFACE, tree_dir):
             raise ValueError(f"{tree_dir} is not an agy harness tree (no GEMINI.md)")
         suite = active_suite()
-        staged = Path(tempfile.mkdtemp(prefix=f"adapt-agy-{arm}-"))
+        staged = Path(tempfile.mkdtemp(prefix=f"adapt-agy-{arm.label}-"))
         try:
             home = staged / "home"
-            omitted = stage_plugins(
-                home / PLUGINS_REL,
-                arm=arm,
-                target_skill=target,
-                skill_override=override,
-                suite=suite,
-            )
+            omitted = stage_plugins(home / PLUGINS_REL, arm=arm, skill_override=override)
             rules = (tree_dir / "GEMINI.md").read_text(encoding="utf-8", errors="replace")
             if rules.strip():
                 (home / RULES_REL).write_text(rules, encoding="utf-8")
@@ -987,11 +1226,14 @@ class AgySubstrate:
             fingerprint=fp,
             extras={
                 "install_mode": INSTALL_MODE,
-                "arm": arm,
-                "target_skill": target,
+                "arm": arm.label,
+                "arm_kind": arm.kind,
+                "target_skill": arm.target_skill or "",
                 "omitted": ",".join(omitted),
                 "suite": suite.name,
                 "suite_hash": suite.suite_hash,
+                "staged_suite": arm.suite.name if arm.suite is not None else "",
+                "staged_suite_hash": arm.suite.suite_hash if arm.suite is not None else "",
             },
         )
 

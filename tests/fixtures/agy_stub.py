@@ -229,12 +229,13 @@ def select_scenario(flags, cwd):
         if judge_scenario:
             return ("fixture", judge_scenario)
     else:
-        posix_cwd = cwd.as_posix()
+        parts = cwd.parts
+        after = parts[parts.index("results") + 1 :] if "results" in parts else parts
         with_scen = os.environ.get("AGY_STUB_WITH_SCENARIO")
         without_scen = os.environ.get("AGY_STUB_WITHOUT_SCENARIO")
-        if with_scen and "/results/with/" in posix_cwd:
+        if with_scen and "with" in after:
             return ("fixture", with_scen)
-        if without_scen and "/results/without/" in posix_cwd:
+        if without_scen and "without" in after:
             return ("fixture", without_scen)
     return ("fixture", raw_scenario or DEFAULT_SCENARIO)
 
