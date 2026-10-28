@@ -43,7 +43,8 @@ from harness2.benchmarks.tasks import discover
 
 PILOT_SKILLS = ("make-plan", "root-cause-investigator", "code-review-refactor")
 
-# All 18 skills in the cc-thingz plugin suite plus any legacy names in SB.KNOWN_SKILLS.
+# All 18 skills in the cc-thingz plugin suite the bundled corpus was written for (the
+# benchmark code itself knows no skill names any more; see skillbench_suite).
 CC_THINGZ_18_SKILLS = frozenset(
     {
         "backlog",
@@ -66,7 +67,11 @@ CC_THINGZ_18_SKILLS = frozenset(
         "skill-eval",
     }
 )
-ALL_SKILL_NAMES = tuple(sorted(CC_THINGZ_18_SKILLS | SB.KNOWN_SKILLS))
+ALL_SKILL_NAMES = tuple(sorted(CC_THINGZ_18_SKILLS | {"pr"}))
+# Skills of that suite whose SKILL.md frontmatter allows `ask_question`.
+ASKING_SKILLS = frozenset(
+    {"brainstorm", "exec", "make-plan", "dialectic", "backlog", "clarify", "learn", "wrong"}
+)
 
 # Skill rituals, template headers, helper scripts, and AGY tool names that must never appear in
 # outcome-only rubrics.
@@ -206,7 +211,7 @@ class PilotCorpusTest(unittest.TestCase):
                 )
                 for word in ("rubric", "score", "skill.md"):
                     self.assertNotIn(word, full_prompt.lower())
-                if task.target_skill in SB.ASK_QUESTION_SKILLS:
+                if task.target_skill in ASKING_SKILLS:
                     self.assertGreaterEqual(
                         len(task.user_answers),
                         4,

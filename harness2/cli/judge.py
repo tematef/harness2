@@ -162,7 +162,9 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     modes = C.parse_modes(args.modes)
 
-    adapter = C.make_adapter(args.bench, args.subset, args.substrate, arm=args.arm)
+    adapter = C.make_adapter(
+        args.bench, args.subset, args.substrate, arm=args.arm, suite=args.suite
+    )
     config.validate_models(judge=True, bench=args.bench)
     tag = C.arm_tag(args.bench, args.arm)
     ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)

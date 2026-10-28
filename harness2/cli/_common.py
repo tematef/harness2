@@ -21,11 +21,14 @@ judge/report read them back.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from ..core import library as LIB
 from ..core import schedule as SCHED
 from ..core.spec import BenchmarkAdapter
+
+SUITE_ENV = "SKILLBENCH_SUITE"
 
 BENCHES = ("jb", "wb", "lab", "skillbench")
 WB_SUBSETS = ("office", "web", "code")
@@ -62,6 +65,29 @@ class _BenchAction(argparse.Action):
             namespace.substrate = default_substrate(values)
 
 
+def apply_suite(suite: Path | str | None) -> Path | None:
+    """Make `--suite` the active skillbench suite for this process by exporting it as
+    `SKILLBENCH_SUITE` (every suite lookup reads that variable, so the substrate, the judge
+    and the report all see the same suite). Returns the exported path, or None when the
+    flag was not given (the env variable or the env fallback then applies)."""
+    if suite is None or str(suite) == "":
+        return None
+    path = Path(suite).expanduser()
+    os.environ[SUITE_ENV] = str(path)
+    return path
+
+
+def add_suite_arg(p: argparse._ActionsContainer) -> None:
+    """`--suite suite.toml` (skillbench only; alternative: `SKILLBENCH_SUITE`)."""
+    p.add_argument(
+        "--suite",
+        type=Path,
+        default=None,
+        help="skillbench only: suite.toml describing the plugin suite under test "
+        "(default: $SKILLBENCH_SUITE, else the SKILLBENCH_PLUGINS_DIR env fallback)",
+    )
+
+
 def make_adapter(
     bench: str,
     subset: str | None = None,
@@ -70,8 +96,10 @@ def make_adapter(
     arm: str | None = None,
     *,
     pilot: bool | None = None,
+    suite: Path | str | None = None,
 ) -> BenchmarkAdapter:
-    """The one place a CLI turns (--bench, --subset, --substrate, --arm) into an adapter."""
+    """The one place a CLI turns (--bench, --subset, --substrate, --arm, --suite) into an
+    adapter."""
     if bench not in BENCHES:
         raise ValueError(f"unknown bench {bench!r}; expected one of {BENCHES}")
     if substrate is None:
@@ -90,6 +118,7 @@ def make_adapter(
             raise ValueError(f"--bench skillbench requires --substrate agy, got {substrate!r}")
         if arm not in ARMS:
             raise ValueError(f"--bench skillbench requires --arm from {ARMS}, got {arm!r}")
+        apply_suite(suite)
         from ..benchmarks.skillbench import SkillbenchAdapter
 
         return SkillbenchAdapter(
@@ -99,6 +128,8 @@ def make_adapter(
         raise ValueError(f"--arm applies to --bench skillbench only, got {arm!r} for {bench}")
     if pilot:
         raise ValueError(f"--pilot applies to --bench skillbench only, got {bench!r}")
+    if suite is not None:
+        raise ValueError(f"--suite applies to --bench skillbench only, got {suite!r} for {bench}")
     if bench == "wb":
         if subset not in WB_SUBSETS:
             raise ValueError(f"--bench wb needs --subset from {WB_SUBSETS}, got {subset!r} ")
@@ -168,6 +199,7 @@ def add_cell_args(p: argparse._ActionsContainer) -> None:
         choices=ARMS,
         help="skillbench only (required): with | without",
     )
+    add_suite_arg(p)
 
 
 def add_modes_arg(p: argparse._ActionsContainer) -> None:

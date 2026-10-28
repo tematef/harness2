@@ -39,7 +39,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .. import config
 from ..benchmarks.skillbench import (
@@ -59,6 +59,7 @@ from ..benchmarks.skillbench import (
     rollout_valid,
     score,
 )
+from ..benchmarks.skillbench_suite import DEFAULT_BANNED_TOOLS, SuiteConfig, active_suite
 from ..substrate.agy import (
     _kill_group,
     agy_argv,
@@ -74,6 +75,7 @@ from ..substrate.agy import (
     run_rollout,
     target_skill_file,
 )
+from . import _common as C
 from .skillbench_report import build_report
 
 
@@ -108,11 +110,8 @@ IMPROVER_SCHEMA: dict[str, Any] = {
 }
 IMPROVER_SCHEMA_JSON = json.dumps(IMPROVER_SCHEMA, separators=(",", ":"))
 
-BANNED_CLAUDE_TOOLS = (
-    "AskUserQuestion",
-    "EnterPlanMode",
-    "TodoWrite",
-)
+# Default of a suite's `banned_tools` (Claude Code tool names; AGY has its own).
+BANNED_CLAUDE_TOOLS = DEFAULT_BANNED_TOOLS
 
 EVIDENCE_TRAJ_CHARS = 1800
 EVIDENCE_DELIV_CHARS = 1800
@@ -195,9 +194,14 @@ def validate_candidate_skill(
     *,
     target_skill: str,
     original_md: str,
+    banned_tools: Iterable[str] | None = None,
 ) -> list[str]:
-    """Validate a proposed `SKILL.md` before staging it. Returns a list of errors (empty = valid)."""
+    """Validate a proposed `SKILL.md` before staging it. Returns a list of errors (empty = valid).
+
+    `banned_tools` defaults to the suite's `banned_tools` (`BANNED_CLAUDE_TOOLS` when the
+    suite names none)."""
     errors: list[str] = []
+    banned = tuple(BANNED_CLAUDE_TOOLS if banned_tools is None else banned_tools)
     text = (candidate_md or "").strip()
     if not text:
         return ["candidate SKILL.md is empty"]
@@ -225,9 +229,9 @@ def validate_candidate_skill(
     if "## When no one can answer" in original_md and "## When no one can answer" not in text:
         errors.append("removed required '## When no one can answer' headless fallback section")
 
-    for banned in BANNED_CLAUDE_TOOLS:
-        if re.search(rf"\b{re.escape(banned)}\b", text):
-            errors.append(f"contains banned Claude Code tool name {banned!r} (use AGY tool names)")
+    for name in banned:
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            errors.append(f"contains banned tool name {name!r} (use AGY tool names)")
 
     if text == original_md.strip():
         errors.append("candidate SKILL.md is identical to the current SKILL.md")
@@ -386,16 +390,21 @@ def build_improver_prompt(
     skill: str,
     evidence_packet: str,
     validation_error: str = "",
+    suite_name: str = "",
+    banned_tools: Iterable[str] = BANNED_CLAUDE_TOOLS,
 ) -> str:
-    """Build the single-turn prompt sent to the isolated `agy` improver."""
+    """Build the single-turn prompt sent to the isolated `agy` improver. `suite_name` and
+    `banned_tools` come from the suite config; nothing suite-specific is hard-coded here."""
     retry_block = (
         f"\n## Previous Candidate Was Rejected\nFix these validation errors:\n{validation_error}\n"
         if validation_error
         else ""
     )
+    suite_phrase = f"the `{suite_name}` plugin suite" if suite_name else "an AGY plugin suite"
+    banned_list = ", ".join(f"`{b}`" for b in banned_tools) or "(none)"
     return (
-        "You are an expert Agent Harness Engineer optimizing a `SKILL.md` file in the `cc-thingz` "
-        "plugin suite for Google Antigravity (AGY) / Jetski.\n\n"
+        f"You are an expert Agent Harness Engineer optimizing a `SKILL.md` file in {suite_phrase} "
+        "for Google Antigravity (AGY) / Jetski.\n\n"
         "Do not call any tools or inspect any files; analyze the Evidence Packet below and return "
         "your structured JSON output immediately via `finish`.\n\n"
         "## Optimization Rules\n"
@@ -404,7 +413,7 @@ def build_improver_prompt(
         "section heading and its headless fallback behavior.\n"
         "3. Use only AGY/Jetski tool names (`view_file`, `write_to_file`, `replace_file_content`, "
         "`find_by_name`, `grep_search`, `run_command`, `invoke_subagent`, `ask_question`). Never "
-        "use Claude Code tool names (`AskUserQuestion`, `EnterPlanMode`, `TodoWrite`).\n"
+        f"use these banned tool names: {banned_list}.\n"
         "4. Fix any quality gaps where `WITH` missed root causes, edge cases, or verification checks.\n"
         "5. Streamline instructions that caused unnecessary tool calls, redundant searches for "
         "other skills in headless/leave-one-out runs, or high token/time overhead.\n"
@@ -530,14 +539,19 @@ def propose_skill(
     model: str,
     timeout: int = DEFAULT_JUDGE_TIMEOUT_S,
     max_attempts: int = 2,
+    suite: SuiteConfig | None = None,
 ) -> dict[str, Any]:
-    """Propose and validate a candidate `SKILL.md` (with up to `max_attempts` retries)."""
+    """Propose and validate a candidate `SKILL.md` (with up to `max_attempts` retries). The
+    prompt names `suite` and its `banned_tools` (the active suite when None)."""
+    suite = suite if suite is not None else active_suite()
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         prompt = build_improver_prompt(
             skill=skill,
             evidence_packet=evidence_packet,
             validation_error=last_err,
+            suite_name=suite.name,
+            banned_tools=suite.banned_tools,
         )
         res = run_improver_once(prompt, model=model, timeout=timeout)
         if res is None:
@@ -547,6 +561,7 @@ def propose_skill(
             res["skill_markdown"],
             target_skill=skill,
             original_md=original_md,
+            banned_tools=suite.banned_tools,
         )
         if errs:
             last_err = "; ".join(errs)
@@ -1008,7 +1023,8 @@ def improve_skill(
     if not tasks:
         raise ValueError(f"no skillbench tasks found for skill {skill!r} (pilot={pilot_only})")
 
-    skill_path = target_skill_file(skill)
+    suite = active_suite()
+    skill_path = target_skill_file(skill, suite)
     original_md = skill_path.read_text(encoding="utf-8")
 
     without_summary = summarize_arm_runs(tasks, runs_dir / "results" / "without", k=k)
@@ -1052,6 +1068,7 @@ def improve_skill(
                 cached_prop["skill_markdown"],
                 target_skill=skill,
                 original_md=original_md,
+                banned_tools=suite.banned_tools,
             )
         ):
             proposal = cached_prop
@@ -1061,6 +1078,7 @@ def improve_skill(
                 original_md=original_md,
                 evidence_packet=evidence,
                 model=imp_model,
+                suite=suite,
             )
             cand_path.write_text(proposal["skill_markdown"], encoding="utf-8")
             (rdir / "proposal.json").write_text(
@@ -1138,8 +1156,9 @@ def improve_skill(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="skillbench-improve",
-        description="Propose, probe, and verify improvements for weak cc-thingz skills.",
+        description="Propose, probe, and verify improvements for weak skills of a plugin suite.",
     )
+    C.add_suite_arg(ap)
     ap.add_argument(
         "--runs-dir",
         type=Path,
@@ -1176,7 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--apply",
         action="store_true",
-        help="write accepted candidate SKILL.md back to $SKILLBENCH_PLUGINS_DIR",
+        help="write accepted candidate SKILL.md back to the suite's plugins_dir checkout",
     )
     ap.add_argument(
         "--dry-run",
@@ -1184,6 +1203,7 @@ def main(argv: list[str] | None = None) -> int:
         help="write evidence packet and print selected skills without calling agy",
     )
     args = ap.parse_args(argv)
+    C.apply_suite(args.suite)
 
     runs_dir = (
         args.runs_dir.expanduser().resolve() if args.runs_dir else _default_runs_root()

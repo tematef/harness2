@@ -33,7 +33,7 @@ def main(argv=None):
     args = p.parse_args(argv)
     arm = args.arm or ("with" if args.bench == "skillbench" else None)
     try:
-        adapter_kw = {"arm": arm}
+        adapter_kw = {"arm": arm, "suite": args.suite}
         if args.pilot:
             adapter_kw["pilot"] = True
         adapter = make_adapter(args.bench, args.subset, args.substrate, **adapter_kw)

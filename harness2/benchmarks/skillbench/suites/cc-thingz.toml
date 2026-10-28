@@ -1,0 +1,26 @@
+# Example suite config: the cc-thingz plugin suite (one concrete suite, never a default).
+#
+# Select it with `--suite harness2/benchmarks/skillbench/suites/cc-thingz.toml` or
+# `SKILLBENCH_SUITE=<that path>`. `plugins_dir` is a git checkout; the entries under
+# ~/.gemini/config/plugins are symlinks into it, so staging reads the checkout and resolves
+# the links. Relative paths resolve against this file's directory; `~` is expanded.
+
+name = "cc-thingz"
+plugins_dir = "~/projects/cc-thingz/plugins"
+plugins = ["brainstorm", "planning", "review", "skill-eval", "thinking-tools", "workflow"]  # or "*"
+# External corpus living next to the skills (Task 12 authors it); until it exists the
+# bundled corpus under harness2/benchmarks/skillbench/tasks/ is used.
+# tasks_root = "~/projects/cc-thingz/benchmarks/skillbench"
+banned_tools = ["AskUserQuestion", "EnterPlanMode", "TodoWrite"]
+
+[families]
+planning = ["brainstorm", "make-plan", "exec"]
+analysis = ["root-cause-investigator", "dialectic", "clarify", "wrong"]
+
+[matrix]
+executors = ["opus-5.5-high", "gemini-3.8-flash-high", "fable-5.1-high"]
+
+[matrix.judge_for]  # keyed by executor model-id prefix; same-prefix pairs are refused
+"opus-" = "gemini-3.8-flash-high"
+"gemini-" = "fable-5.1-high"
+"fable-" = "gemini-3.8-flash-high"

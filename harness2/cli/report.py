@@ -123,7 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     if not ks:
         raise SystemExit("--k named no scale")
 
-    adapter = C.make_adapter(args.bench, args.subset, args.substrate, arm=args.arm)
+    adapter = C.make_adapter(
+        args.bench, args.subset, args.substrate, arm=args.arm, suite=args.suite
+    )
     tag = C.arm_tag(args.bench, args.arm)
     bases = args.bases or args.bench == "skillbench"
     rows, fell_back, usd = [], {}, {}

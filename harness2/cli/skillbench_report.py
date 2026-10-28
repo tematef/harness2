@@ -987,6 +987,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--with-dir", type=Path, default=None, help="explicit WITH namespace dir")
     p.add_argument("--without-dir", type=Path, default=None, help="explicit WITHOUT namespace dir")
+    C.add_suite_arg(p)
     p.add_argument(
         "--out-dir",
         type=Path,
@@ -1001,6 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.k < 1:
             raise ValueError("--k must be positive")
+        C.apply_suite(args.suite)
         with_dir, without_dir = _resolve_ns_dirs(args)
         report = build_report(
             with_dir,

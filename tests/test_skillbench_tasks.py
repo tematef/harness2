@@ -32,6 +32,20 @@ from harness2.benchmarks import skillbench as SB
 from harness2.substrate.agy import AgyTask
 
 REPO = Path(__file__).resolve().parents[1]
+# Skills of the bundled corpus whose SKILL.md allows `ask_question`; `make_task` scripts the
+# simulated user for them. The loader itself no longer knows any skill names: whether a task
+# asks is decided by `asks_user` in task.toml or the skill's frontmatter (`task_asks_user`).
+ASKING_SKILLS = frozenset(
+    {"brainstorm", "exec", "make-plan", "dialectic", "backlog", "clarify", "learn", "wrong"}
+)
+ASKING_SKILL_MD = (
+    "---\nname: make-plan\ndescription: plan\n"
+    "allowed-tools: view_file, write_to_file, run_command, ask_question\n---\n# Plan\n"
+)
+SILENT_SKILL_MD = (
+    "---\nname: code-review-refactor\ndescription: refactor\n"
+    "allowed-tools: view_file, replace_file_content\n---\n# Refactor\nask_question in body only\n"
+)
 
 
 def _rubric(n: int = 4) -> list[dict]:
@@ -68,7 +82,7 @@ def make_task(
         "timeout": 600,
         "pilot": False,
     }
-    if skill in SB.ASK_QUESTION_SKILLS:
+    if skill in ASKING_SKILLS:
         meta["user_answers"] = ["Yes, go ahead.", "Use the simplest option."]
     meta.update(fields)
     body = "".join(f"{k} = {_toml_value(v)}\n" for k, v in meta.items() if v is not None)
@@ -189,31 +203,16 @@ class LoadTaskTest(TmpCase):
         with self.assertRaisesRegex(SB.TaskError, "JSON list"):
             SB.load_task(make_task(self.root, task_id="obj", rubric={"c0": "x"}))
 
-    def test_ask_question_skills_need_user_answers(self):
-        self.assertEqual(
-            SB.ASK_QUESTION_SKILLS,
-            {
-                "brainstorm",
-                "exec",
-                "make-plan",
-                "dialectic",
-                "backlog",
-                "clarify",
-                "learn",
-                "wrong",
-            },
+    def test_loader_no_longer_requires_user_answers_for_asking_skills(self):
+        # The "asking task without user_answers" check moved to `skillbench-tasks check`;
+        # `load_task` accepts the task and records that nothing was scripted.
+        t = SB.load_task(
+            make_task(
+                self.root, "make-plan", "q", user_answers=None, prompt="Help with release notes."
+            )
         )
-        for skill in sorted(SB.ASK_QUESTION_SKILLS):
-            with self.subTest(skill=skill):
-                d = make_task(
-                    self.root,
-                    skill,
-                    "q",
-                    user_answers=None,
-                    prompt="Help me with the release notes.",
-                )
-                with self.assertRaisesRegex(SB.TaskError, "user_answers"):
-                    SB.load_task(d)
+        self.assertEqual(t.user_answers, ())
+        self.assertIsNone(t.asks_user)
         # Skills that never ask need none.
         self.assertEqual(
             SB.load_task(
@@ -223,6 +222,24 @@ class LoadTaskTest(TmpCase):
             ).user_answers,
             (),
         )
+
+    def test_asks_user_override_is_parsed_and_validated(self):
+        t = SB.load_task(make_task(self.root, "code-review-refactor", "a", asks_user=True))
+        self.assertIs(t.asks_user, True)
+        self.assertTrue(SB.task_asks_user(t))
+        self.assertTrue(SB.task_asks_user(t, SILENT_SKILL_MD))  # override beats frontmatter
+        t2 = SB.load_task(make_task(self.root, "make-plan", "b", asks_user=False))
+        self.assertIs(t2.asks_user, False)
+        self.assertFalse(SB.task_asks_user(t2, ASKING_SKILL_MD))
+        with self.assertRaisesRegex(SB.TaskError, "asks_user must be true or false"):
+            SB.load_task(make_task(self.root, "make-plan", "c", asks_user="yes"))
+
+    def test_task_asks_user_falls_back_to_frontmatter(self):
+        t = SB.load_task(make_task(self.root, "make-plan", "f"))
+        self.assertIsNone(t.asks_user)
+        self.assertTrue(SB.task_asks_user(t, ASKING_SKILL_MD))
+        self.assertFalse(SB.task_asks_user(t, SILENT_SKILL_MD))
+        self.assertFalse(SB.task_asks_user(t))  # no SKILL.md known -> not an asking skill
 
     def test_prompt_check_runs_in_loader(self):
         d = make_task(self.root, task_id="inv", prompt="Use the code-review-refactor skill.")
@@ -314,7 +331,7 @@ class BuildPromptTest(TmpCase):
 
     def test_preamble_passes_prompt_check(self):
         pre = SB.simulated_user_preamble(["yes"])
-        self.assertEqual(SB.check_prompt(pre, sorted(SB.ASK_QUESTION_SKILLS)), [])
+        self.assertEqual(SB.check_prompt(pre, sorted(ASKING_SKILLS)), [])
         for word in ("rubric", "score", "skill"):
             self.assertNotIn(word, pre.lower())
 

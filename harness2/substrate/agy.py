@@ -23,7 +23,7 @@ The stream-json decoder:
 
 Staging (install mode `agy_home`, one Install per arm):
 
-    AgySubstrate.materialise  allowlisted cc-thingz plugins (leave-one-out for arm `without`),
+    AgySubstrate.materialise  the active suite's plugins (leave-one-out for arm `without`),
                               copied auth files and side-effect shims -> a HOME template
     prepare_rollout           fresh per-rollout copy of that HOME + the isolated environment
 
@@ -72,6 +72,7 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterable, Mapping
 
 from .. import config
+from ..benchmarks.skillbench_suite import SuiteConfig, active_suite
 from ..core import runmark as RM
 from ..core import tree as HT
 from ..core.tree import SurfaceSpec
@@ -280,12 +281,11 @@ def render_trajectory(
 
 
 # --------------------------------------------------------------------------------------------
-# Staging: allowlisted plugins, leave-one-out arms, isolated HOME, side-effect shims.
+# Staging: the active suite's plugins, leave-one-out arms, isolated HOME, side-effect shims.
 # --------------------------------------------------------------------------------------------
 
 INSTALL_MODE = "agy_home"
 ARMS = ("with", "without")
-DEFAULT_PLUGINS = ("brainstorm", "planning", "review", "skill-eval", "thinking-tools", "workflow")
 SHIM_TOOLS = ("xclip", "xsel", "wl-copy", "pbcopy", "revdiff")
 SIDE_EFFECTS_ENV = "SKILLBENCH_SIDE_EFFECTS_DIR"
 # Where agy discovers plugins, relative to HOME (spike question 9).
@@ -293,7 +293,6 @@ PLUGINS_REL = Path(".gemini") / "config" / "plugins"
 # Where the editable tree's always-on file lands, relative to HOME (AGY's global rules file).
 RULES_REL = Path(".gemini") / "GEMINI.md"
 
-_PLUGIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]*")
 _SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9_\-]*")
 
 # Bases-only surface: the always-on GEMINI.md is installed as AGY's global rules file; the full
@@ -341,35 +340,14 @@ exit 0
 """
 
 
-def plugins_dir() -> Path:
-    """The cc-thingz `plugins/` checkout named by SKILLBENCH_PLUGINS_DIR."""
-    raw = config.env("SKILLBENCH_PLUGINS_DIR")
-    if not raw:
-        raise config.ConfigError(
-            "SKILLBENCH_PLUGINS_DIR is required for the agy substrate: point it at a cc-thingz "
-            "plugins/ checkout, e.g. SKILLBENCH_PLUGINS_DIR=~/projects/cc-thingz/plugins in .env"
-        )
-    p = Path(raw).expanduser()
-    if not p.is_dir():
-        raise config.ConfigError(
-            f"SKILLBENCH_PLUGINS_DIR={raw!r} is not a directory: clone cc-thingz and point it at "
-            f"its plugins/ directory"
-        )
-    return p
+def plugins_dir(suite: SuiteConfig | None = None) -> Path:
+    """The active suite's plugin checkout (`suite.plugins_dir`)."""
+    return (suite or active_suite()).plugins_dir
 
 
-def plugin_allowlist() -> tuple[str, ...]:
-    """Plugin names from SKILLBENCH_PLUGINS (comma list), default DEFAULT_PLUGINS."""
-    raw = config.env("SKILLBENCH_PLUGINS")
-    if not raw:
-        return DEFAULT_PLUGINS
-    names = tuple(dict.fromkeys(n.strip() for n in raw.split(",") if n.strip()))
-    bad = [n for n in names if not _PLUGIN_NAME.fullmatch(n)]
-    if bad or not names:
-        raise config.ConfigError(
-            f"SKILLBENCH_PLUGINS must be a comma list of plugin directory names, got {raw!r}"
-        )
-    return names
+def plugin_allowlist(suite: SuiteConfig | None = None) -> tuple[str, ...]:
+    """The active suite's staged plugin names (`suite.plugins`)."""
+    return (suite or active_suite()).plugins
 
 
 def auth_files() -> tuple[str, ...]:
@@ -403,47 +381,52 @@ def _target_dirs(root: Path, allowlist: tuple[str, ...], skill: str) -> list[Pat
     ]
 
 
-def checked_plugins() -> tuple[Path, tuple[str, ...]]:
-    """`(plugins_dir(), plugin_allowlist())` after checking every allowlisted plugin exists."""
-    root = plugins_dir()
-    allow = plugin_allowlist()
+def checked_plugins(suite: SuiteConfig | None = None) -> tuple[Path, tuple[str, ...]]:
+    """`(plugins_dir, plugins)` of the active suite after checking every plugin exists."""
+    suite = suite or active_suite()
+    root, allow = suite.plugins_dir, suite.plugins
     missing = [p for p in allow if not (root / p).is_dir()]
     if missing:
         raise config.ConfigError(
-            f"allowlisted plugin(s) {missing} not found in SKILLBENCH_PLUGINS_DIR={root}; fix "
-            f"SKILLBENCH_PLUGINS or update the cc-thingz checkout"
+            f"suite {suite.name!r}: plugin(s) {missing} not found under {root}; fix the "
+            f"suite's `plugins` or update the checkout"
         )
     return root, allow
 
 
-def target_skill_file(target_skill: str) -> Path:
-    """Path to `skills/<target_skill>/SKILL.md` in the allowlisted plugins checkout."""
-    root, allow = checked_plugins()
+def target_skill_file(target_skill: str, suite: SuiteConfig | None = None) -> Path:
+    """Path to `skills/<target_skill>/SKILL.md` in the active suite's plugins checkout."""
+    root, allow = checked_plugins(suite)
     targets = _target_dirs(root, allow, target_skill)
     if not targets:
         raise ValueError(
             f"target skill {target_skill!r} not found as skills/{target_skill}/SKILL.md in the "
-            f"allowlisted plugins {list(allow)} under {root}"
+            f"suite's plugins {list(allow)} under {root}"
         )
     return targets[0] / "SKILL.md"
 
 
 def stage_plugins(
-    dest: Path, *, arm: str, target_skill: str, skill_override: Path | str | None = None
+    dest: Path,
+    *,
+    arm: str,
+    target_skill: str,
+    skill_override: Path | str | None = None,
+    suite: SuiteConfig | None = None,
 ) -> list[str]:
-    """Copy the allowlisted plugins (symlinks resolved) into `dest`.
+    """Copy the active suite's plugins (symlinks resolved) into `dest`.
 
     Arm `without` omits `skills/<target_skill>/` from every staged plugin that has it; hooks
     and every other file stay. When `skill_override` (a `Path` to a candidate `SKILL.md` or
     raw markdown text) is given for arm `with`, replaces the staged `skills/<target_skill>/SKILL.md`
     in place. Returns the omitted paths relative to `dest`.
     """
-    root, allow = checked_plugins()
+    root, allow = checked_plugins(suite)
     targets = _target_dirs(root, allow, target_skill)
     if not targets:
         raise ValueError(
             f"target skill {target_skill!r} not found as skills/{target_skill}/SKILL.md in the "
-            f"allowlisted plugins {list(allow)} under {root}"
+            f"suite's plugins {list(allow)} under {root}"
         )
     if skill_override is not None and arm != "with":
         raise ValueError(f"skill_override requires arm='with', got arm={arm!r}")
@@ -958,11 +941,12 @@ class AgySubstrate:
     def materialise(self, tree_dir: Path, spec, ctx: Mapping[str, str]) -> Install:
         """Stage a HOME template for one arm.
 
-        Layout of `staging_dir`: `home/.gemini/config/plugins/<plugin>/` (allowlisted plugins,
-        target skill omitted for arm `without`), `home/.gemini/GEMINI.md` (the tree's always-on
-        text, when non-blank), `home/<auth files>` (copies, if any) and `shims/<tool>`. The
-        fingerprint digests the source tree, the staged plugins and the shims -- never the auth
-        files, so a token refresh does not move the harness identity.
+        Layout of `staging_dir`: `home/.gemini/config/plugins/<plugin>/` (the active suite's
+        plugins, target skill omitted for arm `without`), `home/.gemini/GEMINI.md` (the tree's
+        always-on text, when non-blank), `home/<auth files>` (copies, if any) and
+        `shims/<tool>`. The fingerprint digests the source tree, the staged plugins and the
+        shims -- never the auth files, so a token refresh does not move the harness identity.
+        `extras` records the suite name and `suite_hash` next to the arm and target skill.
         """
         if spec.install_mode != INSTALL_MODE:
             raise ValueError(
@@ -974,11 +958,16 @@ class AgySubstrate:
         tree_dir = Path(tree_dir)
         if not HT.is_tree(AGY_SURFACE, tree_dir):
             raise ValueError(f"{tree_dir} is not an agy harness tree (no GEMINI.md)")
+        suite = active_suite()
         staged = Path(tempfile.mkdtemp(prefix=f"adapt-agy-{arm}-"))
         try:
             home = staged / "home"
             omitted = stage_plugins(
-                home / PLUGINS_REL, arm=arm, target_skill=target, skill_override=override
+                home / PLUGINS_REL,
+                arm=arm,
+                target_skill=target,
+                skill_override=override,
+                suite=suite,
             )
             rules = (tree_dir / "GEMINI.md").read_text(encoding="utf-8", errors="replace")
             if rules.strip():
@@ -1001,6 +990,8 @@ class AgySubstrate:
                 "arm": arm,
                 "target_skill": target,
                 "omitted": ",".join(omitted),
+                "suite": suite.name,
+                "suite_hash": suite.suite_hash,
             },
         )
 
@@ -1036,8 +1027,8 @@ class AgySubstrate:
         )
 
     def preflight(self) -> None:
-        """Checks the agy binary, git, the effort value, the plugins checkout and any listed
-        auth files; starts nothing (agy is not even asked for --version)."""
+        """Checks the agy binary, git, the effort value, the active suite's plugins checkout
+        and any listed auth files; starts nothing (agy is not even asked for --version)."""
         if resolve_agy_bin() is None:
             raise RuntimeError(agy_bin_missing_message())
         if shutil.which("git") is None:

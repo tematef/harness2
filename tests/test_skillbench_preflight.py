@@ -52,7 +52,14 @@ def _write(p: Path, body: str = "x\n") -> Path:
 
 
 def _skill(plugin_dir: Path, name: str) -> None:
+    _plugin(plugin_dir)
     _write(plugin_dir / "skills" / name / "SKILL.md", f"---\nname: {name}\n---\nDo {name}.\n")
+
+
+def _plugin(plugin_dir: Path) -> None:
+    """A plugin.json makes the directory a plugin the env-fallback suite discovers."""
+    if not (plugin_dir / "plugin.json").exists():
+        _write(plugin_dir / "plugin.json", f'{{"name": "fake-{plugin_dir.name}"}}\n')
 
 
 def _tree_hash(root: Path) -> dict[str, str]:
@@ -82,6 +89,7 @@ class _PreflightCase(unittest.TestCase):
         _skill(self.plugins / "planning", "make-plan")
         _skill(self.plugins / "review", "code-review-refactor")
         _write(self.plugins / "skill-eval" / "hooks.json", '{"hooks": {}}\n')
+        _plugin(self.plugins / "skill-eval")
         _skill(self.plugins / "thinking-tools", "root-cause-investigator")
         _skill(self.plugins / "workflow", "backlog")
 

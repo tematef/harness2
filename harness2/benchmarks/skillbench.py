@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""skillbench: leave-one-out skill lift of the cc-thingz suite on the agy substrate.
+"""skillbench: leave-one-out skill lift of a plugin suite (see skillbench_suite) on the agy
+substrate.
 
 Task model and agy judge (the benchmark adapter builds on both):
 
@@ -25,6 +26,9 @@ Task model and agy judge (the benchmark adapter builds on both):
     deliverable_files  final.md, diff.patch, new_files/, side_effects/ from a rollout dir
     deliverable_text   combined deliverable text for a rollout dir
     scrub_deliverable  redacts skill names, SKILL.md paths and plugin paths to `[redacted]`
+                       (the names come from `skillbench_suite.redaction_names`)
+    task_asks_user     whether a task's skill asks the user (`asks_user` override, else the
+                       SKILL.md frontmatter via `skillbench_suite.skill_asks_user`)
     score              runs the isolated agy judge (`--model $SKILLBENCH_JUDGE_MODEL --json-schema`)
                        and caches judgments in `<run_dir>/judgments.json`
     run_verify         optional deterministic check (`verify` command) -> `<run_dir>/verify.json`
@@ -35,7 +39,7 @@ Task layout::
 
     <root>/<skill>/<task-id>/
         task.toml    target_skill, prompt, timeout, [user_answers], [forbidden_terms], [pilot],
-                     [verify], [verify_restore]
+                     [verify], [verify_restore], [asks_user]
         rubric.json  [{"id": ..., "criterion": ...}], 4-8 binary outcome-based criteria
         fixture/     small repo copied into every rollout's working directory
 
@@ -69,6 +73,7 @@ from ..substrate.agy import (
     AGY_SURFACE,
     ARMS,
     INSTALL_MODE,
+    PLUGINS_REL,
     AgyEvent,
     AgySubstrate,
     AgyTask,
@@ -82,6 +87,7 @@ from ..substrate.agy import (
     parse_event,
     resolve_agy_bin,
 )
+from .skillbench_suite import SuiteConfig, active_suite, redaction_names, skill_asks_user
 from .tasks import discover, select
 
 # The bundled corpus. A `skillbench/` directory next to this module holds only data (no
@@ -94,16 +100,18 @@ TASK_FILE = "task.toml"
 RUBRIC_FILE = "rubric.json"
 FIXTURE_DIR = "fixture"
 
-# Skills whose workflow calls `ask_question`: their tasks must script the simulated user.
-ASK_QUESTION_SKILLS = frozenset(
-    {"brainstorm", "exec", "make-plan", "dialectic", "backlog", "clarify", "learn", "wrong"}
-)
-
 MIN_CRITERIA = 4
 MAX_CRITERIA = 8
 
 _REQUIRED_KEYS = ("target_skill", "prompt", "timeout")
-_OPTIONAL_KEYS = ("user_answers", "forbidden_terms", "pilot", "verify", "verify_restore")
+_OPTIONAL_KEYS = (
+    "user_answers",
+    "forbidden_terms",
+    "pilot",
+    "verify",
+    "verify_restore",
+    "asks_user",
+)
 _NAME = re.compile(r"[a-z0-9][a-z0-9_\-]*")
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]*")
 # Never part of a task's identity: copying a fixture drops them too (agy.init_work).
@@ -145,6 +153,8 @@ class SkillbenchTask:
     dir: Path = Path()
     verify: tuple[str, ...] = ()
     verify_restore: tuple[str, ...] = ()
+    # `asks_user` from task.toml; None = decide from the skill's SKILL.md (`task_asks_user`).
+    asks_user: bool | None = None
 
     @property
     def fixture(self) -> Path:
@@ -298,11 +308,9 @@ def load_task(task_dir: Path) -> SkillbenchTask:
     if not isinstance(pilot, bool):
         raise TaskError(f"{toml_path}: pilot must be true or false")
     answers = _str_list(meta, "user_answers", toml_path)
-    if skill in ASK_QUESTION_SKILLS and not answers:
-        raise TaskError(
-            f"{toml_path}: {skill!r} asks the user questions; script the simulated user with "
-            f"user_answers = [...]"
-        )
+    asks_user = meta.get("asks_user")
+    if asks_user is not None and not isinstance(asks_user, bool):
+        raise TaskError(f"{toml_path}: asks_user must be true or false")
     forbidden = _str_list(meta, "forbidden_terms", toml_path)
     problems = check_prompt(prompt, [skill], forbidden)
     if problems:
@@ -326,7 +334,18 @@ def load_task(task_dir: Path) -> SkillbenchTask:
         dir=task_dir,
         verify=verify,
         verify_restore=verify_restore,
+        asks_user=asks_user,
     )
+
+
+def task_asks_user(task: SkillbenchTask, skill_md_text: str | None = None) -> bool:
+    """Whether the simulated user must be scripted for `task`: the task's `asks_user` when
+    set, else whether the skill's `SKILL.md` frontmatter (`skill_md_text`) allows
+    `ask_question`; False when neither is known. A missing `user_answers` on an asking task
+    is reported by `skillbench-tasks check`, not by `load_task`."""
+    if task.asks_user is not None:
+        return task.asks_user
+    return skill_asks_user(skill_md_text) if skill_md_text else False
 
 
 def _load_verify(
@@ -470,30 +489,6 @@ DEFAULT_JUDGE_TIMEOUT_S = 300
 JUDGMENTS_FILE = "judgments.json"
 SKILL_TIMING_FILE = "skill_timing.json"
 
-KNOWN_SKILLS = frozenset(
-    {
-        "backlog",
-        "brainstorm",
-        "clarify",
-        "code-agentic-refactor",
-        "code-review-best-practices",
-        "code-review-refactor",
-        "dialectic",
-        "exec",
-        "git-review",
-        "learn",
-        "make-plan",
-        "md-copy",
-        "pr",
-        "root-cause-investigator",
-        "skill-eval",
-        "txt-copy",
-        "wiki-builder",
-        "writing-style",
-        "wrong",
-    }
-)
-
 JUDGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["criteria"],
@@ -547,16 +542,6 @@ def rollout_valid(run_dir: Path) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     return isinstance(data, dict) and data.get("valid") is True
-
-
-def _discovered_skills() -> set[str]:
-    names = set(KNOWN_SKILLS)
-    raw = config.env("SKILLBENCH_PLUGINS_DIR")
-    if raw:
-        p = Path(raw).expanduser()
-        if p.is_dir():
-            names.update(s.parent.name for s in p.glob("*/skills/*/SKILL.md"))
-    return names
 
 
 def _is_bytecode_path(rel_path: str) -> bool:
@@ -741,13 +726,17 @@ def scrub_deliverable(
     *,
     redact_paths: Iterable[str] = (),
 ) -> str:
-    """Replace `SKILL.md` / plugin paths, run-dir paths, and skill names with `[redacted]`."""
+    """Replace `SKILL.md` / plugin paths, run-dir paths, and `skill_names` with `[redacted]`.
+
+    Takes no suite itself: callers pass the names (`score` builds them with
+    `skillbench_suite.redaction_names` from the rollout's staged plugins and the active suite).
+    """
     out = text
     for raw_path in sorted({p for p in redact_paths if p}, key=len, reverse=True):
         out = out.replace(raw_path, "[redacted]")
     for pat in _PATH_PATTERNS:
         out = pat.sub("[redacted]", out)
-    names = sorted(_discovered_skills() | {s for s in skill_names if s}, key=len, reverse=True)
+    names = sorted({s for s in skill_names if s}, key=len, reverse=True)
     for name in names:
         n = re.escape(name)
         for pat in (
@@ -988,12 +977,25 @@ def _read_cached_judgments(
     return {"n_passed": n_passed, "n_criteria": n_criteria}
 
 
+def _redaction_names_for(run_dir: Path, suite: SuiteConfig | None) -> frozenset[str]:
+    """Skill names to scrub for one rollout: whatever was staged into its HOME plus the
+    active suite's skills and name (the suite is optional: the judge needs no plugins)."""
+    if suite is None:
+        try:
+            suite = active_suite(quiet=True)
+        except config.ConfigError:
+            suite = None
+    staged = run_dir / "home" / PLUGINS_REL
+    return redaction_names(staged if staged.is_dir() else None, suite)
+
+
 def score(
     run_dir: Path,
     task: SkillbenchTask | str | Path,
     *,
     root: Path = TASKS_ROOT,
     timeout: int | None = None,
+    suite: SuiteConfig | None = None,
 ) -> dict | None:
     """Grade one skillbench rollout in `run_dir` with `agy --model $SKILLBENCH_JUDGE_MODEL`.
 
@@ -1018,7 +1020,7 @@ def score(
     rubric_sha = _rubric_sha256(rubric)
     scrubbed = scrub_deliverable(
         deliverable_text(run_dir),
-        [resolved.target_skill],
+        _redaction_names_for(run_dir, suite) | {resolved.target_skill},
         redact_paths=(str(run_dir), str(run_dir.resolve()), run_dir.name),
     )
     deliverable_sha = hashlib.sha256(scrubbed.encode("utf-8")).hexdigest()
@@ -1077,9 +1079,9 @@ BASE_GEMINI_MD = "<!-- skillbench base harness -->\n"
 
 SKILLBENCH_PROMPTS = BenchPrompts(
     work=(
-        "Software engineering assignments in a local git repository: planning features, "
-        "investigating root causes of bugs and failures, reviewing diffs, refactoring code, "
-        "and writing technical documentation or structured project artifacts."
+        "Software engineering assignments in a local git repository: planning, debugging, "
+        "reviewing, refactoring and documenting code, and producing structured project "
+        "artifacts."
     ),
     domain_word="skill domain",
     deliverable_word="repository changes and final answer",
@@ -1092,7 +1094,7 @@ SKILLBENCH_PROMPTS = BenchPrompts(
     dom_levers=(
         "- tailor the depth of analysis, plan structure, or code change to the task type\n"
         "- preserve existing tests and behavior when refactoring unless asked to change them\n"
-        "- ground root-cause claims and design choices in concrete file and line evidence"
+        "- ground diagnostic claims and design choices in concrete file and line evidence"
     ),
     yardstick=(
         "Did the run inspect the workspace, perform the requested engineering operation, "
@@ -1139,7 +1141,8 @@ def skillbench_spec(*, runs_root: Path | None = None) -> BenchSpec:
 class SkillbenchAdapter:
     """The `BenchmarkAdapter` surface for skillbench on the `agy` substrate.
 
-    Each adapter instance represents one arm (`"with"` or `"without"`). Constructing the
+    Each adapter instance represents one arm (`"with"` or `"without"`) of the active suite
+    (`suite`, from `--suite` / `SKILLBENCH_SUITE` / the env fallback). Constructing the
     adapter verifies `check_manifest` against the task corpus root and refuses on drift.
     """
 
@@ -1152,6 +1155,7 @@ class SkillbenchAdapter:
         pilot: bool | None = None,
         root: Path | None = None,
         runs_root: Path | None = None,
+        suite: SuiteConfig | None = None,
     ):
         if arm not in ARMS:
             raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
@@ -1160,6 +1164,7 @@ class SkillbenchAdapter:
         self.arm = arm
         self.split_file = split_file
         self._pilot = pilot
+        self.suite = suite if suite is not None else active_suite()
         self._root = Path(TASKS_ROOT if root is None else root)
         self.manifest_hash = check_manifest(self._root)
         self._tasks = load_tasks(self._root)
@@ -1335,7 +1340,7 @@ class SkillbenchAdapter:
 
     def score(self, run_dir: Path, task_id: str) -> dict | None:
         task = self._tasks.get(task_id, task_id)
-        return score(run_dir, task, root=self._root)
+        return score(run_dir, task, root=self._root, suite=self.suite)
 
 
 # --------------------------------------------------------------------------------------------

@@ -127,6 +127,9 @@ def _print_stream(adapter, args, modes, tag: str = "") -> int:
         f"#   library root:    {C.library_root_for(adapter, args.k, seed=args.seed, tag=tag)}"
     )
     print(f"#   domains parallel: {args.workers}")
+    suite = getattr(adapter, "suite", None)
+    if suite is not None:
+        print(f"#   suite:            {suite.describe()} (hash {suite.suite_hash})")
     for i, (domain, task) in enumerate(stream, 1):
         print(f"{i:>4}  {domain:<40} {task}")
     print("# domains of this split, with task counts (the legal --only-domains names):")
@@ -154,7 +157,7 @@ def _main(args: argparse.Namespace) -> int:
     if args.k < 1 or args.workers < 1:
         raise ValueError("--k and --workers must be positive")
     modes = C.parse_modes(args.modes)
-    adapter_kw: dict[str, object] = {"arm": args.arm}
+    adapter_kw: dict[str, object] = {"arm": args.arm, "suite": getattr(args, "suite", None)}
     if getattr(args, "pilot", False):
         adapter_kw["pilot"] = True
     adapter = C.make_adapter(
@@ -174,6 +177,8 @@ def _main(args: argparse.Namespace) -> int:
     library_root = C.library_root_for(adapter, args.k, seed=args.seed, tag=tag)
     summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)
     _check_identity(adapter, args, runs_root / summary_ns, tag=tag)
+    if args.bench == "skillbench":
+        write_run_json(adapter, runs_root / summary_ns)
     bases_only = bool(getattr(args, "bases_only", False) or args.bench == "skillbench")
     prop = (
         None
@@ -231,6 +236,7 @@ def _main(args: argparse.Namespace) -> int:
         f"next:   python3 -m harness2.cli.judge --bench {args.bench}"
         + (f" --subset {args.subset}" if args.subset else "")
         + (f" --arm {args.arm}" if args.arm else "")
+        + (f" --suite {args.suite}" if getattr(args, "suite", None) else "")
         + f" --substrate {adapter.substrate.name} --k {args.k}"
         + (f" --seed {args.seed}" if args.seed is not None else "")
         + f" --modes {args.modes}"
@@ -239,6 +245,35 @@ def _main(args: argparse.Namespace) -> int:
     if dead:
         return 1
     return 2 if failed else 0
+
+
+RUN_JSON = "run.json"
+
+
+def write_run_json(adapter, namespace_dir: Path) -> Path:
+    """Record what a skillbench namespace was run with: suite name and `suite_hash`, the
+    corpus manifest hash, the arm and the executor / judge model ids. Additive and
+    overwritten on every (re)start; the resume identity stays in `config.json`."""
+    from ..benchmarks.skillbench import judge_model
+    from ..substrate.agy import exec_effort, exec_model
+
+    suite = getattr(adapter, "suite", None)
+    record = {
+        "benchmark": adapter.spec.name,
+        "arm": getattr(adapter, "arm", None),
+        "suite": getattr(suite, "name", None),
+        "suite_hash": getattr(suite, "suite_hash", None),
+        "suite_path": str(suite.path) if suite is not None and suite.path else None,
+        "manifest_hash": getattr(adapter, "manifest_hash", None),
+        "executor": exec_model(),
+        "judge": judge_model(),
+        "effort": exec_effort(),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    namespace_dir.mkdir(parents=True, exist_ok=True)
+    path = namespace_dir / RUN_JSON
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def _check_identity(adapter, args, namespace_dir: Path, tag: str = "") -> None:

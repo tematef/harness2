@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AgySubstrate staging: plugin allowlist, leave-one-out arms, isolated HOME, side-effect shims.
+"""AgySubstrate staging: suite plugins, leave-one-out arms, isolated HOME, side-effect shims.
 
-Every test builds its own fake cc-thingz `plugins/` checkout (incl. a `revmux` plugin that must
-never be staged) and its own fake `$HOME`; the real `~/.gemini` is never touched.
+Every test builds its own fake plugin `plugins/` checkout (incl. a `revmux` directory without
+a plugin.json that must never be staged by the env fallback's `"*"` discovery) and its own fake
+`$HOME`; the real `~/.gemini` is never touched. The suite comes from the deprecated env
+fallback (SKILLBENCH_PLUGINS_DIR / SKILLBENCH_PLUGINS); suite.toml loading is covered by
+tests/test_skillbench_suite.py.
 """
 
 import os
@@ -30,7 +33,6 @@ from harness2.config import ConfigError
 from harness2.core.spec import INSTALL_MODES, BenchPrompts, BenchSpec, ChannelSpec
 from harness2.substrate.agy import (
     AGY_SURFACE,
-    DEFAULT_PLUGINS,
     INSTALL_MODE,
     PLUGINS_REL,
     SHIM_TOOLS,
@@ -39,6 +41,8 @@ from harness2.substrate.agy import (
 )
 
 AUTH = (".gemini/oauth_creds.json", ".gemini/google_accounts.json")
+# What the env fallback discovers: every plugin directory holding a plugin.json.
+SUITE_PLUGINS = ("brainstorm", "planning", "review", "skill-eval", "thinking-tools", "workflow")
 
 
 def _write(p: Path, body: str = "x\n") -> Path:
@@ -95,7 +99,10 @@ class _StagingCase(unittest.TestCase):
         _skill(self.plugins / "thinking-tools", "root-cause-investigator")
         _skill(self.plugins / "workflow", "backlog")
         _write(self.plugins / "workflow" / "scripts" / "__pycache__" / "x.cpython-313.pyc")
-        _skill(self.plugins / "revmux", "revmux")  # installed, but never allowlisted
+        _skill(self.plugins / "revmux", "revmux")  # no plugin.json: never discovered
+        for name in SUITE_PLUGINS:
+            if not (self.plugins / name / "plugin.json").exists():
+                _write(self.plugins / name / "plugin.json", f'{{"name": "fake-{name}"}}\n')
 
         # Fake real HOME: auth files plus things that must never leak into a rollout.
         self.home = self.tmp / "realhome"
@@ -140,12 +147,12 @@ class TestPluginStaging(_StagingCase):
         self.assertIs(self.sub.surface(), AGY_SURFACE)
         self.assertEqual(self.sub.name, "agy")
 
-    def test_with_arm_stages_only_allowlisted_plugins(self) -> None:
+    def test_with_arm_stages_only_suite_plugins(self) -> None:
         inst = self.materialise("with")
         staged = self.staged_plugins(inst)
         self.assertEqual(
             sorted(p.name for p in staged.iterdir()),
-            sorted(DEFAULT_PLUGINS),
+            sorted(SUITE_PLUGINS),
         )
         self.assertFalse((staged / "revmux").exists())
         for skill in ("make-plan", "exec"):
@@ -153,6 +160,13 @@ class TestPluginStaging(_StagingCase):
         self.assertEqual(inst.extras["arm"], "with")
         self.assertEqual(inst.extras["target_skill"], "make-plan")
         self.assertEqual(inst.extras["install_mode"], "agy_home")
+        self.assertEqual(inst.extras["suite"], "cc-thingz")  # parent dir of plugins/
+        self.assertRegex(inst.extras["suite_hash"], r"^[0-9a-f]{16}$")
+
+    def test_suite_hash_moves_with_the_checkout(self) -> None:
+        before = self.materialise("with").extras["suite_hash"]
+        _write(self.plugins / "review" / "skills" / "code-review-refactor" / "SKILL.md", "new\n")
+        self.assertNotEqual(before, self.materialise("with").extras["suite_hash"])
 
     def test_symlinks_are_resolved(self) -> None:
         inst = self.materialise("with")
@@ -216,7 +230,7 @@ class TestPluginStaging(_StagingCase):
 
     def test_missing_plugins_dir_raises_with_remediation(self) -> None:
         os.environ.pop("SKILLBENCH_PLUGINS_DIR")
-        with self.assertRaisesRegex(ConfigError, r"SKILLBENCH_PLUGINS_DIR.*cc-thingz"):
+        with self.assertRaisesRegex(ConfigError, r"--suite.*SKILLBENCH_PLUGINS_DIR"):
             self.materialise("with")
         os.environ["SKILLBENCH_PLUGINS_DIR"] = str(self.tmp / "missing")
         with self.assertRaisesRegex(ConfigError, "SKILLBENCH_PLUGINS_DIR"):

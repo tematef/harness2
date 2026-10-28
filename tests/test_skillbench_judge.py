@@ -79,11 +79,19 @@ class _JudgeCase(unittest.TestCase):
             "real skill\n",
         )
 
+        # Fake suite checkout: the judge redacts every skill name of the active suite (the
+        # env fallback discovers the plugin dirs holding a plugin.json).
         self.plugins = self.tmp / "cc-thingz" / "plugins"
-        _write(self.plugins / "planning" / "skills" / "make-plan" / "SKILL.md", "make-plan\n")
-        _write(
-            self.plugins / "review" / "skills" / "code-review-refactor" / "SKILL.md", "refactor\n"
-        )
+        for plugin, skills in {
+            "planning": ("make-plan", "exec"),
+            "review": ("code-review-refactor",),
+            "brainstorm": ("brainstorm",),
+            "thinking-tools": ("root-cause-investigator", "dialectic"),
+            "workflow": ("backlog",),
+        }.items():
+            _write(self.plugins / plugin / "plugin.json", f'{{"name": "{plugin}"}}\n')
+            for skill in skills:
+                _write(self.plugins / plugin / "skills" / skill / "SKILL.md", f"{skill}\n")
 
         self.tasks_root = self.tmp / "tasks"
         self.task_dir = make_task(

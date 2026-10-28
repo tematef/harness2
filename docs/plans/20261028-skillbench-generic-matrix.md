@@ -217,23 +217,23 @@ Key design decisions:
 - Modify: `harness2/cli/_common.py`
 - Create: `tests/test_skillbench_suite.py`
 
-- [ ] add `SuiteConfig` dataclass + `load_suite(path | None)` (resolves `~`, `"*"` discovery via
+- [x] add `SuiteConfig` dataclass + `load_suite(path | None)` (resolves `~`, `"*"` discovery via
       `plugin.json`, validates names, `families`, `banned_tools`, `matrix`, computes `suite_hash` over the
       staged plugin files) and `active_suite()` (`--suite` → `SKILLBENCH_SUITE` → env-fallback suite built
       from `SKILLBENCH_PLUGINS_DIR` / `SKILLBENCH_PLUGINS`, with a deprecation note)
-- [ ] `agy.plugin_allowlist()` / `plugins_dir()` read the active suite; delete `DEFAULT_PLUGINS` as a default
-- [ ] replace `KNOWN_SKILLS` / `_discovered_skills()` with `redaction_names(staged_plugins_dir, suite)`
+- [x] `agy.plugin_allowlist()` / `plugins_dir()` read the active suite; delete `DEFAULT_PLUGINS` as a default
+- [x] replace `KNOWN_SKILLS` / `_discovered_skills()` with `redaction_names(staged_plugins_dir, suite)`
       (every `skills/*/` dir + suite name); `scrub_deliverable` uses it
-- [ ] replace `ASK_QUESTION_SKILLS` with `skill_asks_user(skill_md_text)` (frontmatter `allowed-tools`
+- [x] replace `ASK_QUESTION_SKILLS` with `skill_asks_user(skill_md_text)` (frontmatter `allowed-tools`
       only) + `task.toml` `asks_user` override; `load_task` no longer errors on missing `user_answers`
-- [ ] move suite-specific wording out of `SKILLBENCH_PROMPTS` and `build_improver_prompt` (use
+- [x] move suite-specific wording out of `SKILLBENCH_PROMPTS` and `build_improver_prompt` (use
       `suite.name`); `BANNED_CLAUDE_TOOLS` becomes the default of `suite.banned_tools`; fix parser help text
-- [ ] add `--suite` to `harness2-sweep`, `harness2-judge`, `skillbench-report`, `skillbench-improve` via
+- [x] add `--suite` to `harness2-sweep`, `harness2-judge`, `skillbench-report`, `skillbench-improve` via
       `_common.py`; record suite name + `suite_hash` in `run.json`
-- [ ] write tests: suite load (explicit list, `"*"`, `"*"` on a dir with no `plugin.json` → error, bad
+- [x] write tests: suite load (explicit list, `"*"`, `"*"` on a dir with no `plugin.json` → error, bad
       name → error, missing plugin → error), env fallback, `redaction_names`, `skill_asks_user` true/false
       + override, `--suite` plumbing, no `cc-thingz` string in prompts
-- [ ] run tests - must pass before task 2
+- [x] run tests - must pass before task 2
 
 ### Task 2: External task corpus and task scaffolder
 
