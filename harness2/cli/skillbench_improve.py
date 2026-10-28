@@ -46,7 +46,6 @@ from ..benchmarks.skillbench import (
     DEFAULT_JUDGE_TIMEOUT_S,
     JUDGMENTS_FILE,
     SKILL_TIMING_FILE,
-    TASKS_ROOT,
     VERIFY_FILE,
     SkillbenchAdapter,
     SkillbenchTask,
@@ -58,6 +57,7 @@ from ..benchmarks.skillbench import (
     load_tasks,
     rollout_valid,
     score,
+    tasks_root,
 )
 from ..benchmarks.skillbench_suite import DEFAULT_BANNED_TOOLS, SuiteConfig, active_suite
 from ..substrate.agy import (
@@ -702,7 +702,7 @@ def probe_candidate(
     tasks: Sequence[SkillbenchTask],
     out_results_dir: Path,
     k: int,
-    root: Path = TASKS_ROOT,
+    root: Path | None = None,
 ) -> dict[str, Any]:
     """Stage `candidate_skill_path`, run all `tasks` for `k` reps, and score each rollout."""
     adapter = SkillbenchAdapter(arm="with", root=root)
@@ -1010,7 +1010,7 @@ def improve_skill(
     include_verdicts: bool = False,
     apply_accepted: bool = False,
     improver_model_name: str | None = None,
-    root: Path = TASKS_ROOT,
+    root: Path | None = None,
 ) -> dict[str, Any]:
     """Run up to `rounds` of Propose -> Probe -> Judge for `skill`."""
     all_tasks = load_tasks(root)
@@ -1225,7 +1225,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.dry_run:
-        all_tasks = load_tasks(TASKS_ROOT)
+        all_tasks = load_tasks(tasks_root())
         pilot_only = bool(args.pilot or _env_pilot())
         for sk in skills:
             tlist = [

@@ -245,19 +245,19 @@ Key design decisions:
 - Modify: `tests/test_skillbench_tasks.py`
 - Create: `tests/test_skillbench_tasks_cli.py`
 
-- [ ] `tasks_root()` resolution (`--tasks` → `suite.tasks_root` → `SKILLBENCH_TASKS_ROOT` → bundled);
+- [x] `tasks_root()` resolution (`--tasks` → `suite.tasks_root` → `SKILLBENCH_TASKS_ROOT` → bundled);
       `tasks.discover("skillbench")`, `freeze`, `check_manifest`, `SkillbenchAdapter` all use it
-- [ ] `skillbench-tasks new --skill X --id Y [--kind suite --family F]`: writes `task.toml`
+- [x] `skillbench-tasks new --skill X --id Y [--kind suite --family F]`: writes `task.toml`
       (`forbidden_terms` auto-filled from the skill name, script names found in its `SKILL.md`, `SKILL.md`;
       `asks_user` pre-set from frontmatter), `rubric.json` with 4 criterion stubs, `fixture/README.md`,
       `verify` stub
-- [ ] `skillbench-tasks check`: `check_prompt`, rubric size 4–8, `user_answers` present for asking tasks,
+- [x] `skillbench-tasks check`: `check_prompt`, rubric size 4–8, `user_answers` present for asking tasks,
       fixture hash, `kind`/`family` validity; table output; non-zero exit on failure
-- [ ] register `skillbench-tasks` console script
-- [ ] write tests: resolution order (4 sources), `discover` honours it, scaffold output, `check` success
+- [x] register `skillbench-tasks` console script
+- [x] write tests: resolution order (4 sources), `discover` honours it, scaffold output, `check` success
       and each failure path (in `test_skillbench_tasks_cli.py`); update `test_skillbench_tasks.py` for the
       moved `user_answers` check
-- [ ] run tests - must pass before task 3
+- [x] run tests - must pass before task 3
 
 ### Task 3: Multi-namespace `build_report` and schema v2 skeleton
 

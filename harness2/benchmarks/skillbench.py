@@ -17,6 +17,8 @@ substrate.
 
 Task model and agy judge (the benchmark adapter builds on both):
 
+    tasks_root         the corpus root: explicit path -> suite.tasks_root -> $SKILLBENCH_TASKS_ROOT
+                       -> the bundled corpus (`TASKS_ROOT`)
     load_task          <root>/<skill>/<task-id>/ -> SkillbenchTask (task.toml + rubric.json + fixture/)
     load_tasks         every task under a corpus root, keyed `<skill>/<task-id>`
     check_prompt       explicit skill invocations / forbidden terms found in a prompt
@@ -37,11 +39,16 @@ Task model and agy judge (the benchmark adapter builds on both):
 
 Task layout::
 
-    <root>/<skill>/<task-id>/
-        task.toml    target_skill, prompt, timeout, [user_answers], [forbidden_terms], [pilot],
-                     [verify], [verify_restore], [asks_user]
+    <root>/<skill>/<task-id>/          kind = "skill" (default): leave-one-out tasks
+    <root>/_suite/<task-id>/           kind = "suite": whole-suite tasks, grouped by `family`
+        task.toml    target_skill (skill tasks), prompt, timeout, [kind], [family], [user_answers],
+                     [forbidden_terms], [pilot], [verify], [verify_restore], [asks_user],
+                     [min_baseline_fail]
         rubric.json  [{"id": ..., "criterion": ...}], 4-8 binary outcome-based criteria
         fixture/     small repo copied into every rollout's working directory
+
+The corpus root is resolved by `tasks_root()`; `skillbench-tasks new` scaffolds a task and
+`skillbench-tasks check` validates a corpus against the active suite.
 
 CLI: `python -m harness2.benchmarks.skillbench freeze [--force] [--root DIR]` and
 `python -m harness2.benchmarks.skillbench check [--root DIR]`.
@@ -87,30 +94,44 @@ from ..substrate.agy import (
     parse_event,
     resolve_agy_bin,
 )
-from .skillbench_suite import SuiteConfig, active_suite, redaction_names, skill_asks_user
+from .skillbench_suite import (
+    SuiteConfig,
+    SuiteError,
+    active_suite,
+    redaction_names,
+    skill_asks_user,
+)
 from .tasks import discover, select
 
 # The bundled corpus. A `skillbench/` directory next to this module holds only data (no
 # `__init__.py`), so `harness2.benchmarks.skillbench` still imports this file.
 TASKS_ROOT = Path(__file__).resolve().with_name("skillbench") / "tasks"
+TASKS_ROOT_ENV = "SKILLBENCH_TASKS_ROOT"
 MANIFEST = "manifest.json"
 MANIFEST_VERSION = 1
 
 TASK_FILE = "task.toml"
 RUBRIC_FILE = "rubric.json"
 FIXTURE_DIR = "fixture"
+# Whole-suite tasks (`kind = "suite"`) live under `<root>/_suite/<task-id>/`.
+SUITE_DIR = "_suite"
+KINDS = ("skill", "suite")
 
 MIN_CRITERIA = 4
 MAX_CRITERIA = 8
 
-_REQUIRED_KEYS = ("target_skill", "prompt", "timeout")
+_REQUIRED_KEYS = ("prompt", "timeout")
 _OPTIONAL_KEYS = (
+    "target_skill",
+    "kind",
+    "family",
     "user_answers",
     "forbidden_terms",
     "pilot",
     "verify",
     "verify_restore",
     "asks_user",
+    "min_baseline_fail",
 )
 _NAME = re.compile(r"[a-z0-9][a-z0-9_\-]*")
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]*")
@@ -140,7 +161,8 @@ class Criterion:
 
 @dataclass(frozen=True)
 class SkillbenchTask:
-    """One frozen skillbench task. `task_id` is `<skill>/<task-id>`; its domain is the skill."""
+    """One frozen skillbench task. `task_id` is `<skill>/<task-id>` (`_suite/<task-id>` for
+    suite tasks); its domain is the skill, or the family for suite tasks."""
 
     task_id: str
     target_skill: str
@@ -155,10 +177,52 @@ class SkillbenchTask:
     verify_restore: tuple[str, ...] = ()
     # `asks_user` from task.toml; None = decide from the skill's SKILL.md (`task_asks_user`).
     asks_user: bool | None = None
+    # "skill" (leave-one-out, `target_skill` set) or "suite" (whole suite, `family` set).
+    kind: str = "skill"
+    family: str | None = None
+    # Criteria the baseline arm must miss (in >= 1 valid rep) for the task to count as
+    # informative for an executor (the hardness flag; never an exclusion).
+    min_baseline_fail: int = 1
 
     @property
     def fixture(self) -> Path:
         return self.dir / FIXTURE_DIR
+
+    @property
+    def domain(self) -> str:
+        """The per-task grouping key: the target skill, or the family of a suite task."""
+        if self.kind == "suite" and self.family:
+            return self.family
+        return self.target_skill
+
+
+# --------------------------------------------------------------------------------------------
+# Corpus root resolution
+# --------------------------------------------------------------------------------------------
+
+
+def tasks_root(
+    explicit: Path | str | None = None, suite: SuiteConfig | None = None
+) -> Path:
+    """The task corpus root: `explicit` (a `--tasks` flag) -> `suite.tasks_root` ->
+    `$SKILLBENCH_TASKS_ROOT` -> the bundled corpus. `suite` defaults to the active suite when
+    one is configured; no suite config at all is not an error here (the bundled corpus
+    needs none), but a configured suite file that fails to load is (`SuiteError`)."""
+    if explicit is not None and str(explicit) != "":
+        return Path(explicit).expanduser()
+    if suite is None:
+        try:
+            suite = active_suite(quiet=True)
+        except SuiteError:
+            raise
+        except config.ConfigError:
+            suite = None
+    if suite is not None and suite.tasks_root is not None:
+        return Path(suite.tasks_root).expanduser()
+    raw = config.env(TASKS_ROOT_ENV)
+    if raw:
+        return Path(str(raw)).expanduser()
+    return TASKS_ROOT
 
 
 # --------------------------------------------------------------------------------------------
@@ -268,6 +332,48 @@ def _load_rubric(path: Path) -> tuple[Criterion, ...]:
     return tuple(out)
 
 
+def _load_kind(meta: dict, toml_path: Path, task_dir: Path) -> tuple[str, str, str | None]:
+    """`(kind, target_skill, family)` from task.toml, checked against the directory layout:
+    skill tasks live in `<root>/<target_skill>/`, suite tasks in `<root>/_suite/` with a
+    `family` and no `target_skill`."""
+    kind = meta.get("kind", "skill")
+    if kind not in KINDS:
+        raise TaskError(f"{toml_path}: kind must be one of {', '.join(KINDS)}, got {kind!r}")
+    family = meta.get("family")
+    if family is not None and (not isinstance(family, str) or not _NAME.fullmatch(family)):
+        raise TaskError(f"{toml_path}: family must be a family name like 'planning'")
+    if kind == "suite":
+        if "target_skill" in meta:
+            raise TaskError(
+                f"{toml_path}: a kind = \"suite\" task benchmarks the whole suite; drop "
+                f"target_skill and name its family instead"
+            )
+        if family is None:
+            raise TaskError(f"{toml_path}: a kind = \"suite\" task needs family = \"<name>\"")
+        if task_dir.parent.name != SUITE_DIR:
+            raise TaskError(
+                f"{toml_path}: kind = \"suite\" tasks go in <root>/{SUITE_DIR}/<task-id>/, not "
+                f"under {task_dir.parent.name!r}"
+            )
+        return kind, "", family
+    if "target_skill" not in meta:
+        raise TaskError(f"{toml_path}: missing required field(s): target_skill")
+    if family is not None:
+        raise TaskError(
+            f"{toml_path}: family applies to kind = \"suite\" tasks only (skill families are "
+            f"defined in suite.toml)"
+        )
+    skill = meta["target_skill"]
+    if not isinstance(skill, str) or not _NAME.fullmatch(skill):
+        raise TaskError(f"{toml_path}: target_skill must be a skill name like 'make-plan'")
+    if task_dir.parent.name != skill:
+        raise TaskError(
+            f"{toml_path}: target_skill {skill!r} but the task lives under "
+            f"{task_dir.parent.name!r}; tasks go in <root>/<target_skill>/<task-id>/"
+        )
+    return kind, skill, None
+
+
 def load_task(task_dir: Path) -> SkillbenchTask:
     """Load and validate `<root>/<skill>/<task-id>/`; raises `TaskError` on any defect."""
     task_dir = Path(task_dir)
@@ -288,14 +394,7 @@ def load_task(task_dir: Path) -> SkillbenchTask:
             f"{', '.join(_REQUIRED_KEYS + _OPTIONAL_KEYS)}"
         )
 
-    skill = meta["target_skill"]
-    if not isinstance(skill, str) or not _NAME.fullmatch(skill):
-        raise TaskError(f"{toml_path}: target_skill must be a skill name like 'make-plan'")
-    if task_dir.parent.name != skill:
-        raise TaskError(
-            f"{toml_path}: target_skill {skill!r} but the task lives under "
-            f"{task_dir.parent.name!r}; tasks go in <root>/<target_skill>/<task-id>/"
-        )
+    kind, skill, family = _load_kind(meta, toml_path, task_dir)
     if not _TASK_ID.fullmatch(task_dir.name):
         raise TaskError(f"{task_dir}: task directory name must match {_TASK_ID.pattern}")
     prompt = meta["prompt"]
@@ -311,8 +410,11 @@ def load_task(task_dir: Path) -> SkillbenchTask:
     asks_user = meta.get("asks_user")
     if asks_user is not None and not isinstance(asks_user, bool):
         raise TaskError(f"{toml_path}: asks_user must be true or false")
+    min_fail = meta.get("min_baseline_fail", 1)
+    if isinstance(min_fail, bool) or not isinstance(min_fail, int) or min_fail < 1:
+        raise TaskError(f"{toml_path}: min_baseline_fail must be a positive integer")
     forbidden = _str_list(meta, "forbidden_terms", toml_path)
-    problems = check_prompt(prompt, [skill], forbidden)
+    problems = check_prompt(prompt, [skill] if skill else [], forbidden)
     if problems:
         raise TaskError(
             f"{toml_path}: prompt invokes the skill explicitly ({'; '.join(problems)}); "
@@ -323,7 +425,7 @@ def load_task(task_dir: Path) -> SkillbenchTask:
         raise TaskError(f"{task_dir / FIXTURE_DIR}: missing (the repo copied into each rollout)")
     verify, verify_restore = _load_verify(meta, toml_path, task_dir / FIXTURE_DIR)
     return SkillbenchTask(
-        task_id=f"{skill}/{task_dir.name}",
+        task_id=f"{task_dir.parent.name}/{task_dir.name}",
         target_skill=skill,
         prompt=prompt,
         timeout=timeout,
@@ -335,6 +437,9 @@ def load_task(task_dir: Path) -> SkillbenchTask:
         verify=verify,
         verify_restore=verify_restore,
         asks_user=asks_user,
+        kind=kind,
+        family=family,
+        min_baseline_fail=min_fail,
     )
 
 
@@ -383,9 +488,10 @@ def task_dirs(root: Path) -> dict[str, Path]:
     }
 
 
-def load_tasks(root: Path = TASKS_ROOT) -> dict[str, SkillbenchTask]:
-    """Every task under `root`, validated, keyed `<skill>/<task-id>` (sorted)."""
-    return {tid: load_task(d) for tid, d in task_dirs(root).items()}
+def load_tasks(root: Path | None = None) -> dict[str, SkillbenchTask]:
+    """Every task under `root` (default: `tasks_root()`), validated, keyed `<skill>/<task-id>`
+    (sorted)."""
+    return {tid: load_task(d) for tid, d in task_dirs(tasks_root(root)).items()}
 
 
 # --------------------------------------------------------------------------------------------
@@ -423,12 +529,13 @@ def _manifest_hash(tasks: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(tasks, sort_keys=True).encode()).hexdigest()
 
 
-def freeze(root: Path = TASKS_ROOT, *, force: bool = False) -> dict:
-    """Validate every task under `root` and write `<root>/manifest.json` (sha256 per task dir).
+def freeze(root: Path | None = None, *, force: bool = False) -> dict:
+    """Validate every task under `root` (default: `tasks_root()`) and write
+    `<root>/manifest.json` (sha256 per task dir).
 
     Refuses to overwrite an existing manifest unless `force`, and to freeze an empty corpus.
     """
-    root = Path(root)
+    root = tasks_root(root)
     path = root / MANIFEST
     if path.exists() and not force:
         raise ManifestError(f"{path} already exists; re-freeze with --force to overwrite it")
@@ -441,10 +548,10 @@ def freeze(root: Path = TASKS_ROOT, *, force: bool = False) -> dict:
     return manifest
 
 
-def check_manifest(root: Path = TASKS_ROOT) -> str:
-    """The manifest hash when every task dir under `root` matches `manifest.json`; otherwise
-    `ManifestError` listing the changed, added and removed tasks."""
-    root = Path(root)
+def check_manifest(root: Path | None = None) -> str:
+    """The manifest hash when every task dir under `root` (default: `tasks_root()`) matches
+    `manifest.json`; otherwise `ManifestError` listing the changed, added and removed tasks."""
+    root = tasks_root(root)
     path = root / MANIFEST
     remedy = f"run `python -m harness2.benchmarks.skillbench freeze --root {root}`"
     if not path.is_file():
@@ -635,7 +742,7 @@ def run_verify(
     run_dir: Path,
     task: SkillbenchTask | str | Path,
     *,
-    root: Path = TASKS_ROOT,
+    root: Path | None = None,
     timeout: int = VERIFY_TIMEOUT_S,
 ) -> dict[str, Any] | None:
     """Run the task's deterministic `verify` command against the agent's work tree.
@@ -766,7 +873,7 @@ def build_judge_prompt(rubric: Iterable[Criterion], scrubbed_deliverable: str) -
     )
 
 
-def _resolve_task(task: SkillbenchTask | str | Path, root: Path) -> SkillbenchTask:
+def _resolve_task(task: SkillbenchTask | str | Path, root: Path | None) -> SkillbenchTask:
     if isinstance(task, SkillbenchTask):
         return task
     if isinstance(task, Path):
@@ -775,7 +882,7 @@ def _resolve_task(task: SkillbenchTask | str | Path, root: Path) -> SkillbenchTa
         p = Path(task)
         if (p / TASK_FILE).is_file():
             return load_task(p)
-        return load_task(Path(root) / task)
+        return load_task(tasks_root(root) / task)
     raise TypeError(f"task must be SkillbenchTask, str, or Path, got {type(task).__name__}")
 
 
@@ -993,7 +1100,7 @@ def score(
     run_dir: Path,
     task: SkillbenchTask | str | Path,
     *,
-    root: Path = TASKS_ROOT,
+    root: Path | None = None,
     timeout: int | None = None,
     suite: SuiteConfig | None = None,
 ) -> dict | None:
@@ -1142,8 +1249,10 @@ class SkillbenchAdapter:
     """The `BenchmarkAdapter` surface for skillbench on the `agy` substrate.
 
     Each adapter instance represents one arm (`"with"` or `"without"`) of the active suite
-    (`suite`, from `--suite` / `SKILLBENCH_SUITE` / the env fallback). Constructing the
-    adapter verifies `check_manifest` against the task corpus root and refuses on drift.
+    (`suite`, from `--suite` / `SKILLBENCH_SUITE` / the env fallback). The task corpus is
+    `root` when given, else `tasks_root(suite=suite)`; constructing the adapter verifies
+    `check_manifest` against it and refuses on drift. Only `kind = "skill"` tasks are
+    scheduled: suite tasks belong to suite arms.
     """
 
     def __init__(
@@ -1165,7 +1274,7 @@ class SkillbenchAdapter:
         self.split_file = split_file
         self._pilot = pilot
         self.suite = suite if suite is not None else active_suite()
-        self._root = Path(TASKS_ROOT if root is None else root)
+        self._root = tasks_root(root, self.suite)
         self.manifest_hash = check_manifest(self._root)
         self._tasks = load_tasks(self._root)
         self.spec = skillbench_spec(runs_root=runs_root)
@@ -1194,9 +1303,11 @@ class SkillbenchAdapter:
             pilot_only = True
         discovered = (
             discover("skillbench")
-            if self._root == TASKS_ROOT
-            else {tid: t.target_skill for tid, t in self._tasks.items()}
+            if self._root == tasks_root(suite=self.suite)
+            else {tid: t.domain for tid, t in self._tasks.items()}
         )
+        # Suite tasks (`kind = "suite"`) are scheduled by suite arms only.
+        discovered = {tid: d for tid, d in discovered.items() if self._tasks[tid].kind == "skill"}
         selected = select(discovered, split, self.split_file, benchmark="skillbench")
         if pilot_only:
             return [tid for tid in selected if self._tasks[tid].pilot]
@@ -1204,7 +1315,7 @@ class SkillbenchAdapter:
 
     def domain_of(self, task_id: str) -> str:
         if task_id in self._tasks:
-            return self._tasks[task_id].target_skill
+            return self._tasks[task_id].domain
         if "/" in task_id:
             skill, rest = task_id.split("/", 1)
             if _NAME.fullmatch(skill) and _TASK_ID.fullmatch(rest):
@@ -1212,7 +1323,7 @@ class SkillbenchAdapter:
         raise ValueError(f"malformed skillbench task_id {task_id!r} (expected '<skill>/<task-id>')")
 
     def reference_domain_order(self) -> list[str]:
-        return sorted({t.target_skill for t in self._tasks.values()})
+        return sorted({t.domain for t in self._tasks.values() if t.kind == "skill"})
 
     def task_prompt(self, task_id: str) -> str:
         return build_prompt(self._get_task(task_id))
@@ -1358,15 +1469,22 @@ def main(argv: list[str] | None = None) -> int:
     fz.add_argument("--force", action="store_true", help="overwrite an existing manifest")
     ck = sub.add_parser("check", help="verify the corpus against manifest.json")
     for p in (fz, ck):
-        p.add_argument("--root", type=Path, default=TASKS_ROOT, help="task corpus root")
+        p.add_argument(
+            "--root",
+            type=Path,
+            default=None,
+            help="task corpus root (default: the active suite's tasks_root, else "
+            "$SKILLBENCH_TASKS_ROOT, else the bundled corpus)",
+        )
     args = ap.parse_args(argv)
+    root = tasks_root(args.root)
     try:
         if args.cmd == "freeze":
-            m = freeze(args.root, force=args.force)
-            print(f"froze {len(m['tasks'])} task(s) -> {args.root / MANIFEST} ({m['hash'][:12]})")
+            m = freeze(root, force=args.force)
+            print(f"froze {len(m['tasks'])} task(s) -> {root / MANIFEST} ({m['hash'][:12]})")
         else:
-            h = check_manifest(args.root)
-            print(f"ok: {args.root / MANIFEST} matches ({h[:12]})")
+            h = check_manifest(root)
+            print(f"ok: {root / MANIFEST} matches ({h[:12]})")
     except (TaskError, ManifestError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

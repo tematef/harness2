@@ -223,6 +223,17 @@ class LoadTaskTest(TmpCase):
             (),
         )
 
+    def test_missing_user_answers_is_reported_by_skillbench_tasks_check(self):
+        from harness2.cli import skillbench_tasks as T
+
+        d = make_task(self.root, "make-plan", "q", user_answers=None, asks_user=True)
+        SB.load_task(d)  # loads fine ...
+        res = T.check_task("make-plan/q", d, suite=None, frozen=None)
+        self.assertFalse(res.ok)  # ... but the corpus check flags it
+        self.assertTrue(any("user_answers" in p for p in res.problems), res.problems)
+        ok = make_task(self.root, "make-plan", "ok", asks_user=True)
+        self.assertTrue(T.check_task("make-plan/ok", ok, suite=None, frozen=None).ok)
+
     def test_asks_user_override_is_parsed_and_validated(self):
         t = SB.load_task(make_task(self.root, "code-review-refactor", "a", asks_user=True))
         self.assertIs(t.asks_user, True)

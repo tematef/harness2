@@ -52,7 +52,7 @@ def discover(bench: str, subset: str | None = None) -> dict[str, str]:
     elif bench == "skillbench" and subset is None:
         from . import skillbench
 
-        root = skillbench.TASKS_ROOT
+        root = skillbench.tasks_root()
         tasks = {tid: d.parent.name for tid, d in skillbench.task_dirs(root).items()}
     else:
         raise ValueError(f"Unknown benchmark/subset: {bench}/{subset}")
