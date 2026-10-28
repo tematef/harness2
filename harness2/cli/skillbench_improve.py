@@ -29,12 +29,14 @@ the skill's tasks (`k` reps), runs deterministic `verify` and the blinded judge,
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import difflib
 import html
 import inspect
 import json
 import os
 import re
+import shlex
 import shutil
 import statistics as st
 import subprocess
@@ -97,6 +99,14 @@ from .skillbench_report import (
     MIN_BASELINE_REPS,
     NEEDS_HARDER_TASKS,
     build_report,
+)
+from .skillbench_summary import (
+    REC_CONSIDER_REMOVING,
+    REC_FIX,
+    REC_NEEDS_HARDER_TASKS,
+    _extract_tokens_delta_pct,
+    _extract_wall_delta_pct,
+    recommend,
 )
 
 
@@ -393,7 +403,23 @@ def _report_skill_ceiling(
         for s_row in summary_rows:
             if not isinstance(s_row, Mapping) or s_row.get("skill") != skill:
                 continue
-            row_model = _str_or_none(s_row.get("model"))
+            by_ex = s_row.get("by_executor")
+            if executor is not None and isinstance(by_ex, Mapping) and executor in by_ex:
+                ex_row = by_ex[executor]
+                if isinstance(ex_row, Mapping):
+                    flagged, c_cnt, t_cnt = _row_is_ceiling(ex_row)
+                    if flagged:
+                        counts = (
+                            f" ({c_cnt}/{t_cnt} tasks at ceiling)"
+                            if c_cnt is not None and t_cnt is not None
+                            else ""
+                        )
+                        return (
+                            True,
+                            f"skill {skill!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {executor!r}{counts}",
+                        )
+                    return False, ""
+            row_model = _str_or_none(s_row.get("model")) or _str_or_none(s_row.get("executor"))
             if executor is not None and row_model is not None and row_model != executor:
                 continue
             flagged, c_cnt, t_cnt = _row_is_ceiling(s_row)
@@ -426,21 +452,171 @@ def _report_skill_ceiling(
     return False, ""
 
 
+def _row_has_cost_overhead(row: Mapping[str, Any]) -> bool:
+    """Whether a summary or skill row shows token or wall-time cost overhead over control."""
+    if row.get("cost_overhead") is True:
+        return True
+    tok_dp = _extract_tokens_delta_pct(row)
+    if tok_dp is not None and tok_dp > 1e-9:
+        return True
+    wall_dp = _extract_wall_delta_pct(row)
+    if wall_dp is not None and wall_dp > 1e-9:
+        return True
+    tok_w = row.get("tokens_with_median", row.get("tokens_median_with"))
+    tok_wo = row.get("tokens_without_median", row.get("tokens_median_without"))
+    if (
+        isinstance(tok_w, (int, float))
+        and not isinstance(tok_w, bool)
+        and isinstance(tok_wo, (int, float))
+        and not isinstance(tok_wo, bool)
+        and tok_wo > 0
+        and float(tok_w) > float(tok_wo) + 1e-9
+    ):
+        return True
+    t_w = row.get("t_total_with_median", row.get("t_total_median_s_with"))
+    t_wo = row.get("t_total_without_median", row.get("t_total_median_s_without"))
+    if (
+        isinstance(t_w, (int, float))
+        and not isinstance(t_w, bool)
+        and isinstance(t_wo, (int, float))
+        and not isinstance(t_wo, bool)
+        and t_wo > 0
+        and float(t_w) > float(t_wo) + 1e-9
+    ):
+        return True
+    return False
+
+
+def _select_from_summary_row(row: Mapping[str, Any], *, all_weak: bool = False) -> bool:
+    """Whether a v2 `summary[]` row is selected (`fix` + `consider removing` by default;
+    `all_weak=True` also selects `inconclusive` with cost overhead)."""
+    rec = str(row.get("recommendation") or "").strip().lower()
+    if not rec:
+        rec = recommend(row)[0].strip().lower()
+    if rec == REC_NEEDS_HARDER_TASKS:
+        return False
+    if rec in (REC_FIX, REC_CONSIDER_REMOVING):
+        return True
+    if all_weak:
+        verdict = str(row.get("verdict") or "").strip().lower()
+        is_inconclusive = verdict == "inconclusive" or rec == "inconclusive" or (
+            not verdict and rec not in ("helps", "hurts")
+        )
+        if is_inconclusive and _row_has_cost_overhead(row):
+            return True
+    return False
+
+
 def select_weak_skills(
     report: Mapping[str, Any],
     *,
     executor: str | None = None,
+    all_weak: bool = False,
+    skill: str | Sequence[str] | None = None,
 ) -> list[str]:
     """Identify skills from a `skillbench` `report.json` that can benefit from improvement.
 
-    A skill is selected when any of the following holds (and it is not flagged
-    `needs harder tasks` for the chosen executor):
-    - `with_mean < 1.0` (missed rubric criteria)
-    - `lift <= 0.0` (no positive lift over WITHOUT)
-    - `verify_with_rate < 1.0` (deterministic test failure)
-    - `tokens_with_median > 1.25 * tokens_without_median` or
-      `t_total_with_median > 1.25 * t_total_without_median` (excessive overhead)
+    - If `skill` is provided (`--skill`), forces selection of the given skill name(s).
+    - When `report` contains v2 `summary[]`: selects skills recommended as `fix` or
+      `consider removing` by default; `all_weak=True` (`--all-weak`) also adds `inconclusive`
+      skills that have token or wall-time cost overhead; skills flagged `needs harder tasks`
+      are skipped.
+    - Falls back to the v1 per-skill heuristic when `summary[]` is absent.
     """
+    if skill is not None:
+        if isinstance(skill, str):
+            forced = [s.strip() for s in skill.split(",") if s.strip()]
+        else:
+            forced = [
+                part.strip()
+                for item in skill
+                for part in str(item).split(",")
+                if part.strip()
+            ]
+        if forced:
+            return list(dict.fromkeys(forced))
+
+    summary_rows = report.get("summary")
+    if isinstance(summary_rows, list):
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for s_row in summary_rows:
+            if not isinstance(s_row, Mapping):
+                continue
+            if str(s_row.get("kind") or "").strip().lower() == "suite":
+                continue
+            sk_name = _str_or_none(s_row.get("skill"))
+            if not sk_name:
+                continue
+            grouped.setdefault(sk_name, []).append(s_row)
+
+        weak_v2: list[str] = []
+        for sk_name, rows_for_sk in grouped.items():
+            eff_row: Mapping[str, Any] | None = None
+            if executor is not None:
+                for cand_r in rows_for_sk:
+                    by_ex = cand_r.get("by_executor")
+                    if isinstance(by_ex, Mapping) and isinstance(by_ex.get(executor), Mapping):
+                        eff_row = {**cand_r, **by_ex[executor]}
+                        break
+                if eff_row is None:
+                    for cand_r in rows_for_sk:
+                        r_mod = _str_or_none(cand_r.get("model")) or _str_or_none(
+                            cand_r.get("executor")
+                        )
+                        if r_mod == executor:
+                            eff_row = cand_r
+                            break
+                if eff_row is None and isinstance(report.get("models"), list):
+                    for m_block in report["models"]:
+                        if isinstance(m_block, Mapping) and m_block.get("executor") == executor:
+                            m_by = m_block.get("by_skill")
+                            if isinstance(m_by, Mapping) and isinstance(m_by.get(sk_name), Mapping):
+                                eff_row = {**rows_for_sk[0], **m_by[sk_name]}
+                                break
+                            for m_r in m_block.get("skills") or []:
+                                if isinstance(m_r, Mapping) and m_r.get("skill") == sk_name:
+                                    eff_row = {**rows_for_sk[0], **m_r}
+                                    break
+                if eff_row is None:
+                    has_explicit_models = any(
+                        _str_or_none(r.get("model")) or _str_or_none(r.get("executor"))
+                        for r in rows_for_sk
+                    )
+                    if not has_explicit_models or len(rows_for_sk) == 1:
+                        eff_row = rows_for_sk[0]
+            else:
+                eff_row = rows_for_sk[0]
+
+            if eff_row is None:
+                continue
+
+            flagged, reason = _report_skill_ceiling(report, sk_name, executor=executor)
+            if not flagged:
+                flagged, c_cnt, t_cnt = _row_is_ceiling(eff_row)
+                if flagged:
+                    ex_str = (
+                        executor
+                        or _str_or_none(eff_row.get("model"))
+                        or _str_or_none(eff_row.get("executor"))
+                        or "default"
+                    )
+                    counts = (
+                        f" ({c_cnt}/{t_cnt} tasks at ceiling)"
+                        if c_cnt is not None and t_cnt is not None
+                        else ""
+                    )
+                    reason = (
+                        f"skill {sk_name!r} is flagged '{NEEDS_HARDER_TASKS}' "
+                        f"for executor {ex_str!r}{counts}"
+                    )
+            if flagged:
+                print(f"skipping {sk_name}: {reason}", flush=True)
+                continue
+
+            if _select_from_summary_row(eff_row, all_weak=all_weak):
+                weak_v2.append(sk_name)
+        return weak_v2
+
     weak: list[str] = []
     raw_skills: Any = None
     if executor is not None and isinstance(report.get("models"), list):
@@ -462,16 +638,21 @@ def select_weak_skills(
     else:
         items = []
 
-    for skill, s in sorted(items, key=lambda pair: pair[0]):
-        flagged, reason = _report_skill_ceiling(report, skill, executor=executor)
+    for sk_name, s in sorted(items, key=lambda pair: pair[0]):
+        flagged, reason = _report_skill_ceiling(report, sk_name, executor=executor)
         if not flagged:
             flagged, c_cnt, t_cnt = _row_is_ceiling(s)
             if flagged:
                 ex_str = executor or _str_or_none(report.get("requested_exec_model")) or "default"
                 counts = f" ({c_cnt}/{t_cnt} tasks at ceiling)" if c_cnt is not None and t_cnt is not None else ""
-                reason = f"skill {skill!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {ex_str!r}{counts}"
+                reason = f"skill {sk_name!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {ex_str!r}{counts}"
         if flagged:
-            print(f"skipping {skill}: {reason}", flush=True)
+            print(f"skipping {sk_name}: {reason}", flush=True)
+            continue
+
+        if s.get("recommendation"):
+            if _select_from_summary_row(s, all_weak=all_weak):
+                weak.append(sk_name)
             continue
 
         mean_w = s.get("with_mean", s.get("mean_with"))
@@ -505,8 +686,10 @@ def select_weak_skills(
             and t_w > 1.25 * t_wo
         ):
             is_weak = True
+        elif all_weak and _row_has_cost_overhead(s):
+            is_weak = True
         if is_weak:
-            weak.append(skill)
+            weak.append(sk_name)
     return weak
 
 
@@ -1051,14 +1234,40 @@ def propose_skill(
 
 def unified_skill_diff(original_md: str, candidate_md: str, *, skill: str) -> str:
     """Unified diff between original and candidate `SKILL.md`."""
+    cand = candidate_md if not candidate_md or candidate_md.endswith("\n") else candidate_md + "\n"
     return "".join(
         difflib.unified_diff(
             original_md.splitlines(keepends=True),
-            candidate_md.splitlines(keepends=True),
+            cand.splitlines(keepends=True),
             fromfile=f"a/skills/{skill}/SKILL.md",
             tofile=f"b/skills/{skill}/SKILL.md",
         )
     )
+
+
+def patch_diff_stat(diff_text: str) -> dict[str, int]:
+    """Count `{files, added, removed}` from a unified diff string (`best.patch`)."""
+    files = 0
+    added = 0
+    removed = 0
+    for line in (diff_text or "").splitlines():
+        if line.startswith("+++ "):
+            files += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    if files == 0 and (added > 0 or removed > 0):
+        files = 1
+    return {"files": files, "added": added, "removed": removed}
+
+
+def format_diff_stat(diff_text: str) -> str:
+    """Format a human-readable diff stat (e.g. `1 file changed, +8/-4 lines`)."""
+    st_map = patch_diff_stat(diff_text)
+    f_cnt = st_map["files"]
+    f_word = "file" if f_cnt == 1 else "files"
+    return f"{f_cnt} {f_word} changed, +{st_map['added']}/-{st_map['removed']} lines"
 
 
 def _judged_scores_map(results_dir: Path) -> dict[tuple[str, str], dict[str, int]]:
@@ -1500,6 +1709,38 @@ def _model_gates_for_skill_record(
     ]
 
 
+def format_decision_line(
+    s: Mapping[str, Any],
+    *,
+    fallback_exec: Any = None,
+    fallback_judge: Any = None,
+) -> str:
+    """Format the top per-skill Decision line:
+    `ACCEPTED on [models] — <reason> (<diff_stat>)` or `REJECTED: <reason> (<diff_stat>)`."""
+    gates = _model_gates_for_skill_record(s, fallback_exec, fallback_judge)
+    raw_models = s.get("models")
+    models_list: list[str] = []
+    if isinstance(raw_models, list):
+        models_list = [str(m).strip() for m in raw_models if str(m).strip()]
+    if not models_list:
+        models_list = [
+            str(g.get("executor")).strip()
+            for g in gates
+            if g.get("executor") and str(g.get("executor")).strip() != "—"
+        ]
+    if not models_list and fallback_exec:
+        models_list = [str(fallback_exec).strip()]
+    models_str = ", ".join(models_list) or "default"
+    dstat = str(s.get("diff_stat_str") or format_diff_stat(str(s.get("diff") or "")))
+    reason = str(s.get("decision_reason") or s.get("skip_reason") or "").strip()
+    if s.get("accepted"):
+        if reason:
+            return f"ACCEPTED on [{models_str}] — {reason} ({dstat})"
+        return f"ACCEPTED on [{models_str}] ({dstat})"
+    reason_out = reason or "candidate did not pass gate"
+    return f"REJECTED: {reason_out} ({dstat})"
+
+
 def render_improve_markdown(record: Mapping[str, Any]) -> str:
     """Render `improve_report.md` for one or more improved skills."""
     fallback_exec = record.get("executor_model")
@@ -1574,12 +1815,15 @@ def render_improve_markdown(record: Mapping[str, Any]) -> str:
         else:
             status = "REJECTED"
         gates = _model_gates_for_skill_record(s, fallback_exec, fallback_judge)
+        decision_line = format_decision_line(
+            s, fallback_exec=fallback_exec, fallback_judge=fallback_judge
+        )
         lines.extend(
             [
                 "",
                 f"## Skill: `{skill}` ({status})",
                 "",
-                f"- **Decision**: {s.get('decision_reason')}",
+                f"- **Decision**: {decision_line}",
                 (
                     f"- **Arm executors**: WITHOUT=`{wo_ex}` | "
                     f"Current WITH=`{cur_ex}` | Candidate WITH=`{cand_ex}`"
@@ -1700,6 +1944,9 @@ def render_improve_html(record: Mapping[str, Any]) -> str:
         )
 
         gates = _model_gates_for_skill_record(s, fallback_exec, fallback_judge)
+        decision_line = format_decision_line(
+            s, fallback_exec=fallback_exec, fallback_judge=fallback_judge
+        )
         gate_rows_html: list[str] = []
         for g in gates:
             g_wo = g.get("without") or {}
@@ -1739,7 +1986,7 @@ def render_improve_html(record: Mapping[str, Any]) -> str:
             f"<div class='bg-[var(--card,#1e293b)] border border-[var(--border,#334155)] rounded-xl p-5 mb-4 shadow-sm'>"
             f"<h3 class='text-base font-semibold mb-2'><code class='font-mono'>{e(skill)}</code> — "
             f"<span class='inline-block rounded-full px-2.5 py-0.5 text-xs font-semibold {badge_cls}'>{badge_txt}</span></h3>"
-            f"<p class='text-sm mb-1'><strong>Decision:</strong> {e(str(s.get('decision_reason') or ''))}</p>"
+            f"<p class='text-sm mb-1' data-decision-line='true'><strong>Decision:</strong> {e(decision_line)}</p>"
             f"<p class='text-xs text-[var(--muted-foreground,#94a3b8)] mb-3'><strong>Arm executors:</strong> "
             f"WITHOUT <code class='font-mono'>{e(wo_ex)}</code> · "
             f"Current WITH <code class='font-mono'>{e(cur_ex)}</code> · "
@@ -2076,6 +2323,273 @@ def _call_probe_candidate(
     return summary
 
 
+def _git_toplevel(target_dir: Path) -> Path | None:
+    """Return the realpath-resolved git work tree root for `target_dir`, or `None`."""
+    if not target_dir.is_dir():
+        return None
+    proc = subprocess.run(
+        ["git", "-C", str(target_dir), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0 or proc.stdout.strip().lower() != "true":
+        return None
+    top_proc = subprocess.run(
+        ["git", "-C", str(target_dir), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if top_proc.returncode != 0 or not top_proc.stdout.strip():
+        return None
+    return Path(os.path.realpath(top_proc.stdout.strip()))
+
+
+def resolve_git_worktree(
+    plugins_dir: Path,
+    skill_path: Path | None = None,
+    *,
+    require_clean: bool = True,
+) -> tuple[Path, Path]:
+    """Resolve `realpath(plugins_dir)` (and symlinked plugin/skill target when applicable),
+    verify it sits inside a git work tree, and verify `git status --porcelain` is clean when
+    `require_clean=True`. Returns `(repo_root, real_plugins_dir)`."""
+    real_plugins_dir = Path(os.path.realpath(plugins_dir))
+    repo_root = _git_toplevel(real_plugins_dir)
+    if repo_root is None and skill_path is not None:
+        real_skill = Path(os.path.realpath(skill_path))
+        if real_skill != skill_path.resolve(strict=False) or skill_path.is_symlink() or any(
+            p.is_symlink() for p in skill_path.parents
+        ):
+            repo_root = _git_toplevel(real_skill.parent)
+            if repo_root is not None:
+                # Re-anchor real_plugins_dir to the checkout's plugins directory
+                real_plugin_dir = real_skill.parent.parent.parent
+                if real_plugin_dir.parent.is_dir():
+                    real_plugins_dir = real_plugin_dir.parent
+    if repo_root is None:
+        raise ValueError(
+            f"cannot --apply: realpath(plugins_dir) {real_plugins_dir} is not inside a git work tree"
+        )
+    if require_clean:
+        status_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_proc.returncode != 0:
+            raise ValueError(
+                f"cannot --apply: git status failed in {repo_root}: {status_proc.stderr.strip()}"
+            )
+        dirty = status_proc.stdout.strip()
+        if dirty:
+            raise ValueError(
+                f"cannot --apply: git work tree at {repo_root} has dirty status "
+                f"(uncommitted changes):\n{dirty}"
+            )
+    return repo_root, real_plugins_dir
+
+
+def build_apply_commit_message(skill: str, skill_record: Mapping[str, Any]) -> str:
+    """Build the git commit message carrying the 3-way numbers for `--apply`."""
+    fallback_exec = (skill_record.get("executors") or {}).get("candidate") or (
+        (skill_record.get("models") or [None])[0]
+    )
+    decision_line = str(
+        skill_record.get("decision_line")
+        or format_decision_line(skill_record, fallback_exec=fallback_exec)
+    )
+    gates = _model_gates_for_skill_record(skill_record, fallback_exec, None)
+    lines = [
+        f"skillbench-improve({skill}): apply accepted SKILL.md candidate",
+        "",
+        f"Decision: {decision_line}",
+    ]
+    if skill_record.get("best_round") is not None:
+        lines.append(f"Winning round: {skill_record.get('best_round')}")
+    if skill_record.get("changes_summary"):
+        lines.append(f"Changes: {skill_record.get('changes_summary')}")
+    lines.append("")
+    lines.append("3-way comparison (WITHOUT -> Current WITH -> Candidate WITH):")
+    for g in gates:
+        ex = g.get("executor") or fallback_exec or "default"
+        wo = g.get("without") if isinstance(g.get("without"), Mapping) else {}
+        cur = g.get("current_with") if isinstance(g.get("current_with"), Mapping) else {}
+        cand = g.get("candidate") if isinstance(g.get("candidate"), Mapping) else {}
+        wo_m = wo.get("mean")
+        cur_m = cur.get("mean")
+        cand_m = cand.get("mean")
+        delta = (
+            cand_m - cur_m
+            if isinstance(cand_m, (int, float)) and isinstance(cur_m, (int, float))
+            else None
+        )
+        wo_v = (wo.get("verify") or {}).get("rate") if isinstance(wo.get("verify"), Mapping) else None
+        cur_v = (cur.get("verify") or {}).get("rate") if isinstance(cur.get("verify"), Mapping) else None
+        cand_v = (cand.get("verify") or {}).get("rate") if isinstance(cand.get("verify"), Mapping) else None
+        wo_t = wo.get("tokens_median")
+        cur_t = cur.get("tokens_median")
+        cand_t = cand.get("tokens_median")
+        wo_w = wo.get("t_total_median_s")
+        cur_w = cur.get("t_total_median_s")
+        cand_w = cand.get("t_total_median_s")
+        lines.append(
+            f"- [{ex}] WITHOUT -> Current WITH -> Candidate WITH: "
+            f"mean={_fmt_num(wo_m)} -> {_fmt_num(cur_m)} -> {_fmt_num(cand_m)} "
+            f"(lift {_fmt_num(delta, '+.2f')}) | "
+            f"verify={_fmt_num(wo_v, 'pct')} -> {_fmt_num(cur_v, 'pct')} -> {_fmt_num(cand_v, 'pct')} | "
+            f"tokens={_fmt_num(wo_t, 'int')} -> {_fmt_num(cur_t, 'int')} -> {_fmt_num(cand_t, 'int')} | "
+            f"wall={_fmt_num(wo_w, '.1f', 's')} -> {_fmt_num(cur_w, '.1f', 's')} -> {_fmt_num(cand_w, '.1f', 's')}"
+        )
+    return "\n".join(lines)
+
+
+def apply_candidate_patch(
+    *,
+    skill: str,
+    patch_path: Path,
+    skill_record: Mapping[str, Any],
+    suite: SuiteConfig | None = None,
+    plugins_dir: Path | None = None,
+    skill_path: Path | None = None,
+    date: str | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Apply `best.patch` onto branch `skillbench/improve-<skill>-<date>` in the git work tree
+    containing `realpath(plugins_dir)`, and commit with the 3-way numbers (never pushing).
+
+    `dry_run=True` is the default: prints the git commands without mutating the checkout.
+    When `dry_run=False` (`--apply`), enforces that `realpath(plugins_dir)` sits inside a git
+    work tree with a clean status (`git status --porcelain`)."""
+    resolved_suite = suite if suite is not None else active_suite()
+    raw_plugins_dir = Path(plugins_dir) if plugins_dir is not None else resolved_suite.plugins_dir
+    raw_skill_path = (
+        Path(skill_path)
+        if skill_path is not None
+        else target_skill_file(skill, resolved_suite)
+    )
+    real_plugins_dir = Path(os.path.realpath(raw_plugins_dir))
+    real_skill_path = Path(os.path.realpath(raw_skill_path))
+    patch_path = Path(os.path.realpath(patch_path))
+
+    date_str = str(date or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d"))
+    branch = f"skillbench/improve-{skill}-{date_str}"
+    commit_msg = build_apply_commit_message(skill, skill_record)
+
+    if not dry_run:
+        repo_root, real_plugins_dir = resolve_git_worktree(
+            raw_plugins_dir, raw_skill_path, require_clean=True
+        )
+    else:
+        try:
+            repo_root, real_plugins_dir = resolve_git_worktree(
+                raw_plugins_dir, raw_skill_path, require_clean=False
+            )
+        except ValueError:
+            repo_root = real_plugins_dir
+
+    try:
+        rel_skill_path = real_skill_path.relative_to(repo_root)
+    except ValueError:
+        rel_skill_path = Path("skills") / skill / "SKILL.md"
+
+    real_plugin_dir = real_skill_path.parent.parent.parent
+    try:
+        rel_plugin_dir = real_plugin_dir.relative_to(repo_root)
+    except ValueError:
+        rel_plugin_dir = Path(".")
+
+    checkout_argv = ["git", "-C", str(repo_root), "checkout", "-b", branch]
+    apply_argv = ["git", "-C", str(repo_root), "apply"]
+    if str(rel_plugin_dir) not in ("", "."):
+        apply_argv.extend(["--directory", str(rel_plugin_dir)])
+    apply_argv.append(str(patch_path))
+    add_argv = ["git", "-C", str(repo_root), "add", str(rel_skill_path)]
+    commit_argv = [
+        "git",
+        "-C",
+        str(repo_root),
+        "commit",
+        "--no-gpg-sign",
+        "-m",
+        commit_msg,
+    ]
+
+    cmd_strings = [
+        shlex.join(checkout_argv),
+        shlex.join(apply_argv),
+        shlex.join(add_argv),
+        shlex.join(commit_argv),
+    ]
+    prefix = "[dry-run --apply]" if dry_run else "[--apply]"
+    for c_str in cmd_strings:
+        print(f"{prefix} {c_str}", flush=True)
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "branch": branch,
+            "commit_message": commit_msg,
+            "commands": cmd_strings,
+            "repo_root": str(repo_root),
+            "real_plugins_dir": str(real_plugins_dir),
+            "applied_to": None,
+            "commit": None,
+        }
+
+    for argv in (checkout_argv, apply_argv, add_argv):
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"git command failed ({shlex.join(argv)}): {proc.stderr.strip() or proc.stdout.strip()}"
+            )
+
+    # Ensure git user.name / user.email have fallbacks if not configured in the environment/repo.
+    name_chk = subprocess.run(
+        ["git", "-C", str(repo_root), "config", "user.name"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    email_chk = subprocess.run(
+        ["git", "-C", str(repo_root), "config", "user.email"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    exec_commit_argv = ["git", "-C", str(repo_root)]
+    if not name_chk.stdout.strip():
+        exec_commit_argv.extend(["-c", "user.name=skillbench-improve"])
+    if not email_chk.stdout.strip():
+        exec_commit_argv.extend(["-c", "user.email=skillbench-improve@local"])
+    exec_commit_argv.extend(["commit", "--no-gpg-sign", "-m", commit_msg])
+    c_proc = subprocess.run(exec_commit_argv, capture_output=True, text=True, check=False)
+    if c_proc.returncode != 0:
+        raise RuntimeError(
+            f"git commit failed in {repo_root}: {c_proc.stderr.strip() or c_proc.stdout.strip()}"
+        )
+
+    sha_proc = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    commit_sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else None
+    return {
+        "dry_run": False,
+        "branch": branch,
+        "commit_message": commit_msg,
+        "commands": cmd_strings,
+        "repo_root": str(repo_root),
+        "real_plugins_dir": str(real_plugins_dir),
+        "applied_to": str(real_skill_path),
+        "commit": commit_sha,
+    }
+
+
 def improve_skill(
     skill: str,
     *,
@@ -2092,6 +2606,7 @@ def improve_skill(
     allow_model_mismatch: bool = False,
     max_growth: float | None = DEFAULT_MAX_GROWTH_PCT,
     suite: SuiteConfig | Path | str | None = None,
+    date: str | None = None,
 ) -> dict[str, Any]:
     """Run up to `rounds` of Propose -> Probe -> Judge for `skill`."""
     all_tasks = load_tasks(root)
@@ -2110,6 +2625,8 @@ def improve_skill(
         else (load_suite(suite) if suite is not None else active_suite())
     )
     skill_path = target_skill_file(skill, resolved_suite)
+    if apply_accepted:
+        resolve_git_worktree(resolved_suite.plugins_dir, skill_path, require_clean=True)
     original_md = skill_path.read_text(encoding="utf-8")
 
     model_cells = _resolve_model_cells(
@@ -2169,7 +2686,7 @@ def improve_skill(
                 }
                 for mod in models_list
             ]
-            return {
+            skipped_rec: dict[str, Any] = {
                 "skill": skill,
                 "skipped": True,
                 "skip_reason": reason,
@@ -2185,6 +2702,8 @@ def improve_skill(
                 "diagnosis": "",
                 "changes_summary": "",
                 "diff": "",
+                "diff_stat": patch_diff_stat(""),
+                "diff_stat_str": format_diff_stat(""),
                 "applied_to": None,
                 "without": without_by_model[primary],
                 "current_with": current_with_by_model[primary],
@@ -2193,6 +2712,10 @@ def improve_skill(
                 "model_gates": skipped_gates,
                 "rounds": [],
             }
+            skipped_rec["decision_line"] = format_decision_line(
+                skipped_rec, fallback_exec=primary
+            )
+            return skipped_rec
 
     skill_out = runs_dir / "improve" / skill
     skill_out.mkdir(parents=True, exist_ok=True)
@@ -2369,15 +2892,11 @@ def improve_skill(
     best_cur = current_with_by_model[primary_model]
 
     best_diff = unified_skill_diff(original_md, best_proposal["skill_markdown"], skill=skill)
+    best_patch_path = skill_out / "best.patch"
     (skill_out / "best_SKILL.md").write_text(best_proposal["skill_markdown"], encoding="utf-8")
-    (skill_out / "best.patch").write_text(best_diff, encoding="utf-8")
+    best_patch_path.write_text(best_diff, encoding="utf-8")
 
-    applied_to: str | None = None
-    if apply_accepted and best_accepted:
-        skill_path.write_text(best_proposal["skill_markdown"], encoding="utf-8")
-        applied_to = str(skill_path)
-
-    return {
+    result_rec: dict[str, Any] = {
         "skill": skill,
         "skipped": False,
         "skip_reason": None,
@@ -2393,7 +2912,9 @@ def improve_skill(
         "diagnosis": best_proposal["diagnosis"],
         "changes_summary": best_proposal["changes_summary"],
         "diff": best_diff,
-        "applied_to": applied_to,
+        "diff_stat": patch_diff_stat(best_diff),
+        "diff_stat_str": format_diff_stat(best_diff),
+        "applied_to": None,
         "without": best_wo,
         "current_with": best_cur,
         "best_candidate": best_summary,
@@ -2401,6 +2922,36 @@ def improve_skill(
         "model_gates": best_gates,
         "rounds": round_records,
     }
+    result_rec["decision_line"] = format_decision_line(
+        result_rec, fallback_exec=primary_model
+    )
+
+    if apply_accepted and best_accepted:
+        apply_info = apply_candidate_patch(
+            skill=skill,
+            patch_path=best_patch_path,
+            skill_record=result_rec,
+            suite=resolved_suite,
+            skill_path=skill_path,
+            date=date,
+            dry_run=False,
+        )
+    else:
+        apply_info = apply_candidate_patch(
+            skill=skill,
+            patch_path=best_patch_path,
+            skill_record=result_rec,
+            suite=resolved_suite,
+            skill_path=skill_path,
+            date=date,
+            dry_run=True,
+        )
+    result_rec["applied_to"] = apply_info["applied_to"]
+    result_rec["apply"] = apply_info
+    result_rec["branch"] = apply_info["branch"]
+    result_rec["commit_message"] = apply_info["commit_message"]
+    result_rec["apply_commands"] = apply_info["commands"]
+    return result_rec
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -2418,12 +2969,20 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--skill",
         default="",
-        help="comma-separated skill name(s) to improve (or pass --auto)",
+        help="comma-separated skill name(s) to force improvement on (overrides summary selection)",
     )
     ap.add_argument(
         "--auto",
         action="store_true",
-        help="automatically select skills with score < 1.0, lift <= 0, or >25%% overhead",
+        help="select weak skills from report.json summary[] (default: fix + consider removing)",
+    )
+    ap.add_argument(
+        "--all-weak",
+        action="store_true",
+        help=(
+            "when selecting weak skills from summary[], also include inconclusive skills "
+            "that have token or wall-time cost overhead"
+        ),
     )
     ap.add_argument(
         "--models",
@@ -2468,12 +3027,16 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--apply",
         action="store_true",
-        help="write accepted candidate SKILL.md back to the suite's plugins_dir checkout",
+        help=(
+            "apply best.patch onto branch skillbench/improve-<skill>-<date> of the "
+            "realpath-resolved plugins_dir git checkout and commit with 3-way numbers "
+            "(requires clean git status; never pushes; dry-run printing the commands is the default)"
+        ),
     )
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="write evidence packet and print selected skills without calling agy",
+        help="write evidence packet and print selected skills and apply commands without calling agy",
     )
     return ap
 
@@ -2490,14 +3053,20 @@ def main(argv: list[str] | None = None) -> int:
     primary_exec = req_models[0] if req_models else None
 
     skills = [s.strip() for s in args.skill.split(",") if s.strip()]
-    if args.auto and not skills:
+    if not skills and (args.auto or args.all_weak or (runs_dir / "report.json").is_file()):
         report_json = runs_dir / "report.json"
-        rep = (
-            json.loads(report_json.read_text(encoding="utf-8"))
-            if report_json.is_file()
-            else build_report(runs_dir, k=args.k, pilot=args.pilot or None)
-        )
-        skills = select_weak_skills(rep, executor=primary_exec)
+        try:
+            rep = (
+                json.loads(report_json.read_text(encoding="utf-8"))
+                if report_json.is_file()
+                else build_report(runs_dir, k=args.k, pilot=args.pilot or None)
+            )
+            skills = select_weak_skills(
+                rep, executor=primary_exec, all_weak=bool(args.all_weak)
+            )
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     if not skills:
         print(
             "error: specify --skill <name> or --auto (with an existing skillbench run)",
@@ -2508,13 +3077,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         all_tasks = load_tasks(tasks_root())
         pilot_only = bool(args.pilot or _env_pilot())
+        resolved_suite = active_suite()
         for sk in skills:
             tlist = [
                 t
                 for t in all_tasks.values()
                 if t.target_skill == sk and (not pilot_only or t.pilot)
             ]
-            md = target_skill_file(sk).read_text(encoding="utf-8")
+            sk_path = target_skill_file(sk, resolved_suite)
+            md = sk_path.read_text(encoding="utf-8")
             ev = build_evidence_packet(
                 skill=sk,
                 current_skill_md=md,
@@ -2528,6 +3099,20 @@ def main(argv: list[str] | None = None) -> int:
             out_p.parent.mkdir(parents=True, exist_ok=True)
             out_p.write_text(ev, encoding="utf-8")
             print(f"[dry-run] {sk}: {len(tlist)} task(s) -> {out_p} ({len(ev)} chars)")
+            patch_p = runs_dir / "improve" / sk / "best.patch"
+            apply_candidate_patch(
+                skill=sk,
+                patch_path=patch_p,
+                skill_record={
+                    "skill": sk,
+                    "accepted": True,
+                    "decision_reason": "dry-run preview",
+                    "models": list(req_models) if req_models else [primary_exec or exec_model()],
+                },
+                suite=resolved_suite,
+                skill_path=sk_path,
+                dry_run=True,
+            )
         return 0
 
     results: dict[str, Any] = {}
@@ -2557,7 +3142,7 @@ def main(argv: list[str] | None = None) -> int:
                 if res.get("skipped")
                 else ("ACCEPTED" if res["accepted"] else "REJECTED")
             )
-            print(f"  [{sk}] {status}: {res['decision_reason']}", flush=True)
+            print(f"  [{sk}] {status}: {res['decision_line']}", flush=True)
     except (ValueError, RuntimeError, config.ConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

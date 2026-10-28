@@ -409,15 +409,15 @@ Key design decisions:
 - Modify: `harness2/cli/skillbench_improve.py`
 - Modify: `tests/test_skillbench_improve.py`
 
-- [ ] `select_weak_skills` reads v2 `summary[]`: default `fix` + `consider removing`; `--all-weak` adds
+- [x] `select_weak_skills` reads v2 `summary[]`: default `fix` + `consider removing`; `--all-weak` adds
       `inconclusive` with cost overhead; `--skill` forces one
-- [ ] `--apply`: `realpath(plugins_dir)` must be inside a git work tree with clean status; branch
+- [x] `--apply`: `realpath(plugins_dir)` must be inside a git work tree with clean status; branch
       `skillbench/improve-<skill>-<date>`; apply `best.patch`; commit with the 3-way numbers; never push;
       dry-run default prints the commands
-- [ ] `improve_report` top "Decision" line per skill: `ACCEPTED on [models]` / `REJECTED: reason` + diff stat
-- [ ] write tests: selection from v2 summary, dry-run output, symlinked `plugins_dir` resolves to the
+- [x] `improve_report` top "Decision" line per skill: `ACCEPTED on [models]` / `REJECTED: reason` + diff stat
+- [x] write tests: selection from v2 summary, dry-run output, symlinked `plugins_dir` resolves to the
       checkout, dirty tree refused, not-a-git-dir refused, commit message content (git repo in `tmp_path`)
-- [ ] run tests - must pass before task 11
+- [x] run tests - must pass before task 11
 
 ### Task 11: `skillbench-cycle` runner
 

@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -982,6 +984,488 @@ class TestSkillbenchImprove(unittest.TestCase):
             self.assertTrue((runs_dir / "improve" / "improve_report.json").is_file())
             self.assertTrue((runs_dir / "improve" / "improve_report.md").is_file())
             self.assertTrue((runs_dir / "improve" / "improve_report.html").is_file())
+
+    def test_select_weak_skills_from_v2_summary_and_flags(self) -> None:
+        v2_report: dict[str, Any] = {
+            "report_schema_version": 2,
+            "summary": [
+                {
+                    "skill": "keep-skill",
+                    "executor": "opus-5.5-high",
+                    "verdict": "helps",
+                    "recommendation": "keep",
+                    "tokens_delta_pct": -10.0,
+                    "wall_delta_pct": -5.0,
+                },
+                {
+                    "skill": "fix-skill",
+                    "executor": "opus-5.5-high",
+                    "verdict": "hurts",
+                    "recommendation": "fix",
+                    "tokens_delta_pct": 15.0,
+                    "wall_delta_pct": 10.0,
+                },
+                {
+                    "skill": "remove-skill",
+                    "executor": "opus-5.5-high",
+                    "verdict": "neutral",
+                    "recommendation": "consider removing",
+                    "tokens_delta_pct": 25.0,
+                    "wall_delta_pct": 20.0,
+                },
+                {
+                    "skill": "inconc-expensive",
+                    "executor": "opus-5.5-high",
+                    "verdict": "neutral",
+                    "recommendation": "inconclusive",
+                    "tokens_delta_pct": 12.0,
+                    "wall_delta_pct": 0.0,
+                },
+                {
+                    "skill": "inconc-cheap",
+                    "executor": "opus-5.5-high",
+                    "verdict": "neutral",
+                    "recommendation": "inconclusive",
+                    "tokens_delta_pct": -5.0,
+                    "wall_delta_pct": -2.0,
+                },
+                {
+                    "skill": "ceiling-skill",
+                    "executor": "opus-5.5-high",
+                    "verdict": "needs harder tasks",
+                    "recommendation": "needs harder tasks",
+                    "ceiling_tasks": 3,
+                    "total_tasks": 3,
+                    "tokens_delta_pct": 5.0,
+                    "wall_delta_pct": 5.0,
+                },
+            ],
+            "skills": {},
+        }
+
+        # 1. Default: selects 'fix' + 'consider removing' and skips 'needs harder tasks'
+        buf_def = io.StringIO()
+        with contextlib.redirect_stdout(buf_def):
+            default_weak = select_weak_skills(v2_report)
+        self.assertEqual(default_weak, ["fix-skill", "remove-skill"])
+        self.assertIn("needs harder tasks", buf_def.getvalue())
+
+        # 2. --all-weak (all_weak=True): adds 'inconclusive' with cost overhead, skips cheap inconclusive
+        buf_all = io.StringIO()
+        with contextlib.redirect_stdout(buf_all):
+            all_weak = select_weak_skills(v2_report, all_weak=True)
+        self.assertEqual(all_weak, ["fix-skill", "remove-skill", "inconc-expensive"])
+
+        # 3. --skill forces one regardless of recommendation
+        self.assertEqual(
+            select_weak_skills(v2_report, skill="keep-skill"),
+            ["keep-skill"],
+        )
+        self.assertEqual(
+            select_weak_skills(v2_report, all_weak=True, skill="inconc-cheap"),
+            ["inconc-cheap"],
+        )
+
+    def test_decision_line_and_diff_stat_in_report(self) -> None:
+        runs_dir = self.tmp / "runs_decision"
+        safe = safe_tid(self.task.task_id)
+        for model in ("opus-5.5-high", "gemini-3.8-flash-high"):
+            for arm, np in (("without", 2), ("with", 3)):
+                _seed_rollout(
+                    runs_dir / "results" / model / arm / f"{safe}__b1",
+                    arm=arm,
+                    n_passed=np,
+                    executor=model,
+                )
+
+        def probe_all_pass(**kwargs: Any) -> dict[str, Any]:
+            ex = kwargs.get("executor") or exec_model()
+            return _make_cand_summary(mean=1.0, executor=ex)
+
+        def probe_all_fail(**kwargs: Any) -> dict[str, Any]:
+            ex = kwargs.get("executor") or exec_model()
+            return _make_cand_summary(mean=0.50, executor=ex)
+
+        with (
+            mock.patch.dict("os.environ", self._base_env(), clear=False),
+            mock.patch(
+                "harness2.cli.skillbench_improve.load_tasks",
+                return_value={self.task.task_id: self.task},
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.propose_skill",
+                return_value=_make_proposal(),
+            ),
+        ):
+            with mock.patch(
+                "harness2.cli.skillbench_improve.probe_candidate",
+                side_effect=probe_all_pass,
+            ):
+                res_acc = improve_skill(
+                    "make-plan",
+                    runs_dir=runs_dir,
+                    k=1,
+                    pilot=True,
+                    models=["opus-5.5-high", "gemini-3.8-flash-high"],
+                )
+            with mock.patch(
+                "harness2.cli.skillbench_improve.probe_candidate",
+                side_effect=probe_all_fail,
+            ):
+                res_rej = improve_skill(
+                    "make-plan",
+                    runs_dir=runs_dir,
+                    k=1,
+                    pilot=True,
+                    models=["opus-5.5-high"],
+                )
+
+        self.assertIn(
+            "ACCEPTED on [opus-5.5-high, gemini-3.8-flash-high]",
+            res_acc["decision_line"],
+        )
+        self.assertIn("1 file changed, +", res_acc["decision_line"])
+        self.assertGreater(res_acc["diff_stat"]["added"], 0)
+        self.assertGreater(res_acc["diff_stat"]["removed"], 0)
+
+        self.assertTrue(res_rej["decision_line"].startswith("REJECTED:"))
+        self.assertIn("rubric score regressed", res_rej["decision_line"])
+        self.assertIn("1 file changed, +", res_rej["decision_line"])
+
+        rec_acc = {
+            "improver_model": "opus-5.5-high",
+            "executor_model": "opus-5.5-high",
+            "models": ["opus-5.5-high", "gemini-3.8-flash-high"],
+            "judge_model": "fable-5.1-high",
+            "include_verdicts": False,
+            "skills": {"make-plan": res_acc, "rejected-skill": res_rej},
+        }
+        md_out = render_improve_markdown(rec_acc)
+        html_out = render_improve_html(rec_acc)
+        self.assertIn(
+            "- **Decision**: ACCEPTED on [opus-5.5-high, gemini-3.8-flash-high]",
+            md_out,
+        )
+        self.assertIn("- **Decision**: REJECTED:", md_out)
+        self.assertIn("1 file changed, +", md_out)
+        self.assertIn("data-decision-line='true'", html_out)
+        self.assertIn("ACCEPTED on [opus-5.5-high, gemini-3.8-flash-high]", html_out)
+        self.assertIn("REJECTED:", html_out)
+
+    def _init_git_plugins_repo(self, repo_dir: Path) -> Path:
+        """Create a clean git repository containing plugins/planning/skills/make-plan/SKILL.md."""
+        plugins_dir = repo_dir / "plugins"
+        skill_dir = plugins_dir / "planning" / "skills" / "make-plan"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (plugins_dir / "planning" / "plugin.json").write_text(
+            '{"name": "cc-thingz-planning"}\n', encoding="utf-8"
+        )
+        (skill_dir / "SKILL.md").write_text(ORIGINAL_SKILL, encoding="utf-8")
+        subprocess.run(["git", "init", str(repo_dir)], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.name", "Test User"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.email", "test@example.com"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "."],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "--no-gpg-sign", "-m", "initial commit"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return plugins_dir
+
+    def test_apply_dry_run_default_prints_commands_without_mutating(self) -> None:
+        repo_dir = self.tmp / "git_dry_repo"
+        git_plugins_dir = self._init_git_plugins_repo(repo_dir)
+        runs_dir = self.tmp / "runs_dry"
+        safe = safe_tid(self.task.task_id)
+        for arm in ("without", "with"):
+            _seed_rollout(
+                runs_dir / "results" / arm / f"{safe}__b1",
+                arm=arm,
+                n_passed=3,
+                executor="opus-5.5-high",
+            )
+
+        env = self._base_env(SKILLBENCH_PLUGINS_DIR=str(git_plugins_dir))
+        with (
+            mock.patch.dict("os.environ", env, clear=False),
+            mock.patch(
+                "harness2.cli.skillbench_improve.load_tasks",
+                return_value={self.task.task_id: self.task},
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.propose_skill",
+                return_value=_make_proposal(),
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.probe_candidate",
+                return_value=_make_cand_summary(mean=1.0, executor="opus-5.5-high"),
+            ),
+        ):
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf):
+                rc = main(
+                    [
+                        "--runs-dir",
+                        str(runs_dir),
+                        "--skill",
+                        "make-plan",
+                        "--k",
+                        "1",
+                        "--pilot",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            stdout_txt = out_buf.getvalue()
+            today = datetime.date.today().isoformat()
+            self.assertIn("[dry-run --apply]", stdout_txt)
+            self.assertIn(f"checkout -b skillbench/improve-make-plan-{today}", stdout_txt)
+            self.assertIn("best.patch", stdout_txt)
+            self.assertIn("commit --no-gpg-sign -m", stdout_txt)
+
+            # Verify SKILL.md was NOT modified and no new branch was created in dry-run mode
+            skill_md = (git_plugins_dir / "planning" / "skills" / "make-plan" / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(skill_md, ORIGINAL_SKILL)
+            log_proc = subprocess.run(
+                ["git", "-C", str(repo_dir), "log", "--oneline"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(len(log_proc.stdout.strip().splitlines()), 1)
+
+    def test_apply_symlinked_plugins_dir_commits_3_way_numbers_and_never_pushes(self) -> None:
+        repo_dir = self.tmp / "git_checkout"
+        git_plugins_dir = self._init_git_plugins_repo(repo_dir)
+
+        # Bare remote to verify --apply never pushes
+        bare_remote = self.tmp / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(bare_remote)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "remote", "add", "origin", str(bare_remote)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # Symlinked plugins_dir (like ~/.gemini/config/plugins/<name> -> checkout/plugins/<name>)
+        symlink_plugins_root = self.tmp / "linked_plugins"
+        symlink_plugins_root.mkdir(parents=True, exist_ok=True)
+        (symlink_plugins_root / "planning").symlink_to(git_plugins_dir / "planning")
+
+        runs_dir = self.tmp / "runs_apply"
+        safe = safe_tid(self.task.task_id)
+        for arm, np in (("without", 2), ("with", 3)):
+            _seed_rollout(
+                runs_dir / "results" / arm / f"{safe}__b1",
+                arm=arm,
+                n_passed=np,
+                executor="opus-5.5-high",
+            )
+
+        env = self._base_env(SKILLBENCH_PLUGINS_DIR=str(symlink_plugins_root))
+        with (
+            mock.patch.dict("os.environ", env, clear=False),
+            mock.patch(
+                "harness2.cli.skillbench_improve.load_tasks",
+                return_value={self.task.task_id: self.task},
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.propose_skill",
+                return_value=_make_proposal(),
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.probe_candidate",
+                return_value=_make_cand_summary(mean=1.0, tokens=42000, wall_s=88.0, executor="opus-5.5-high"),
+            ),
+        ):
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf):
+                rc = main(
+                    [
+                        "--runs-dir",
+                        str(runs_dir),
+                        "--skill",
+                        "make-plan",
+                        "--k",
+                        "1",
+                        "--pilot",
+                        "--apply",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+
+        today = datetime.date.today().isoformat()
+        expected_branch = f"skillbench/improve-make-plan-{today}"
+
+        # 1. Branch switched to skillbench/improve-make-plan-<date>
+        branch_proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(branch_proc.stdout.strip(), expected_branch)
+
+        # 2. SKILL.md inside the real git checkout was updated by best.patch
+        updated_md = (git_plugins_dir / "planning" / "skills" / "make-plan" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(updated_md, CANDIDATE_SKILL)
+
+        # 3. Working tree is clean after commit
+        status_proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status_proc.stdout.strip(), "")
+
+        # 4. Commit message includes the 3-way numbers (WITHOUT -> Current WITH -> Candidate WITH)
+        msg_proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "log", "-1", "--format=%B"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit_msg = msg_proc.stdout
+        self.assertIn("skillbench-improve(make-plan):", commit_msg)
+        self.assertIn("Decision: ACCEPTED on [opus-5.5-high]", commit_msg)
+        self.assertIn("3-way comparison (WITHOUT -> Current WITH -> Candidate WITH):", commit_msg)
+        self.assertIn("mean=0.50 -> 0.75 -> 1.00", commit_msg)
+        self.assertIn("verify=100% -> 100% -> 100%", commit_msg)
+        self.assertIn("tokens=60,000 -> 60,000 -> 42,000", commit_msg)
+        self.assertIn("wall=120.0s -> 120.0s -> 88.0s", commit_msg)
+
+        # 5. Remote bare repository has NO refs (never pushed)
+        remote_refs = subprocess.run(
+            ["git", "--git-dir", str(bare_remote), "for-each-ref"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(remote_refs.stdout.strip(), "")
+
+    def test_apply_refuses_dirty_tree_and_not_a_git_dir(self) -> None:
+        runs_dir = self.tmp / "runs_refuse"
+        safe = safe_tid(self.task.task_id)
+        for arm in ("without", "with"):
+            _seed_rollout(
+                runs_dir / "results" / arm / f"{safe}__b1",
+                arm=arm,
+                n_passed=3,
+                executor="opus-5.5-high",
+            )
+
+        # 1. Not a git directory: self.plugins_dir is in self.tmp (no .git anywhere)
+        with (
+            mock.patch.dict("os.environ", self._base_env(), clear=False),
+            mock.patch(
+                "harness2.cli.skillbench_improve.load_tasks",
+                return_value={self.task.task_id: self.task},
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.propose_skill",
+                return_value=_make_proposal(),
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.probe_candidate",
+                return_value=_make_cand_summary(mean=1.0, executor="opus-5.5-high"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "not inside a git work tree"):
+                improve_skill(
+                    "make-plan",
+                    runs_dir=runs_dir,
+                    k=1,
+                    pilot=True,
+                    apply_accepted=True,
+                )
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc_nogit = main(
+                    [
+                        "--runs-dir",
+                        str(runs_dir),
+                        "--skill",
+                        "make-plan",
+                        "--k",
+                        "1",
+                        "--pilot",
+                        "--apply",
+                    ]
+                )
+            self.assertEqual(rc_nogit, 1)
+            self.assertIn("not inside a git work tree", err_buf.getvalue())
+
+        # 2. Dirty git tree: initialize git repo and leave uncommitted modification
+        dirty_repo = self.tmp / "dirty_repo"
+        dirty_plugins_dir = self._init_git_plugins_repo(dirty_repo)
+        (dirty_repo / "UNTRACKED.txt").write_text("dirty state\n", encoding="utf-8")
+
+        env_dirty = self._base_env(SKILLBENCH_PLUGINS_DIR=str(dirty_plugins_dir))
+        with (
+            mock.patch.dict("os.environ", env_dirty, clear=False),
+            mock.patch(
+                "harness2.cli.skillbench_improve.load_tasks",
+                return_value={self.task.task_id: self.task},
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.propose_skill",
+                return_value=_make_proposal(),
+            ),
+            mock.patch(
+                "harness2.cli.skillbench_improve.probe_candidate",
+                return_value=_make_cand_summary(mean=1.0, executor="opus-5.5-high"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "uncommitted changes"):
+                improve_skill(
+                    "make-plan",
+                    runs_dir=runs_dir,
+                    k=1,
+                    pilot=True,
+                    apply_accepted=True,
+                )
+            err_buf2 = io.StringIO()
+            with contextlib.redirect_stderr(err_buf2):
+                rc_dirty = main(
+                    [
+                        "--runs-dir",
+                        str(runs_dir),
+                        "--skill",
+                        "make-plan",
+                        "--k",
+                        "1",
+                        "--pilot",
+                        "--apply",
+                    ]
+                )
+            self.assertEqual(rc_dirty, 1)
+            self.assertIn("uncommitted changes", err_buf2.getvalue())
 
 
 if __name__ == "__main__":
