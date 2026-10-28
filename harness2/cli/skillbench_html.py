@@ -742,12 +742,20 @@ pre{white-space:pre-wrap}
 """
 
 
-def render_html(report: Mapping[str, Any]) -> str:
-    """Self-contained `report.html` for the skillbench report dictionary (schema v1 or v2); a
-    v2 report with several executors repeats every tab's content once per executor."""
+def render_html(
+    report: Mapping[str, Any],
+    *,
+    history: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Self-contained `report.html` for the skillbench report dictionary (schema v1 or v2);
+    the One-page Summary is the first tab, and a v2 report with several executors repeats
+    each per-model tab's content once per executor."""
+    from .skillbench_summary import render_summary_section_html
+
     models = _models(report)
     multi = len(models) > 1
     tabs = [
+        ("summary", "Summary", render_summary_section_html(report, history=history)),
         ("skills", "Skills", _per_model(report, _skills_tab)),
         ("models", "Models", _models_tab(report)),
         ("tasks", "Tasks & criteria", _per_model(report, _tasks_tab)),

@@ -371,18 +371,18 @@ Key design decisions:
 - Modify: `harness2/cli/skillbench_html.py`
 - Create: `tests/test_skillbench_summary.py`
 
-- [ ] `recommend(row) -> (label, reason)` implementing the precedence in Solution Overview §5 (first match
+- [x] `recommend(row) -> (label, reason)` implementing the precedence in Solution Overview §5 (first match
       wins)
-- [ ] Summary = first page of `report.html` and `summary.md`: one row per skill (and per family in suite
+- [x] Summary = first page of `report.html` and `summary.md`: one row per skill (and per family in suite
       mode): recommendation badge, quality Δ with CI, tokens Δ %, time Δ %, discovery (`inv %`, `t_skill`
       p50), best model, reason; legend with the rule; dashboard tabs follow
-- [ ] `skillbench-report history append` / `history show` on `history.jsonl` next to `suite.toml`;
+- [x] `skillbench-report history append` / `history show` on `history.jsonl` next to `suite.toml`;
       idempotent per `(date, suite_hash, executor, skill)`; inline `<svg>` sparkline per row (lift, tokens Δ)
       with a tick where `suite_hash` changed
-- [ ] `--summary-only` writes just `summary.md` + minimal `summary.html`
-- [ ] write tests: each recommendation branch, precedence when several rules match, reason text, summary
+- [x] `--summary-only` writes just `summary.md` + minimal `summary.html`
+- [x] write tests: each recommendation branch, precedence when several rules match, reason text, summary
       rows from a v2 report, history idempotence, sparkline series, `--summary-only` output set
-- [ ] run tests - must pass before task 9
+- [x] run tests - must pass before task 9
 
 ### Task 9: Improver v2 — same-model probing, rounds, multi-model gate
 

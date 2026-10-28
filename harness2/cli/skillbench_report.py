@@ -79,7 +79,7 @@ from ..core import schedule as SCHED
 from ..substrate.agy import (
     ARM_LABEL_HELP,
     BASELINE_ARM,
-     DEFAULT_EXEC_MODEL,
+    DEFAULT_EXEC_MODEL,
     SUITE_ARM_PREFIX,
     arm_kind,
     exec_model,
@@ -90,6 +90,53 @@ from ..substrate.agy import (
 from . import _common as C
 from .run_sweep import RUN_JSON
 from .skillbench_html import render_html
+from .skillbench_summary import (
+    HISTORY_FILENAME as HISTORY_FILENAME,
+)
+from .skillbench_summary import (
+    REC_CONSIDER_REMOVING as REC_CONSIDER_REMOVING,
+)
+from .skillbench_summary import (
+    REC_FIX as REC_FIX,
+)
+from .skillbench_summary import (
+    REC_KEEP as REC_KEEP,
+)
+from .skillbench_summary import (
+    REC_NEEDS_HARDER_TASKS as REC_NEEDS_HARDER_TASKS,
+)
+from .skillbench_summary import (
+    RECOMMENDATION_LABELS as RECOMMENDATION_LABELS,
+)
+from .skillbench_summary import (
+    RECOMMENDATION_RULE_NOTE,
+    append_history,
+    build_summary,
+    default_history_path,
+    read_history,
+    recommend,
+    render_history_markdown,
+    render_summary_markdown,
+    write_summary,
+)
+from .skillbench_summary import (
+    SparklineSeries as SparklineSeries,
+)
+from .skillbench_summary import (
+    history_records_from_report as history_records_from_report,
+)
+from .skillbench_summary import (
+    render_sparkline_svg as render_sparkline_svg,
+)
+from .skillbench_summary import (
+    render_summary_html as render_summary_html,
+)
+from .skillbench_summary import (
+    render_summary_section_html as render_summary_section_html,
+)
+from .skillbench_summary import (
+    sparkline_series as sparkline_series,
+)
 
 SCHEMA_VERSION = 2
 DEFAULT_BOOTSTRAP_DRAWS = 10_000
@@ -1133,6 +1180,7 @@ def build_report(
     pilot: bool | None = None,
     min_baseline_fail: int | Mapping[str, int] | None = None,
     suites: Iterable[SuiteConfig | Path | str] | str | Path | None = None,
+    history: Sequence[Mapping[str, Any]] | Path | str | None = None,
 ) -> dict[str, Any]:
     """Compute the schema-v2 skillbench report dictionary from a list of `ReportCell`s.
 
@@ -1232,11 +1280,13 @@ def build_report(
         "manifest_hash": manifest_hash,
         "power_note": POWER_NOTE,
         "hardness_note": HARDNESS_NOTE,
+        "recommendation_note": RECOMMENDATION_RULE_NOTE,
         "judge_pairing_note": judge_pairing_note(models),
         "models": models,
         "model_summary": model_summary,
         "skill_matrix": skill_matrix,
     }
+    report["summary"] = build_summary(report, history=history)
     if extra_suites:
         report["extra_suites"] = [
             {"name": sc.name, "hash": sc.suite_hash} for sc in extra_suites
@@ -1673,6 +1723,9 @@ def _build_suites_section(
             **skill_hardness(t["hardness"] for t in tasks_detail.values()),
             "tasks": tasks_detail,
         }
+        rec_lbl, rec_rsn = recommend(row)
+        row["recommendation"] = rec_lbl
+        row["reason"] = rec_rsn
         suite_rows.append(row)
         by_family[family] = row
 
@@ -1901,6 +1954,9 @@ def _model_block(
             "task_deltas": task_deltas,
             "tasks": tasks_detail,
         }
+        rec_lbl, rec_rsn = recommend(row)
+        row["recommendation"] = rec_lbl
+        row["reason"] = rec_rsn
         skill_rows.append(row)
         by_skill[skill] = row
 
@@ -2101,6 +2157,10 @@ def build_skill_matrix(
             ci = srow.get("ci")
             if ci is None and ci_low is not None and ci_high is not None:
                 ci = [ci_low, ci_high]
+            rec_lbl = srow.get("recommendation")
+            rec_rsn = srow.get("reason")
+            if not rec_lbl or not rec_rsn:
+                rec_lbl, rec_rsn = recommend(srow)
             raw_rows.append(
                 {
                     "skill": skill,
@@ -2114,6 +2174,8 @@ def build_skill_matrix(
                     "ci_high": ci_high,
                     "ci": ci,
                     "verdict": str(srow.get("verdict", "insufficient data")),
+                    "recommendation": rec_lbl,
+                    "reason": rec_rsn,
                     "tokens_with_median": tok_w,
                     "tokens_without_median": tok_wo,
                     "tokens_delta_pct": tok_dp,
@@ -2959,16 +3021,25 @@ def render_hardness_markdown(hardness: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_report(report: Mapping[str, Any], out_dir: Path) -> tuple[Path, Path, Path]:
-    """Write `report.json`, `report.md` and `report.html` inside `out_dir`."""
+def write_report(
+    report: Mapping[str, Any],
+    out_dir: Path,
+    *,
+    history: Sequence[Mapping[str, Any]] | Path | str | None = None,
+) -> tuple[Path, Path, Path]:
+    """Write `report.json`, `report.md`, `report.html` and `summary.md` inside `out_dir`."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "report.json"
     md_path = out_dir / "report.md"
     html_path = out_dir / "report.html"
+    summary_md_path = out_dir / "summary.md"
     json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     md_path.write_text(render_markdown(report), encoding="utf-8")
-    html_path.write_text(render_html(report), encoding="utf-8")
+    html_path.write_text(render_html(report, history=history), encoding="utf-8")
+    summary_md_path.write_text(
+        render_summary_markdown(report, history=history), encoding="utf-8"
+    )
     return (json_path, md_path, html_path)
 
 
@@ -3043,6 +3114,12 @@ def _build_parser() -> argparse.ArgumentParser:
     C.add_suite_arg(p)
     C.add_suites_arg(p)
     p.add_argument(
+        "--history",
+        type=Path,
+        default=None,
+        help="path to history.jsonl for sparkline trends (default: history.jsonl next to suite.toml)",
+    )
+    p.add_argument(
         "--hardness-only",
         action="store_true",
         help="print the task x executor hardness table (informative / ceiling / unclassified "
@@ -3050,17 +3127,166 @@ def _build_parser() -> argparse.ArgumentParser:
         "on control-arm namespaces alone, e.g. after `skillbench-matrix --arms baseline`",
     )
     p.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="write only summary.md and minimal summary.html inside --out-dir",
+    )
+    p.add_argument(
         "--out-dir",
         type=Path,
         default=None,
-        help="directory where report.json, report.md and report.html are written",
+        help="directory where report.json, report.md and report.html (or summary.md + summary.html) are written",
     )
     return p
 
 
+def _build_history_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="skillbench-report history",
+        description="Append to or inspect history.jsonl next to suite.toml.",
+        formatter_class=C.HelpFormatter,
+    )
+    sub = p.add_subparsers(dest="action", required=True)
+
+    ap = sub.add_parser(
+        "append",
+        help="idempotently append per-(date, suite_hash, executor, skill) rows to history.jsonl",
+        formatter_class=C.HelpFormatter,
+    )
+    ap.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="optional path to report.json or a results directory",
+    )
+    ap.add_argument("--report", type=Path, default=None, help="path to report.json")
+    ap.add_argument("--history", type=Path, default=None, help="explicit history.jsonl path")
+    ap.add_argument(
+        "--date",
+        default=None,
+        help="override YYYY-MM-DD date stamp for appended history rows",
+    )
+    ap.add_argument("--k", type=int, default=1, help="base rollouts per task in the sweep")
+    ap.add_argument("--seed", type=int, default=None, help="stream-order seed of the sweep")
+    ap.add_argument("--bootstrap-seed", type=int, default=None, help="bootstrap seed")
+    ap.add_argument("--draws", type=int, default=DEFAULT_BOOTSTRAP_DRAWS, help="bootstrap draws")
+    ap.add_argument("--pilot", action="store_true", help="use pilot threshold")
+    ap.add_argument("--runs-root", type=Path, default=None, help="skillbench runs root")
+    ap.add_argument("--with-dir", type=Path, default=None, help="explicit WITH namespace dir")
+    ap.add_argument("--without-dir", type=Path, default=None, help="explicit WITHOUT namespace dir")
+    ap.add_argument("--results-root", type=Path, default=None, help="matrix results directory")
+    C.add_suite_arg(ap)
+    C.add_suites_arg(ap)
+
+    sp = sub.add_parser(
+        "show",
+        help="render history.jsonl rows (optionally filtered by --skill / --executor)",
+        formatter_class=C.HelpFormatter,
+    )
+    sp.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="optional path to history.jsonl or suite.toml",
+    )
+    sp.add_argument("--history", type=Path, default=None, help="explicit history.jsonl path")
+    sp.add_argument("--skill", default=None, help="filter to a single skill or family")
+    sp.add_argument("--executor", default=None, help="filter to a single executor")
+    sp.add_argument("--json", action="store_true", help="emit JSON array instead of Markdown")
+    C.add_suite_arg(sp)
+    return p
+
+
+def _load_or_build_report_for_history(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], Path | None]:
+    report_candidate = args.report or (Path(args.target) if args.target else None)
+    if report_candidate is not None:
+        cand = Path(report_candidate).expanduser()
+        if cand.is_file():
+            data = json.loads(cand.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"{cand}: expected a JSON object")
+            return data, cand.parent
+        if cand.is_dir():
+            rjson = cand / "report.json"
+            if rjson.is_file():
+                data = json.loads(rjson.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError(f"{rjson}: expected a JSON object")
+                return data, cand
+            cells = discover_cells(cand)
+            rep = build_report(
+                cells,
+                k=args.k,
+                seed=args.seed,
+                bootstrap_seed=args.bootstrap_seed,
+                draws=args.draws,
+                pilot=True if args.pilot else None,
+                suites=args.suites,
+            )
+            return rep, cand.parent
+        raise FileNotFoundError(f"report path does not exist: {cand}")
+
+    cells, default_out = _resolve_cells(args)
+    rep = build_report(
+        cells,
+        k=args.k,
+        seed=args.seed,
+        bootstrap_seed=args.bootstrap_seed,
+        draws=args.draws,
+        pilot=True if args.pilot else None,
+        suites=args.suites,
+    )
+    return rep, default_out
+
+
+def _run_history_cli(argv: Sequence[str]) -> int:
+    args = _build_history_parser().parse_args(list(argv))
+    C.apply_suite(args.suite)
+    if args.action == "append":
+        report, fallback_dir = _load_or_build_report_for_history(args)
+        hpath = (
+            Path(args.history).expanduser().resolve()
+            if args.history is not None
+            else default_history_path(args.suite, fallback_dir=fallback_dir)
+        )
+        merged = append_history(hpath, report, date=args.date)
+        print(f"updated {hpath} ({len(merged)} records)")
+        return 0
+    if args.action == "show":
+        if args.history is not None:
+            hpath = Path(args.history).expanduser().resolve()
+        elif args.target is not None:
+            hpath = default_history_path(args.target)
+        else:
+            hpath = default_history_path(args.suite)
+        records = read_history(hpath)
+        if args.json:
+            filtered = [
+                r
+                for r in records
+                if (not args.skill or (r.get("skill") or r.get("family")) == args.skill)
+                and (not args.executor or r.get("executor") == args.executor)
+            ]
+            print(json.dumps(filtered, indent=2))
+        else:
+            print(
+                render_history_markdown(
+                    records, skill=args.skill, executor=args.executor
+                ),
+                end="",
+            )
+        return 0
+    raise ValueError(f"unknown history action: {args.action!r}")
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    eff_argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        if eff_argv and eff_argv[0] == "history":
+            return _run_history_cli(eff_argv[1:])
+        args = _build_parser().parse_args(eff_argv)
         if args.k < 1:
             raise ValueError("--k must be positive")
         C.apply_suite(args.suite)
@@ -3077,9 +3303,19 @@ def main(argv: list[str] | None = None) -> int:
             draws=args.draws,
             pilot=True if args.pilot else None,
             suites=args.suites,
+            history=args.history,
         )
         out_dir = args.out_dir if args.out_dir is not None else default_out
-        json_path, md_path, html_path = write_report(report, out_dir)
+        if args.summary_only:
+            summary_md, summary_html = write_summary(
+                report, out_dir, history=args.history
+            )
+            print(summary_md.read_text(encoding="utf-8"), end="")
+            print(f"wrote {summary_md} and {summary_html}")
+            return 0
+        json_path, md_path, html_path = write_report(
+            report, out_dir, history=args.history
+        )
         print(md_path.read_text(encoding="utf-8"), end="")
         print(f"wrote {md_path}, {json_path} and {html_path}")
         return 0
