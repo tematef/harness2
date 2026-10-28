@@ -65,6 +65,7 @@ agy process spawned.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -77,7 +78,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, Any, Callable, Iterable, Mapping
+from typing import IO, Any, Callable, Iterable, Iterator, Mapping
 
 from .. import config
 from ..benchmarks.skillbench_suite import SuiteConfig, active_suite, load_suite
@@ -849,6 +850,49 @@ def exec_effort() -> str:
             f"SKILLBENCH_EFFORT must be empty or one of {'|'.join(EFFORTS)}, got {raw!r}"
         )
     return raw
+
+
+@contextlib.contextmanager
+def executor_env(
+    executor: str,
+    judge: str | None = None,
+    *,
+    suite: SuiteConfig | Path | str | None = None,
+    runs_root: Path | None = None,
+    matrix: bool = True,
+) -> Iterator[dict[str, str]]:
+    """Temporarily set `SKILLBENCH_EXEC_MODEL`, `SKILLBENCH_JUDGE_MODEL`, `SKILLBENCH_SUITE`,
+    `SKILLBENCH_RUNS_ROOT` and `SKILLBENCH_MATRIX` in `os.environ` for one matrix executor."""
+    keys = (
+        "SKILLBENCH_EXEC_MODEL",
+        "SKILLBENCH_JUDGE_MODEL",
+        "SKILLBENCH_SUITE",
+        "SKILLBENCH_RUNS_ROOT",
+        "SKILLBENCH_MATRIX",
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    updates: dict[str, str] = {"SKILLBENCH_EXEC_MODEL": executor}
+    if judge is not None:
+        updates["SKILLBENCH_JUDGE_MODEL"] = judge
+    if suite is not None:
+        if isinstance(suite, SuiteConfig):
+            if suite.path is not None:
+                updates["SKILLBENCH_SUITE"] = str(suite.path)
+        elif str(suite):
+            updates["SKILLBENCH_SUITE"] = str(Path(suite).expanduser())
+    if runs_root is not None:
+        updates["SKILLBENCH_RUNS_ROOT"] = str(Path(runs_root).expanduser().resolve())
+    if matrix:
+        updates["SKILLBENCH_MATRIX"] = "1"
+    try:
+        os.environ.update(updates)
+        yield updates
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
 
 
 def agy_argv(

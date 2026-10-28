@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -142,6 +143,19 @@ def judge_bases(adapter, ns_dir: Path) -> int:
         return 2
     out = ns_dir / "base_judged.json"
     out.write_text(json.dumps(rows, indent=1, default=str), encoding="utf-8")
+    results_root = getattr(adapter, "_results_root", None)
+    if results_root is not None and Path(results_root) != ns_dir:
+        dst_root = Path(results_root)
+        dst_root.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(out, dst_root / "base_judged.json")
+        for meta in ("config.json", "run.json"):
+            src = ns_dir / meta
+            if src.is_file():
+                shutil.copyfile(src, dst_root / meta)
+        for summary_path in sorted(ns_dir.glob("*/summary.json")):
+            task_dst = dst_root / summary_path.parent.name
+            task_dst.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(summary_path, task_dst / "summary.json")
     graded = sum(1 for r in rows if r["score"] is not None)
     print(f"wrote {out}: {len(rows)} row(s), {graded} graded")
     return 0 if graded == len(rows) else 2

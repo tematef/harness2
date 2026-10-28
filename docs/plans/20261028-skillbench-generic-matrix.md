@@ -333,20 +333,20 @@ Key design decisions:
 - Modify: `pyproject.toml`
 - Create: `tests/test_skillbench_matrix.py`
 
-- [ ] `skillbench-matrix --suite S [--executors a,b,c] [--k 3] [--arms skill|suite|both|baseline]
+- [x] `skillbench-matrix --suite S [--executors a,b,c] [--k 3] [--arms skill|suite|both|baseline]
       [--parallel 3] [--max-rollouts N] [--yes]`: expands `(executor, arm, task, rep)` jobs; per executor
       sets exec/judge model through a context manager and calls `run_sweep.main` then `judge.main`
       in-process; `judge_for` lookup by prefix, same-prefix pair or missing mapping → error
-- [ ] `_check_identity` in `run_sweep.py` includes `suite_hash` and executor; namespaces per executor so
+- [x] `_check_identity` in `run_sweep.py` includes `suite_hash` and executor; namespaces per executor so
       resume skips finished cells across runs
-- [ ] `estimate_budget(jobs, history)`: rollouts, est. wall, est. tokens per executor and total; aborts
+- [x] `estimate_budget(jobs, history)`: rollouts, est. wall, est. tokens per executor and total; aborts
       without `--yes` / TTY confirmation; `--max-rollouts` hard cap; writes `matrix.json` (executors,
       judges, per-cell status, invalid counts by reason)
-- [ ] register `skillbench-matrix` console script
-- [ ] write tests: job expansion for each `--arms` value, judge same-family refused, missing mapping error,
+- [x] register `skillbench-matrix` console script
+- [x] write tests: job expansion for each `--arms` value, judge same-family refused, missing mapping error,
       budget numbers from synthetic history, resume skips finished cells, `--max-rollouts` abort, identity
       mismatch on changed `suite_hash` (runner mocked)
-- [ ] run tests - must pass before task 7
+- [x] run tests - must pass before task 7
 
 ### Task 7: Cross-model report tables
 

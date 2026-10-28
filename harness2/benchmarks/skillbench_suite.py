@@ -127,9 +127,11 @@ class SuiteConfig:
                 f"{executor!r}; add e.g. \"{_family_prefix(executor)}\" = \"<judge model id>\""
             )
         judge = self.judge_for[prefix]
-        if judge.startswith(prefix):
+        fam = _family_prefix(executor)
+        if judge.startswith(prefix) or judge.startswith(fam) or judge == executor:
+            shared = prefix if judge.startswith(prefix) else fam
             raise SuiteError(
-                f"suite {self.name!r}: judge {judge!r} shares the prefix {prefix!r} with "
+                f"suite {self.name!r}: judge {judge!r} shares the prefix {shared!r} with "
                 f"executor {executor!r}; a model must not grade its own family"
             )
         return judge
@@ -346,9 +348,11 @@ def _load_matrix(raw: Any, where: str) -> tuple[tuple[str, ...], dict[str, str]]
                 f"{where}: executor {ex!r} has no [matrix.judge_for] prefix; add e.g. "
                 f"\"{_family_prefix(ex)}\" = \"<judge model id>\""
             )
-        if judge_for[prefix].startswith(prefix):
+        fam = _family_prefix(ex)
+        judge = judge_for[prefix]
+        if judge.startswith(prefix) or judge.startswith(fam) or judge == ex:
             raise SuiteError(
-                f"{where}: judge_for[{prefix!r}] = {judge_for[prefix]!r} shares the executor's "
+                f"{where}: judge_for[{prefix!r}] = {judge!r} shares the executor's "
                 f"prefix; a model must not grade its own family"
             )
     return executors, judge_for

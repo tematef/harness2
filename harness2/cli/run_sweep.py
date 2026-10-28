@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,9 +181,10 @@ def _main(args: argparse.Namespace) -> int:
     runs_root = C.runs_root_for(adapter)
     library_root = C.library_root_for(adapter, args.k, seed=args.seed, tag=tag)
     summary_ns = C.summary_namespace(adapter, args.k, seed=args.seed, tag=tag)
-    _check_identity(adapter, args, runs_root / summary_ns, tag=tag)
+    ns_dir = runs_root / summary_ns
+    _check_identity(adapter, args, ns_dir, tag=tag)
     if args.bench == "skillbench":
-        write_run_json(adapter, runs_root / summary_ns)
+        write_run_json(adapter, ns_dir)
     bases_only = bool(getattr(args, "bases_only", False) or args.bench == "skillbench")
     prop = (
         None
@@ -214,6 +216,8 @@ def _main(args: argparse.Namespace) -> int:
         pool_policy="finals",
         bases_only=bases_only,
     )
+    if args.bench == "skillbench":
+        _sync_results_cell(adapter, ns_dir)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rec = runs_root / "_sweeps" / f"{summary_ns}-{stamp}.json"
@@ -254,6 +258,40 @@ def _main(args: argparse.Namespace) -> int:
 RUN_JSON = "run.json"
 
 
+def _fresh_suite_hash(suite: object) -> str | None:
+    """Recompute `suite_hash` from disk when `plugins_dir` and `plugins` are present so in-memory
+    `SuiteConfig` instances still detect plugin edits between runs."""
+    if suite is None:
+        return None
+    plugins_dir = getattr(suite, "plugins_dir", None)
+    plugins = getattr(suite, "plugins", None)
+    if isinstance(plugins_dir, Path) and isinstance(plugins, tuple) and plugins_dir.is_dir():
+        from ..benchmarks.skillbench_suite import compute_suite_hash
+
+        return compute_suite_hash(plugins_dir, plugins)
+    return getattr(suite, "suite_hash", None)
+
+
+def _sync_results_cell(adapter, ns_dir: Path) -> None:
+    """Mirror `config.json`, `run.json` and `<task>/summary.json` into `adapter._results_root`
+    (`<runs_root>/results/<executor>/<arm>/`) so `discover_cells` finds a self-contained cell."""
+    results_root = getattr(adapter, "_results_root", None)
+    if results_root is None:
+        return
+    dst_root = Path(results_root)
+    if dst_root == ns_dir:
+        return
+    dst_root.mkdir(parents=True, exist_ok=True)
+    for meta in ("config.json", RUN_JSON):
+        src = ns_dir / meta
+        if src.is_file():
+            shutil.copyfile(src, dst_root / meta)
+    for summary_path in sorted(ns_dir.glob("*/summary.json")):
+        task_dst = dst_root / summary_path.parent.name
+        task_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(summary_path, task_dst / "summary.json")
+
+
 def write_run_json(adapter, namespace_dir: Path) -> Path:
     """Record what a skillbench namespace was run with: suite name and `suite_hash`, the
     corpus manifest hash, the arm and the executor / judge model ids. Additive and
@@ -269,10 +307,10 @@ def write_run_json(adapter, namespace_dir: Path) -> Path:
         "arm": getattr(adapter, "arm", None),
         "arm_kind": getattr(adapter, "arm_kind", None),
         "suite": getattr(suite, "name", None),
-        "suite_hash": getattr(suite, "suite_hash", None),
+        "suite_hash": _fresh_suite_hash(suite),
         "suite_path": str(suite.path) if suite is not None and suite.path else None,
         "staged_suite": getattr(staged_suite, "name", None),
-        "staged_suite_hash": getattr(staged_suite, "suite_hash", None),
+        "staged_suite_hash": _fresh_suite_hash(staged_suite),
         "manifest_hash": getattr(adapter, "manifest_hash", None),
         "executor": exec_model(),
         "judge": judge_model(),
@@ -297,11 +335,13 @@ def _check_identity(adapter, args, namespace_dir: Path, tag: str = "") -> None:
             if root is not None
             else (getattr(adapter, "manifest_hash", None) or check_manifest())
         )
+        suite = getattr(adapter, "suite", None)
         identity = {
             "method_version": config.METHOD_VERSION,
             "executor": exec_model(),
             "judge": judge_model(),
             "effort": exec_effort(),
+            "suite_hash": _fresh_suite_hash(suite),
             "manifest_hash": manifest_hash,
             "split": args.split,
             "tasks": _stream_for(adapter, args)[1],

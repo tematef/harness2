@@ -1223,6 +1223,9 @@ SKILLBENCH_PROMPTS = BenchPrompts(
 
 
 def _default_runs_root() -> Path:
+    explicit = config.env("SKILLBENCH_RUNS_ROOT")
+    if explicit:
+        return Path(str(explicit)).expanduser().resolve()
     raw = config.env("HARNESS2_RUNS_DIR")
     base = Path(raw).expanduser().resolve() if raw else config.RUNS
     return base / "skillbench"

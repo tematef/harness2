@@ -29,6 +29,7 @@ from ..core import schedule as SCHED
 from ..core.spec import BenchmarkAdapter
 
 SUITE_ENV = "SKILLBENCH_SUITE"
+MATRIX_ENV = "SKILLBENCH_MATRIX"
 
 BENCHES = ("jb", "wb", "lab", "skillbench")
 WB_SUBSETS = ("office", "web", "code")
@@ -204,9 +205,25 @@ def make_adapter(
     return LabAdapter(substrate=substrate, split_file=split_file)
 
 
+def _matrix_executor_segment(adapter: BenchmarkAdapter) -> str:
+    """Executor path segment when running a skillbench matrix cell (`SKILLBENCH_MATRIX` set),
+    else empty so single-model CLI namespaces stay at `<runs_root>/adapt/<ns>`."""
+    if getattr(adapter.spec, "name", "") != "skillbench":
+        return ""
+    if not str(os.environ.get(MATRIX_ENV) or "").strip():
+        return ""
+    from ..benchmarks.skillbench import _path_segment
+    from ..substrate.agy import exec_model
+
+    raw = getattr(adapter, "executor", None) or exec_model()
+    return _path_segment(str(raw))
+
+
 def runs_root_for(adapter: BenchmarkAdapter) -> Path:
     """Scheduler state: summaries, harnesses and selections, not the rollout store."""
-    return adapter.spec.runs_root / "adapt"
+    base = adapter.spec.runs_root / "adapt"
+    seg = _matrix_executor_segment(adapter)
+    return base / seg if seg else base
 
 
 def library_root_for(adapter: BenchmarkAdapter, k: int, *, seed: int | None, tag: str = "") -> Path:
@@ -216,6 +233,9 @@ def library_root_for(adapter: BenchmarkAdapter, k: int, *, seed: int | None, tag
     """
     SCHED.validate_tag(tag)
     variant = adapter.substrate.name
+    seg = _matrix_executor_segment(adapter)
+    if seg:
+        variant += f"-{seg}"
     if seed is not None:
         variant += f"-s{int(seed)}"
     if tag:
