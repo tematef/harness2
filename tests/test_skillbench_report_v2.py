@@ -68,6 +68,11 @@ def seed_namespace(
     config_json: bool = True,
     seed: int | None = 3,
     shift: int = 0,
+    tokens_with: int = 1000,
+    tokens_without: int = 1000,
+    wall_with: float = 20.0,
+    wall_without: float = 20.0,
+    t_skill_s: float = 2.0,
 ) -> Path:
     """Write a judged arm namespace whose `run_dir`s are relative to `ns_dir`. `shift` lowers
     every WITH score by that many criteria (to make executors differ)."""
@@ -100,6 +105,8 @@ def seed_namespace(
             },
         )
     judged: list[dict[str, Any]] = []
+    arm_tokens = tokens_with if arm == "with" else tokens_without
+    arm_wall = wall_with if arm == "with" else wall_without
     for task_id, arms in sorted(spec.items()):
         task_dir = ns_dir / task_id.replace("/", "__")
         entries = []
@@ -114,15 +121,15 @@ def seed_namespace(
                 run_dir / "skill_timing.json",
                 {
                     "invoked": arm == "with",
-                    "t_skill_s": 2.0 if arm == "with" else None,
+                    "t_skill_s": t_skill_s if arm == "with" else None,
                     "step_idx": 1 if arm == "with" else None,
-                    "t_total_s": 20.0,
+                    "t_total_s": arm_wall,
                     "requested_model": executor or "env-exec",
                     "actual_model": executor or "env-exec",
                     "valid": valid,
                     "invalid_reason": None if valid else "exit 1",
                     "exit_code": 0 if valid else 1,
-                    "total_tokens": 1000,
+                    "total_tokens": arm_tokens,
                 },
             )
             score = {"n_passed": n_passed, "n_criteria": 4} if valid else None
@@ -203,13 +210,21 @@ class _V2Case(unittest.TestCase):
             seed_namespace(root / "without", "without", spec, **kw),
         )
 
-    def _matrix(self, executors: dict[str, dict[str, Any]], root: Path | None = None) -> Path:
+    def _matrix(
+        self,
+        executors: dict[str, dict[str, Any]],
+        root: Path | None = None,
+        *,
+        spec: Spec = THREE_TASKS,
+    ) -> Path:
         """`results/<executor>/<arm>` namespaces; each value is extra kwargs for the executor."""
         root = root or (self.runs_dir / "run-1" / "results")
-        for executor, kw in executors.items():
+        for executor, raw_kw in executors.items():
+            kw = dict(raw_kw)
+            ex_spec = kw.pop("spec", spec)
             kw = {"executor": executor, **kw}
-            seed_namespace(root / executor / "with", "with", THREE_TASKS, **kw)
-            seed_namespace(root / executor / "without", "without", THREE_TASKS, **kw)
+            seed_namespace(root / executor / "with", "with", ex_spec, **kw)
+            seed_namespace(root / executor / "without", "without", ex_spec, **kw)
         return root
 
 
@@ -522,6 +537,277 @@ class TestRenderers(_V2Case):
         md_v1 = SR.render_markdown(v1)
         self.assertNotIn("**Suite**", md_v1)
         self.assertIn("| alpha-skill | 3 | 0.92 | 0.46 |", md_v1)
+
+
+TWO_SKILL_SPEC: Spec = {
+    "alpha/t1": {"with": [4, 3], "without": [2, 1]},
+    "alpha/t2": {"with": [3, 4], "without": [2, 2]},
+    "alpha/t3": {"with": [4, 4], "without": [4, 4]},  # ceiling task
+    "beta/t1": {"with": [3, 3], "without": [2, 2]},
+    "beta/t2": {"with": [4, 2], "without": [2, 2]},
+}
+
+
+class TestCrossModelMatrix(_V2Case):
+    def test_skill_matrix_values_and_best_model_highest_lift(self) -> None:
+        root = self._matrix(
+            {
+                "exec-a": {
+                    "judge": "judge-b",
+                    "tokens_with": 1200,
+                    "tokens_without": 1000,
+                    "wall_with": 30.0,
+                    "wall_without": 20.0,
+                    "t_skill_s": 1.5,
+                },
+                "exec-c": {
+                    "judge": "judge-d",
+                    "shift": 1,
+                    "tokens_with": 800,
+                    "tokens_without": 1000,
+                    "wall_with": 15.0,
+                    "wall_without": 20.0,
+                    "t_skill_s": 3.0,
+                },
+            },
+            spec=TWO_SKILL_SPEC,
+        )
+        rep = SR.build_report(root, draws=100, bootstrap_seed=7)
+        matrix = rep["skill_matrix"]
+        self.assertEqual(sorted(matrix.keys()), ["alpha", "beta"])
+
+        alpha = matrix["alpha"]
+        self.assertEqual(alpha["best_model"], "exec-a")
+        self.assertEqual([r["executor"] for r in alpha["rows"]], ["exec-a", "exec-c"])
+
+        row_a, row_c = alpha["rows"]
+        # alpha for exec-a: t1=(0.875-0.375)=0.5, t2=(0.875-0.5)=0.375, t3=(1.0-1.0)=0.0 -> mean=0.2916667
+        self.assertAlmostEqual(row_a["lift"], (0.5 + 0.375 + 0.0) / 3.0)
+        self.assertTrue(row_a["is_best_model"])
+        self.assertEqual(row_a["best_model"], "exec-a")
+        self.assertEqual(row_a["tokens_with_median"], 1200.0)
+        self.assertEqual(row_a["tokens_without_median"], 1000.0)
+        self.assertAlmostEqual(row_a["tokens_delta_pct"], 20.0)
+        self.assertEqual(row_a["t_total_with_median"], 30.0)
+        self.assertEqual(row_a["t_total_without_median"], 20.0)
+        self.assertAlmostEqual(row_a["wall_delta_pct"], 50.0)
+        self.assertEqual(row_a["invoked"], 6)
+        self.assertEqual(row_a["valid_with_reps"], 6)
+        self.assertAlmostEqual(row_a["invocation_rate"], 1.0)
+        self.assertAlmostEqual(row_a["t_skill_p50"], 1.5)
+        self.assertAlmostEqual(row_a["t_skill_p90"], 1.5)
+        self.assertEqual(row_a["ceiling_tasks"], 1)
+        self.assertEqual(row_a["total_tasks"], 3)
+
+        self.assertFalse(row_c["is_best_model"])
+        self.assertEqual(row_c["best_model"], "exec-a")
+        self.assertEqual(row_c["tokens_with_median"], 800.0)
+        self.assertEqual(row_c["tokens_without_median"], 1000.0)
+        self.assertAlmostEqual(row_c["tokens_delta_pct"], -20.0)
+        self.assertAlmostEqual(row_c["wall_delta_pct"], -25.0)
+        self.assertAlmostEqual(row_c["t_skill_p50"], 3.0)
+
+        # Annotated on per-model skill rows too.
+        self.assertTrue(rep["models"][0]["by_skill"]["alpha"]["is_best_model"])
+        self.assertFalse(rep["models"][1]["by_skill"]["alpha"]["is_best_model"])
+        self.assertEqual(rep["models"][1]["by_skill"]["alpha"]["best_model"], "exec-a")
+
+    def test_best_model_tie_break_by_fewest_tokens(self) -> None:
+        root = self._matrix(
+            {
+                "exec-heavy": {
+                    "judge": "judge-b",
+                    "tokens_with": 1500,
+                    "tokens_without": 1000,
+                    "wall_with": 30.0,
+                    "wall_without": 20.0,
+                },
+                "exec-lean": {
+                    "judge": "judge-d",
+                    "tokens_with": 900,
+                    "tokens_without": 1000,
+                    "wall_with": 15.0,
+                    "wall_without": 20.0,
+                },
+            }
+        )
+        rep = SR.build_report(root, draws=100, bootstrap_seed=7)
+        alpha = rep["skill_matrix"]["alpha"]
+        # Both executors have identical scores on THREE_TASKS, so lift is tied; exec-lean wins on tokens.
+        self.assertAlmostEqual(
+            alpha["by_executor"]["exec-heavy"]["lift"],
+            alpha["by_executor"]["exec-lean"]["lift"],
+        )
+        self.assertEqual(alpha["best_model"], "exec-lean")
+        self.assertFalse(alpha["by_executor"]["exec-heavy"]["is_best_model"])
+        self.assertTrue(alpha["by_executor"]["exec-lean"]["is_best_model"])
+
+        # Direct unit checks for secondary tie-breakers and null-lift rows.
+        self.assertEqual(
+            SR.pick_best_model(
+                [
+                    {
+                        "executor": "m1",
+                        "lift": 0.25,
+                        "tokens_with_median": 500,
+                        "tokens_without_median": 600,
+                    },
+                    {
+                        "executor": "m2",
+                        "lift": 0.25,
+                        "tokens_with_median": 500,
+                        "tokens_without_median": 400,
+                    },
+                ]
+            ),
+            "m2",
+        )
+        self.assertIsNone(
+            SR.pick_best_model([{"executor": "m1", "lift": None}, {"executor": "m2", "lift": None}])
+        )
+
+    def test_model_level_summary_sums_and_invalid_rate(self) -> None:
+        spec_with_invalid: Spec = {
+            **TWO_SKILL_SPEC,
+            "beta/t2": {"with": [4, None], "without": [2, 2]},  # 1 invalid rollout in WITH
+        }
+        root = self._matrix(
+            {
+                "exec-a": {
+                    "judge": "judge-b",
+                    "spec": TWO_SKILL_SPEC,
+                    "tokens_with": 1200,
+                    "tokens_without": 800,
+                    "wall_with": 25.0,
+                    "wall_without": 15.0,
+                },
+                "exec-b": {
+                    "judge": "judge-c",
+                    "spec": spec_with_invalid,
+                    "tokens_with": 1000,
+                    "tokens_without": 600,
+                    "wall_with": 20.0,
+                    "wall_without": 10.0,
+                },
+            }
+        )
+        rep = SR.build_report(root, draws=50)
+        summary = {row["executor"]: row for row in rep["model_summary"]}
+        self.assertEqual(list(summary.keys()), ["exec-a", "exec-b"])
+
+        sa = summary["exec-a"]
+        # 5 tasks x 2 reps = 10 valid WITH reps + 10 valid WITHOUT reps = 20 rollouts total.
+        self.assertEqual(sa["n_skills"], 2)
+        self.assertEqual(sa["total_tokens"], 10 * 1200 + 10 * 800)
+        self.assertAlmostEqual(sa["total_wall_s"], 10 * 25.0 + 10 * 15.0)
+        self.assertEqual(sa["valid_total"], 20)
+        self.assertEqual(sa["invalid_total"], 0)
+        self.assertEqual(sa["total_rollouts"], 20)
+        self.assertAlmostEqual(sa["invalid_rate"], 0.0)
+        expected_mean_a = (
+            rep["models"][0]["by_skill"]["alpha"]["lift"]
+            + rep["models"][0]["by_skill"]["beta"]["lift"]
+        ) / 2.0
+        self.assertAlmostEqual(sa["mean_lift"], expected_mean_a)
+
+        sb = summary["exec-b"]
+        # 9 valid WITH reps + 10 valid WITHOUT reps = 19 valid out of 20 total rollouts (1 invalid).
+        self.assertEqual(sb["total_tokens"], 9 * 1000 + 10 * 600)
+        self.assertAlmostEqual(sb["total_wall_s"], 9 * 20.0 + 10 * 10.0)
+        self.assertEqual(sb["valid_total"], 19)
+        self.assertEqual(sb["invalid_total"], 1)
+        self.assertEqual(sb["total_rollouts"], 20)
+        self.assertAlmostEqual(sb["invalid_rate"], 1 / 20)
+
+    def test_markdown_and_html_contain_matrix_and_model_summary_cells(self) -> None:
+        spec_c: Spec = {
+            **THREE_TASKS,
+            "alpha/t3": {"with": [4, None], "without": [3, 1]},  # 1 invalid rollout
+        }
+        root = self._matrix(
+            {
+                "claude-opus": {
+                    "judge": "gpt-5.4",
+                    "tokens_with": 1500,
+                    "tokens_without": 1000,
+                    "wall_with": 30.0,
+                    "wall_without": 20.0,
+                },
+                "gemini-pro": {
+                    "judge": "claude-opus",
+                    "tokens_with": 900,
+                    "tokens_without": 1000,
+                    "wall_with": 15.0,
+                    "wall_without": 20.0,
+                },
+                "gpt-5.4": {
+                    "judge": "claude-opus",
+                    "spec": spec_c,
+                    "shift": 1,
+                    "tokens_with": 1100,
+                    "tokens_without": 1000,
+                    "wall_with": 22.0,
+                    "wall_without": 20.0,
+                },
+            }
+        )
+        rep = SR.build_report(root, draws=100, bootstrap_seed=7)
+
+        # Judge pairing legend explains cross-family pairing and shared judge across 3 families.
+        note = rep["judge_pairing_note"]
+        self.assertIn("`claude-opus` → `gpt-5.4`", note)
+        self.assertIn("`gemini-pro` → `claude-opus`", note)
+        self.assertIn("`gpt-5.4` → `claude-opus`", note)
+        self.assertIn("`claude-opus` grades `gemini-pro`, `gpt-5.4`", note)
+        self.assertIn("two executors share a judge under cross-family", note)
+
+        md = SR.render_markdown(rep)
+        self.assertIn("## Model summary", md)
+        self.assertIn(f"- **Legend**: {note}", md)
+        self.assertIn(
+            "| executor | judge | skills | mean lift | total tokens | total wall | invalid rate |",
+            md,
+        )
+        # claude-opus: 6*1500 + 6*1000 = 15000 tokens, 6*30 + 6*20 = 300s, 0/12 (0%)
+        self.assertIn("| claude-opus | gpt-5.4 | 1 | +0.46 | 15000 | 300s | 0/12 (0%) |", md)
+        # gemini-pro: 6*900 + 6*1000 = 11400 tokens, 6*15 + 6*20 = 210s, 0/12 (0%)
+        self.assertIn("| gemini-pro | claude-opus | 1 | +0.46 | 11400 | 210s | 0/12 (0%) |", md)
+        # gpt-5.4: 5*1100 + 6*1000 = 11500 tokens, 5*22 + 6*20 = 230s, 1/12 (8%)
+        self.assertIn("| gpt-5.4 | claude-opus | 1 | +0.21 | 11500 | 230s | 1/12 (8%) |", md)
+
+        self.assertIn("## Skill × executor matrix", md)
+        # claude-opus and gemini-pro tie on lift (+0.4583); gemini-pro wins best_model on fewer tokens.
+        self.assertIn("### `alpha` (best model: `gemini-pro`)", md)
+        self.assertIn(
+            "| executor | lift [95% CI] | verdict | tokens p50 W/WO (Δ %) "
+            "| wall p50 W/WO (Δ %) | invocation | t_skill p50/p90 | ceiling/total |",
+            md,
+        )
+        self.assertIn("1500 / 1000 (+50%) | 30s / 20s (+50%) | 6/6 (100%) | 2.0s / 2.0s | 0/3 |", md)
+        self.assertIn("gemini-pro ★ (best)", md)
+        self.assertIn("900 / 1000 (-10%) | 15s / 20s (-25%) | 6/6 (100%) | 2.0s / 2.0s | 0/3 |", md)
+        self.assertIn("1100 / 1000 (+10%) | 22s / 20s (+10%) | 5/5 (100%) | 2.0s / 2.0s | 0/3 |", md)
+
+        page = SR.render_html(rep)
+        self.assertIn('data-tab="models"', page)
+        self.assertIn('data-panel="models"', page)
+        parser = _TextCollector()
+        parser.feed(page)
+        text = " ".join(parser.text)
+        self.assertIn("Models", text)
+        self.assertIn("Model summary", text)
+        self.assertIn("two executors share a judge under cross-family", text)
+        self.assertIn("15000", text)
+        self.assertIn("300s", text)
+        self.assertIn("11400", text)
+        self.assertIn("210s", text)
+        self.assertIn("1/12 (8%)", text)
+        self.assertIn("★ (best)", text)
+        self.assertIn("(best model: gemini-pro)", text)
+        self.assertIn("1500 / 1000 (+50%)", text)
+        self.assertIn("30s / 20s (+50%)", text)
+        self.assertIn("900 / 1000 (-10%)", text)
+        self.assertIn("15s / 20s (-25%)", text)
 
 
 if __name__ == "__main__":

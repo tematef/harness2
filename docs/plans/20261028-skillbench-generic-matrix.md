@@ -355,13 +355,13 @@ Key design decisions:
 - Modify: `harness2/cli/skillbench_html.py`
 - Modify: `tests/test_skillbench_report_v2.py`
 
-- [ ] matrix table per skill: rows = executors; columns = lift [CI], verdict, tokens p50 W/WO (Δ %), wall
+- [x] matrix table per skill: rows = executors; columns = lift [CI], verdict, tokens p50 W/WO (Δ %), wall
       p50 W/WO (Δ %), invocation, `t_skill` p50/p90, ceiling/total; `best_model` marker (highest lift,
       ties → fewest tokens)
-- [ ] model-level summary per executor: mean lift across skills, total tokens, total wall, invalid rate
-- [ ] markdown renderer mirrors both tables; HTML gets a "Models" tab; legend states the judge pairing
-- [ ] write tests: matrix values, best-model tie-break, model-level sums, markdown/HTML contain the cells
-- [ ] run tests - must pass before task 8
+- [x] model-level summary per executor: mean lift across skills, total tokens, total wall, invalid rate
+- [x] markdown renderer mirrors both tables; HTML gets a "Models" tab; legend states the judge pairing
+- [x] write tests: matrix values, best-model tie-break, model-level sums, markdown/HTML contain the cells
+- [x] run tests - must pass before task 8
 
 ### Task 8: One-page Summary, recommendations and history trend
 

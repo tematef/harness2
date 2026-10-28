@@ -795,6 +795,56 @@ def _median(vals: Iterable[float | int | None]) -> float | None:
     return float(st.median(clean)) if clean else None
 
 
+def _delta_pct(treatment: float | None, control: float | None) -> float | None:
+    """Percentage change `(treatment - control) / control * 100` when both medians are known
+    and `control > 0`."""
+    if (
+        treatment is None
+        or control is None
+        or isinstance(treatment, bool)
+        or isinstance(control, bool)
+        or control <= 0
+    ):
+        return None
+    return (float(treatment) - float(control)) / float(control) * 100.0
+
+
+def pick_best_model(rows: Sequence[Mapping[str, Any]]) -> str | None:
+    """Best executor for a skill across models: highest `lift`; ties broken by fewest tokens
+    (`tokens_with_median`, then `tokens_without_median`, then `total_tokens`, then row order).
+    Returns `None` when no row has a non-null `lift`."""
+    candidates: list[tuple[float, float, float, int, str]] = []
+    for idx, row in enumerate(rows):
+        lift = row.get("lift")
+        executor = row.get("executor") or row.get("requested_exec_model")
+        if lift is None or isinstance(lift, bool) or not executor:
+            continue
+        tok_w = row.get("tokens_with_median")
+        if tok_w is None:
+            tok_w = row.get("tokens_suite_median")
+        if tok_w is None:
+            tok_w = row.get("total_tokens")
+        tok_wo = row.get("tokens_without_median")
+        if tok_wo is None:
+            tok_wo = row.get("tokens_baseline_median")
+        key_lift = -round(float(lift), 9)
+        key_tok_w = (
+            float(tok_w)
+            if tok_w is not None and not isinstance(tok_w, bool)
+            else float("inf")
+        )
+        key_tok_wo = (
+            float(tok_wo)
+            if tok_wo is not None and not isinstance(tok_wo, bool)
+            else float("inf")
+        )
+        candidates.append((key_lift, key_tok_w, key_tok_wo, idx, str(executor)))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][4]
+
+
 def _verify_counts(recs: Sequence[_RepRecord]) -> tuple[int, int, float | None]:
     checked = [r.verify_passed for r in recs if r.valid and r.verify_passed is not None]
     passed = sum(1 for v in checked if v)
@@ -1167,6 +1217,10 @@ def build_report(
             )
         )
 
+    _annotate_best_models(models)
+    skill_matrix = build_skill_matrix(models)
+    model_summary = build_model_summary(models)
+
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "suite": suite_meta,
@@ -1178,7 +1232,10 @@ def build_report(
         "manifest_hash": manifest_hash,
         "power_note": POWER_NOTE,
         "hardness_note": HARDNESS_NOTE,
+        "judge_pairing_note": judge_pairing_note(models),
         "models": models,
+        "model_summary": model_summary,
+        "skill_matrix": skill_matrix,
     }
     if extra_suites:
         report["extra_suites"] = [
@@ -1552,10 +1609,12 @@ def _build_suites_section(
                 "tokens_with_median": tok_suite_med,
                 "tokens_baseline_median": tok_base_med,
                 "tokens_without_median": tok_base_med,
+                "tokens_delta_pct": _delta_pct(tok_suite_med, tok_base_med),
                 "t_total_suite_median": wall_suite_med,
                 "t_total_with_median": wall_suite_med,
                 "t_total_baseline_median": wall_base_med,
                 "t_total_without_median": wall_base_med,
+                "wall_delta_pct": _delta_pct(wall_suite_med, wall_base_med),
                 "task_deltas": task_deltas,
             }
 
@@ -1794,6 +1853,10 @@ def _model_block(
         vw_pass, vw_total, vw_rate = _verify_counts(s_with)
         vu_pass, vu_total, vu_rate = _verify_counts(s_without)
         valid_without = [r for r in s_without if r.valid]
+        tok_with_med = _median(r.total_tokens for r in valid_with)
+        tok_without_med = _median(r.total_tokens for r in valid_without)
+        wall_with_med = _median(r.t_total_s for r in valid_with)
+        wall_without_med = _median(r.t_total_s for r in valid_without)
 
         row = {
             "skill": skill,
@@ -1828,10 +1891,12 @@ def _model_block(
             "verify_without_rate": vu_rate,
             "diff_lines_with_median": _median(r.diff_lines for r in valid_with),
             "diff_lines_without_median": _median(r.diff_lines for r in valid_without),
-            "tokens_with_median": _median(r.total_tokens for r in valid_with),
-            "tokens_without_median": _median(r.total_tokens for r in valid_without),
-            "t_total_with_median": _median(r.t_total_s for r in valid_with),
-            "t_total_without_median": _median(r.t_total_s for r in valid_without),
+            "tokens_with_median": tok_with_med,
+            "tokens_without_median": tok_without_med,
+            "tokens_delta_pct": _delta_pct(tok_with_med, tok_without_med),
+            "t_total_with_median": wall_with_med,
+            "t_total_without_median": wall_without_med,
+            "wall_delta_pct": _delta_pct(wall_with_med, wall_without_med),
             **skill_hardness(t["hardness"] for t in tasks_detail.values()),
             "task_deltas": task_deltas,
             "tasks": tasks_detail,
@@ -1870,6 +1935,18 @@ def _model_block(
         for tid, t in row["tasks"].items()
     }
 
+    lifts = [float(r["lift"]) for r in skill_rows if r.get("lift") is not None]
+    if not lifts and suite_rows:
+        lifts = [float(r["lift"]) for r in suite_rows if r.get("lift") is not None]
+    mean_lift: float | None = float(st.mean(lifts)) if lifts else None
+    total_tokens = sum(int(r.total_tokens) for r in valid_recs if r.total_tokens is not None)
+    total_wall_s = float(sum(float(r.t_total_s) for r in valid_recs if r.t_total_s is not None))
+    total_rollouts = len(all_recs)
+    valid_total = len(valid_recs)
+    invalid_rate: float | None = (
+        (overall_invalid_total / total_rollouts) if total_rollouts > 0 else None
+    )
+
     return {
         "executor": executor,
         "judge": judge,
@@ -1885,7 +1962,14 @@ def _model_block(
         "judge_noise_rate": noise_rate,
         "judge_noise_disagreed": noise_disagreed,
         "judge_noise_total": noise_total,
+        "mean_lift": mean_lift,
+        "total_tokens": total_tokens,
+        "total_wall_s": total_wall_s,
+        "total_wall": total_wall_s,
+        "valid_total": valid_total,
+        "total_rollouts": total_rollouts,
         "invalid_total": overall_invalid_total,
+        "invalid_rate": invalid_rate,
         "invalid_by_reason": dict(sorted(overall_invalid_by_reason.items())),
         "skills": skill_rows,
         "by_skill": by_skill,
@@ -1902,6 +1986,329 @@ def models_of(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if isinstance(models, list) and models:
         return [m for m in models if isinstance(m, Mapping)]
     return [report]
+
+
+def _model_exec_name(model: Mapping[str, Any]) -> str:
+    return str(model.get("executor") or model.get("requested_exec_model") or "executor")
+
+
+def _model_judge_name(model: Mapping[str, Any]) -> str:
+    return str(model.get("judge") or model.get("requested_judge_model") or "judge")
+
+
+def _skill_rows_of(model: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    by_skill = model.get("by_skill")
+    if isinstance(by_skill, Mapping) and by_skill:
+        return {
+            str(k): dict(v)
+            for k, v in by_skill.items()
+            if isinstance(v, Mapping)
+        }
+    out: dict[str, dict[str, Any]] = {}
+    for row in model.get("skills") or []:
+        if isinstance(row, Mapping) and row.get("skill"):
+            out[str(row["skill"])] = dict(row)
+    return out
+
+
+def _annotate_best_models(models: Sequence[dict[str, Any]]) -> None:
+    """Populate `best_model` and `is_best_model` on every per-skill and per-family row across
+    `models` in place."""
+    skills = sorted(
+        {
+            str(row.get("skill"))
+            for m in models
+            for row in (m.get("skills") or [])
+            if isinstance(row, Mapping) and row.get("skill")
+        }
+    )
+    for skill in skills:
+        candidates: list[dict[str, Any]] = []
+        target_rows: list[tuple[str, dict[str, Any]]] = []
+        for m in models:
+            ex = _model_exec_name(m)
+            for row in m.get("skills") or []:
+                if isinstance(row, dict) and str(row.get("skill")) == skill:
+                    candidates.append({"executor": ex, **row})
+                    target_rows.append((ex, row))
+        best = pick_best_model(candidates)
+        for ex, row in target_rows:
+            row["best_model"] = best
+            row["is_best_model"] = best is not None and ex == best
+
+    families = sorted(
+        {
+            str(row.get("family") or row.get("skill"))
+            for m in models
+            for row in (m.get("suites") or [])
+            if isinstance(row, Mapping) and (row.get("family") or row.get("skill"))
+        }
+    )
+    for fam in families:
+        fam_candidates: list[dict[str, Any]] = []
+        fam_targets: list[tuple[str, dict[str, Any]]] = []
+        for m in models:
+            ex = _model_exec_name(m)
+            for row in m.get("suites") or []:
+                if isinstance(row, dict) and str(row.get("family") or row.get("skill")) == fam:
+                    fam_candidates.append({"executor": ex, **row})
+                    fam_targets.append((ex, row))
+        best_fam = pick_best_model(fam_candidates)
+        for ex, row in fam_targets:
+            row["best_model"] = best_fam
+            row["is_best_model"] = best_fam is not None and ex == best_fam
+
+
+def build_skill_matrix(
+    report_or_models: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Cross-model matrix per skill: `skill -> {skill, best_model, rows, by_executor}`.
+
+    Each entry in `rows` corresponds to one executor (in `models[]` order) and carries:
+    `executor`, `judge`, `lift`, `ci_low`, `ci_high`, `ci`, `verdict`, `tokens_with_median`,
+    `tokens_without_median`, `tokens_delta_pct`, `t_total_with_median`,
+    `t_total_without_median`, `wall_delta_pct`, `invoked`, `valid_with_reps`,
+    `invocation_rate`, `t_skill_p50`, `t_skill_p90`, `ceiling_tasks`, `total_tasks`,
+    `unclassified_tasks`, `needs_harder_tasks`, `best_model`, `is_best_model`.
+    """
+    models = (
+        models_of(report_or_models)
+        if isinstance(report_or_models, Mapping)
+        else [m for m in report_or_models if isinstance(m, Mapping)]
+    )
+    per_model = [(_model_exec_name(m), _model_judge_name(m), _skill_rows_of(m)) for m in models]
+    skills = sorted({s for _, _, srows in per_model for s in srows})
+
+    matrix: dict[str, dict[str, Any]] = {}
+    for skill in skills:
+        raw_rows: list[dict[str, Any]] = []
+        for ex, jg, srows in per_model:
+            if skill not in srows:
+                continue
+            srow = srows[skill]
+            tok_w = srow.get("tokens_with_median")
+            tok_wo = srow.get("tokens_without_median")
+            tok_dp = srow.get("tokens_delta_pct")
+            if tok_dp is None:
+                tok_dp = _delta_pct(tok_w, tok_wo)
+            wall_w = srow.get("t_total_with_median")
+            wall_wo = srow.get("t_total_without_median")
+            wall_dp = srow.get("wall_delta_pct")
+            if wall_dp is None:
+                wall_dp = _delta_pct(wall_w, wall_wo)
+            ci_low = srow.get("ci_low")
+            ci_high = srow.get("ci_high")
+            ci = srow.get("ci")
+            if ci is None and ci_low is not None and ci_high is not None:
+                ci = [ci_low, ci_high]
+            raw_rows.append(
+                {
+                    "skill": skill,
+                    "executor": ex,
+                    "judge": jg,
+                    "n_tasks": int(srow.get("n_tasks", 0)),
+                    "with_mean": srow.get("with_mean"),
+                    "without_mean": srow.get("without_mean"),
+                    "lift": srow.get("lift"),
+                    "ci_low": ci_low,
+                    "ci_high": ci_high,
+                    "ci": ci,
+                    "verdict": str(srow.get("verdict", "insufficient data")),
+                    "tokens_with_median": tok_w,
+                    "tokens_without_median": tok_wo,
+                    "tokens_delta_pct": tok_dp,
+                    "t_total_with_median": wall_w,
+                    "t_total_without_median": wall_wo,
+                    "wall_delta_pct": wall_dp,
+                    "invoked": int(srow.get("invoked", 0)),
+                    "valid_with_reps": int(srow.get("valid_with_reps", 0)),
+                    "invocation_rate": srow.get("invocation_rate"),
+                    "t_skill_p50": srow.get("t_skill_p50"),
+                    "t_skill_p90": srow.get("t_skill_p90"),
+                    "ceiling_tasks": srow.get("ceiling_tasks"),
+                    "total_tasks": srow.get("total_tasks"),
+                    "unclassified_tasks": int(srow.get("unclassified_tasks") or 0),
+                    "needs_harder_tasks": bool(srow.get("needs_harder_tasks")),
+                }
+            )
+        best = pick_best_model(raw_rows)
+        for r in raw_rows:
+            r["best_model"] = best
+            r["is_best_model"] = best is not None and r["executor"] == best
+        matrix[skill] = {
+            "skill": skill,
+            "best_model": best,
+            "rows": raw_rows,
+            "by_executor": {r["executor"]: r for r in raw_rows},
+        }
+    return matrix
+
+
+def _iter_unique_reps(model: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """All per-rep detail dicts stored under `model['skills']` and `model['suites']`."""
+    reps: list[Mapping[str, Any]] = []
+    for srow in model.get("skills") or []:
+        if not isinstance(srow, Mapping):
+            continue
+        for t in (srow.get("tasks") or {}).values():
+            if not isinstance(t, Mapping):
+                continue
+            rmap = t.get("reps") if isinstance(t.get("reps"), Mapping) else {}
+            for arm in ("with", "without"):
+                for rep in rmap.get(arm) or []:
+                    if isinstance(rep, Mapping):
+                        reps.append(rep)
+    suite_arms = [str(a) for a in (model.get("suite_arms") or [])]
+    for frow in model.get("suites") or []:
+        if not isinstance(frow, Mapping):
+            continue
+        arms_to_read = [BASELINE_ARM, *(suite_arms or list(frow.get("suite_arms") or []))]
+        for t in (frow.get("tasks") or {}).values():
+            if not isinstance(t, Mapping):
+                continue
+            rmap = t.get("reps") if isinstance(t.get("reps"), Mapping) else {}
+            for arm in arms_to_read:
+                for rep in rmap.get(arm) or []:
+                    if isinstance(rep, Mapping):
+                        reps.append(rep)
+    return reps
+
+
+def build_model_summary(
+    report_or_models: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Model-level summary per executor: `executor`, `judge`, `n_skills`, `mean_lift` across
+    skills, `total_tokens`, `total_wall_s` (`total_wall`), `valid_total`, `invalid_total`,
+    `total_rollouts`, and `invalid_rate`."""
+    models = (
+        models_of(report_or_models)
+        if isinstance(report_or_models, Mapping)
+        else [m for m in report_or_models if isinstance(m, Mapping)]
+    )
+    out: list[dict[str, Any]] = []
+    for m in models:
+        ex = _model_exec_name(m)
+        jg = _model_judge_name(m)
+        skills = [r for r in (m.get("skills") or []) if isinstance(r, Mapping)]
+        suites = [r for r in (m.get("suites") or []) if isinstance(r, Mapping)]
+        if "mean_lift" in m:
+            mean_lift = m.get("mean_lift")
+        else:
+            lifts = [
+                float(r["lift"])
+                for r in (skills or suites)
+                if r.get("lift") is not None and not isinstance(r.get("lift"), bool)
+            ]
+            mean_lift = float(st.mean(lifts)) if lifts else None
+
+        reps = _iter_unique_reps(m)
+        if isinstance(m.get("total_tokens"), int) and not isinstance(m.get("total_tokens"), bool):
+            total_tokens = int(m["total_tokens"])
+        else:
+            total_tokens = sum(
+                int(r["total_tokens"])
+                for r in reps
+                if r.get("valid")
+                and isinstance(r.get("total_tokens"), int)
+                and not isinstance(r.get("total_tokens"), bool)
+            )
+
+        raw_wall = m.get("total_wall_s", m.get("total_wall"))
+        if isinstance(raw_wall, (int, float)) and not isinstance(raw_wall, bool):
+            total_wall_s = float(raw_wall)
+        else:
+            total_wall_s = float(
+                sum(
+                    float(r["t_total_s"])
+                    for r in reps
+                    if r.get("valid")
+                    and isinstance(r.get("t_total_s"), (int, float))
+                    and not isinstance(r.get("t_total_s"), bool)
+                )
+            )
+
+        if isinstance(m.get("total_rollouts"), int) and not isinstance(
+            m.get("total_rollouts"), bool
+        ):
+            total_rollouts = int(m["total_rollouts"])
+            valid_total = int(m.get("valid_total", total_rollouts - int(m.get("invalid_total", 0))))
+            invalid_total = int(m.get("invalid_total", total_rollouts - valid_total))
+        elif reps:
+            total_rollouts = len(reps)
+            valid_total = sum(1 for r in reps if r.get("valid"))
+            invalid_total = total_rollouts - valid_total
+        else:
+            invalid_total = int(
+                m.get("invalid_total")
+                if m.get("invalid_total") is not None
+                else sum(int(r.get("invalid_total", 0)) for r in (skills + suites))
+            )
+            valid_with = sum(int(r.get("valid_with_reps", 0)) for r in (skills + suites))
+            valid_total = valid_with * 2
+            total_rollouts = valid_total + invalid_total
+
+        if "invalid_rate" in m:
+            invalid_rate = m.get("invalid_rate")
+        else:
+            invalid_rate = (invalid_total / total_rollouts) if total_rollouts > 0 else None
+
+        out.append(
+            {
+                "executor": ex,
+                "judge": jg,
+                "n_skills": len(skills),
+                "mean_lift": mean_lift,
+                "total_tokens": total_tokens,
+                "total_wall_s": total_wall_s,
+                "total_wall": total_wall_s,
+                "valid_total": valid_total,
+                "invalid_total": invalid_total,
+                "total_rollouts": total_rollouts,
+                "invalid_rate": invalid_rate,
+            }
+        )
+    return out
+
+
+def judge_pairing_note(
+    report_or_models: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+) -> str:
+    """Legend note stating the `executor -> judge` pairing, whether any executors share a
+    judge under cross-family `judge_for` mapping, and the `best_model` selection rule."""
+    models = (
+        models_of(report_or_models)
+        if isinstance(report_or_models, Mapping)
+        else [m for m in report_or_models if isinstance(m, Mapping)]
+    )
+    pairs: list[str] = []
+    by_judge: dict[str, list[str]] = {}
+    for m in models:
+        ex = _model_exec_name(m)
+        jg = _model_judge_name(m)
+        pairs.append(f"`{ex}` → `{jg}`")
+        by_judge.setdefault(jg, []).append(ex)
+    shared = [
+        f"`{jg}` grades {', '.join(f'`{e}`' for e in exs)}"
+        for jg, exs in by_judge.items()
+        if len(exs) > 1
+    ]
+    pair_str = ", ".join(pairs) if pairs else "none"
+    if shared:
+        shared_str = (
+            f" ({'; '.join(shared)} — two executors share a judge under cross-family "
+            "`judge_for` pairing so no executor is graded by its own model family)"
+        )
+    else:
+        shared_str = (
+            " (each executor is paired with a cross-family judge via `judge_for` so no "
+            "executor is graded by its own model family; when 3 families are paired two "
+            "executors share a judge)"
+        )
+    return (
+        f"Judge pairing: {pair_str}{shared_str}. "
+        "`best_model` ★ marks the executor with the highest rubric lift for that skill "
+        "(ties → fewest WITH-arm median tokens)."
+    )
 
 
 def _fmt_frac(val: float | None) -> str:
@@ -2013,6 +2420,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.append(f"- **Statistical power**: {power_note}")
     lines.append(f"- **Hardness**: {report.get('hardness_note') or HARDNESS_NOTE}")
 
+    if multi:
+        lines += _render_cross_model_tables(report)
+
     for model in models:
         if multi:
             lines += [
@@ -2024,7 +2434,151 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f"- **Judge-noise rate**: {_noise_str(model)}",
             ]
         lines += _render_model_tables(model)
+
+    if not multi and isinstance(report.get("models"), list) and report.get("models"):
+        lines += _render_cross_model_tables(report)
+
     return "\n".join(lines) + "\n"
+
+
+def _fmt_signed_frac(val: float | None) -> str:
+    if val is None or isinstance(val, bool):
+        return "n/a"
+    return f"{float(val):+.2f}"
+
+
+def _fmt_wall_sum(val: float | None) -> str:
+    if val is None or isinstance(val, bool):
+        return "n/a"
+    f = float(val)
+    return f"{f:.0f}s" if f.is_integer() else f"{f:.1f}s"
+
+
+def _fmt_invalid_rate(invalid_total: int, total_rollouts: int, rate: float | None) -> str:
+    if total_rollouts <= 0 or rate is None:
+        return f"{invalid_total}/{total_rollouts} (n/a)"
+    return f"{invalid_total}/{total_rollouts} ({rate * 100:.0f}%)"
+
+
+def _fmt_pair_delta(
+    a: float | None,
+    b: float | None,
+    delta_pct: float | None = None,
+    *,
+    suffix: str = "",
+) -> str:
+    pair = _fmt_pair(a, b, suffix=suffix)
+    if pair == "n/a":
+        return "n/a"
+    if delta_pct is None:
+        delta_pct = _delta_pct(a, b)
+    if delta_pct is None:
+        return f"{pair} (n/a)"
+    return f"{pair} ({delta_pct:+.0f}%)"
+
+
+def _render_cross_model_tables(report: Mapping[str, Any]) -> list[str]:
+    """Render the model-level summary table, the cross-model per-skill matrix tables, and
+    the judge-pairing legend."""
+    raw_ms = report.get("model_summary")
+    model_rows = (
+        [r for r in raw_ms if isinstance(r, Mapping)]
+        if isinstance(raw_ms, list) and raw_ms
+        else build_model_summary(report)
+    )
+    raw_sm = report.get("skill_matrix")
+    skill_matrix = (
+        {str(k): dict(v) for k, v in raw_sm.items() if isinstance(v, Mapping)}
+        if isinstance(raw_sm, Mapping) and raw_sm
+        else build_skill_matrix(report)
+    )
+    pairing = str(report.get("judge_pairing_note") or judge_pairing_note(report))
+
+    lines: list[str] = [
+        "",
+        "## Model summary",
+        "",
+        f"- **Legend**: {pairing}",
+        "",
+        "| executor | judge | skills | mean lift | total tokens | total wall | invalid rate |",
+        "| :--- | :--- | ---: | :---: | ---: | ---: | :---: |",
+    ]
+    for mrow in model_rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    str(mrow.get("executor", "executor")),
+                    str(mrow.get("judge", "judge")),
+                    str(mrow.get("n_skills", 0)),
+                    _fmt_signed_frac(mrow.get("mean_lift")),
+                    str(int(mrow["total_tokens"]))
+                    if isinstance(mrow.get("total_tokens"), (int, float))
+                    and not isinstance(mrow.get("total_tokens"), bool)
+                    else "n/a",
+                    _fmt_wall_sum(mrow.get("total_wall_s", mrow.get("total_wall"))),
+                    _fmt_invalid_rate(
+                        int(mrow.get("invalid_total", 0)),
+                        int(mrow.get("total_rollouts", 0)),
+                        mrow.get("invalid_rate"),
+                    ),
+                )
+            )
+            + " |"
+        )
+
+    if skill_matrix:
+        lines += ["", "## Skill × executor matrix"]
+        for skill in sorted(skill_matrix):
+            entry = skill_matrix[skill]
+            best = entry.get("best_model")
+            best_label = f"`{best}`" if best else "n/a"
+            lines += [
+                "",
+                f"### `{skill}` (best model: {best_label})",
+                "",
+                "| executor | lift [95% CI] | verdict | tokens p50 W/WO (Δ %) "
+                "| wall p50 W/WO (Δ %) | invocation | t_skill p50/p90 | ceiling/total |",
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |",
+            ]
+            for r in entry.get("rows") or []:
+                if not isinstance(r, Mapping):
+                    continue
+                ex_cell = (
+                    f"{r.get('executor')} ★ (best)"
+                    if r.get("is_best_model")
+                    else str(r.get("executor"))
+                )
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        (
+                            ex_cell,
+                            _fmt_lift_ci(r.get("lift"), r.get("ci_low"), r.get("ci_high")),
+                            str(r.get("verdict", "insufficient data")),
+                            _fmt_pair_delta(
+                                r.get("tokens_with_median"),
+                                r.get("tokens_without_median"),
+                                r.get("tokens_delta_pct"),
+                            ),
+                            _fmt_pair_delta(
+                                r.get("t_total_with_median"),
+                                r.get("t_total_without_median"),
+                                r.get("wall_delta_pct"),
+                                suffix="s",
+                            ),
+                            _fmt_invoked(
+                                int(r.get("invoked", 0)),
+                                int(r.get("valid_with_reps", 0)),
+                                r.get("invocation_rate"),
+                            ),
+                            _fmt_timing(r.get("t_skill_p50"), r.get("t_skill_p90")),
+                            _fmt_ceiling(r),
+                        )
+                    )
+                    + " |"
+                )
+    return lines
 
 
 def _fmt_skills_histogram(hist: Mapping[str, int] | None) -> str:

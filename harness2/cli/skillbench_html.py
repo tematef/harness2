@@ -533,6 +533,153 @@ def _diagnostics_tab(report: Mapping[str, Any]) -> str:
     return out
 
 
+def _models_tab(report: Mapping[str, Any]) -> str:
+    """Cross-model comparison tab: model-level summary table, judge-pairing legend, and
+    per-skill executor matrix tables with `best_model` markers."""
+    from .skillbench_report import (
+        _fmt_ceiling,
+        _fmt_invalid_rate,
+        _fmt_invoked,
+        _fmt_lift_ci,
+        _fmt_pair_delta,
+        _fmt_signed_frac,
+        _fmt_timing,
+        _fmt_wall_sum,
+        build_model_summary,
+        build_skill_matrix,
+        judge_pairing_note,
+    )
+
+    raw_ms = report.get("model_summary")
+    model_rows = (
+        [r for r in raw_ms if isinstance(r, Mapping)]
+        if isinstance(raw_ms, list) and raw_ms
+        else build_model_summary(report)
+    )
+    raw_sm = report.get("skill_matrix")
+    skill_matrix = (
+        {str(k): dict(v) for k, v in raw_sm.items() if isinstance(v, Mapping)}
+        if isinstance(raw_sm, Mapping) and raw_sm
+        else build_skill_matrix(report)
+    )
+    pairing = str(report.get("judge_pairing_note") or judge_pairing_note(report))
+
+    mrows: list[list[str]] = []
+    for mrow in model_rows:
+        tot_tok = mrow.get("total_tokens")
+        tok_str = (
+            str(int(tot_tok))
+            if isinstance(tot_tok, (int, float)) and not isinstance(tot_tok, bool)
+            else "n/a"
+        )
+        mrows.append(
+            [
+                f'<span class="font-medium">{_e(mrow.get("executor", "executor"))}</span>',
+                _e(mrow.get("judge", "judge")),
+                _e(mrow.get("n_skills", 0)),
+                f'<span class="font-medium">{_e(_fmt_signed_frac(mrow.get("mean_lift")))}</span>',
+                _e(tok_str),
+                _e(_fmt_wall_sum(mrow.get("total_wall_s", mrow.get("total_wall")))),
+                _e(
+                    _fmt_invalid_rate(
+                        int(mrow.get("invalid_total", 0)),
+                        int(mrow.get("total_rollouts", 0)),
+                        mrow.get("invalid_rate"),
+                    )
+                ),
+            ]
+        )
+
+    summary_html = (
+        f'<h3 class="{FG} text-base font-semibold mb-3">Model summary</h3>'
+        + _table(
+            [
+                "executor",
+                "judge",
+                "skills",
+                "mean lift",
+                "total tokens",
+                "total wall",
+                "invalid rate",
+            ],
+            mrows,
+            "llrrrrc",
+        )
+        + f'<p class="{MUTED} text-xs mt-3">{_e(pairing)}</p>'
+    )
+
+    skill_blocks: list[str] = []
+    for skill in sorted(skill_matrix):
+        entry = skill_matrix[skill]
+        best = entry.get("best_model")
+        best_suffix = f" (best model: {_e(best)})" if best else ""
+        srows: list[list[str]] = []
+        for r in entry.get("rows") or []:
+            if not isinstance(r, Mapping):
+                continue
+            ex_name = _e(r.get("executor"))
+            if r.get("is_best_model"):
+                ex_cell = (
+                    f'<span class="font-medium">{ex_name}</span> '
+                    '<span class="inline-block rounded px-1.5 py-0.5 text-xs font-medium '
+                    'bg-emerald-500/15 text-emerald-600">★ (best)</span>'
+                )
+            else:
+                ex_cell = f'<span class="font-medium">{ex_name}</span>'
+            srows.append(
+                [
+                    ex_cell,
+                    _e(_fmt_lift_ci(r.get("lift"), r.get("ci_low"), r.get("ci_high"))),
+                    _verdict_pill(str(r.get("verdict", "insufficient data"))),
+                    _e(
+                        _fmt_pair_delta(
+                            r.get("tokens_with_median"),
+                            r.get("tokens_without_median"),
+                            r.get("tokens_delta_pct"),
+                        )
+                    ),
+                    _e(
+                        _fmt_pair_delta(
+                            r.get("t_total_with_median"),
+                            r.get("t_total_without_median"),
+                            r.get("wall_delta_pct"),
+                            suffix="s",
+                        )
+                    ),
+                    _e(
+                        _fmt_invoked(
+                            int(r.get("invoked", 0)),
+                            int(r.get("valid_with_reps", 0)),
+                            r.get("invocation_rate"),
+                        )
+                    ),
+                    _e(_fmt_timing(r.get("t_skill_p50"), r.get("t_skill_p90"))),
+                    _e(_fmt_ceiling(r)),
+                ]
+            )
+        skill_blocks.append(
+            f'<div class="mt-6"><h3 class="{FG} text-base font-semibold mb-3">'
+            f"skill <code>{_e(skill)}</code>"
+            f'<span class="{MUTED} text-sm font-normal">{best_suffix}</span></h3>'
+            + _table(
+                [
+                    "executor",
+                    "lift [95% CI]",
+                    "verdict",
+                    "tokens p50 W/WO (Δ %)",
+                    "wall p50 W/WO (Δ %)",
+                    "invocation",
+                    "t_skill p50/p90",
+                    "ceiling/total",
+                ],
+                srows,
+                "lcccccccl",
+            )
+            + "</div>"
+        )
+    return summary_html + "".join(skill_blocks)
+
+
 def _models(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """Per-executor blocks (`models[]`); a schema-v1 dictionary is its own single block."""
     models = report.get("models")
@@ -602,6 +749,7 @@ def render_html(report: Mapping[str, Any]) -> str:
     multi = len(models) > 1
     tabs = [
         ("skills", "Skills", _per_model(report, _skills_tab)),
+        ("models", "Models", _models_tab(report)),
         ("tasks", "Tasks & criteria", _per_model(report, _tasks_tab)),
         ("sbs", "Side by side", _side_by_side_tab(report)),
         ("diag", "Diagnostics", _diagnostics_tab(report)),
