@@ -390,18 +390,18 @@ Key design decisions:
 - Modify: `harness2/cli/skillbench_improve.py`
 - Modify: `tests/test_skillbench_improve.py`
 
-- [ ] probe executor defaults to the executor recorded in the baseline cell; a different one is an error
+- [x] probe executor defaults to the executor recorded in the baseline cell; a different one is an error
       unless `--allow-model-mismatch`; the 3-way report prints the executor of every arm
-- [ ] `--models a,b`: probe on each executor (reusing matrix cells for `WITHOUT` / `Current WITH`);
+- [x] `--models a,b`: probe on each executor (reusing matrix cells for `WITHOUT` / `Current WITH`);
       `evaluate_acceptance` must pass on every executor; per-model gate row in the report
-- [ ] `--rounds N`: round `r+1` packet includes round `r`'s candidate, 3-way numbers and gate reasons; early
+- [x] `--rounds N`: round `r+1` packet includes round `r`'s candidate, 3-way numbers and gate reasons; early
       stop on acceptance; best round by (verify, mean, −tokens, −wall)
-- [ ] skip skills flagged `needs harder tasks` for the chosen executor and say why; `--max-growth 50`
+- [x] skip skills flagged `needs harder tasks` for the chosen executor and say why; `--max-growth 50`
       (percent, flag with rationale in help) rejects candidates that grow beyond the threshold;
       `banned_tools` from the suite
-- [ ] write tests: mismatch error and override, multi-model gate pass/fail mix, rounds feedback in packet,
+- [x] write tests: mismatch error and override, multi-model gate pass/fail mix, rounds feedback in packet,
       early stop, ceiling skip, growth guard pass/fail
-- [ ] run tests - must pass before task 10
+- [x] run tests - must pass before task 10
 
 ### Task 10: Improver weak-skill selection from the Summary and `--apply`
 

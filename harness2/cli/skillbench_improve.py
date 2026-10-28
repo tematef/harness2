@@ -14,13 +14,16 @@
 
 """Targeted skillbench improver (`skillbench-improve`): Propose -> Probe -> Judge -> 3-Way Report.
 
-Given an existing `skillbench` run directory (`results/with/` and `results/without/`), inspects
+Given an existing `skillbench` run directory (`results/with/` and `results/without/`, or
+matrix cells `results/<executor>/with/` and `results/<executor>/without/`), inspects
 weak or high-overhead skills, builds a contrastive evidence packet from the `WITH` and `WITHOUT`
 trajectories and deliverables (without leaking `rubric.json` or judge verdicts unless
 `--include-verdicts` is set), asks an isolated `agy` improver session for a revised `SKILL.md`,
-validates the candidate skill, probes it across the skill's tasks (`k` reps), runs deterministic
-`verify` and the blinded judge, and emits a 3-way comparison (`WITHOUT` vs `Current WITH` vs
-`Candidate WITH`) in `improve_report.{json,md,html}` plus a unified diff (`best.patch`).
+validates the candidate skill (frontmatter, headless fallback, suite `banned_tools`, and
+`--max-growth` size cap), probes it with the **same executor model(s)** as the baseline across
+the skill's tasks (`k` reps), runs deterministic `verify` and the blinded judge, and emits a
+3-way comparison (`WITHOUT` vs `Current WITH` vs `Candidate WITH`) in
+`improve_report.{json,md,html}` plus a unified diff (`best.patch`).
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import html
+import inspect
 import json
 import os
 import re
@@ -51,15 +55,23 @@ from ..benchmarks.skillbench import (
     SkillbenchTask,
     _default_runs_root,
     _env_pilot,
+    _path_segment,
     build_prompt,
     deliverable_text,
     diff_stats,
+    judge_model,
     load_tasks,
     rollout_valid,
     score,
     tasks_root,
 )
-from ..benchmarks.skillbench_suite import DEFAULT_BANNED_TOOLS, SuiteConfig, active_suite
+from ..benchmarks.skillbench_suite import (
+    DEFAULT_BANNED_TOOLS,
+    SuiteConfig,
+    SuiteError,
+    active_suite,
+    load_suite,
+)
 from ..substrate.agy import (
     _kill_group,
     agy_argv,
@@ -67,6 +79,7 @@ from ..substrate.agy import (
     auth_files,
     exec_effort,
     exec_model,
+    executor_env,
     model_guard,
     parse_event,
     read_events,
@@ -76,7 +89,15 @@ from ..substrate.agy import (
     target_skill_file,
 )
 from . import _common as C
-from .skillbench_report import build_report
+from .skillbench_report import (
+    CEILING_FLAG_SHARE,
+    HARDNESS_CEILING,
+    HARDNESS_INFORMATIVE,
+    HARDNESS_UNCLASSIFIED,
+    MIN_BASELINE_REPS,
+    NEEDS_HARDER_TASKS,
+    build_report,
+)
 
 
 def safe_tid(task_id: str) -> str:
@@ -84,19 +105,59 @@ def safe_tid(task_id: str) -> str:
     return task_id.replace("/", "__")
 
 
+def _rep_from_summary_json(base_dir: Path, task_id: str, rep_idx: int) -> Path | None:
+    """Resolve `base<rep_idx>` from `<base_dir>/<task>/summary.json` if present."""
+    for sub in (safe_tid(task_id), task_id):
+        sp = base_dir / sub / "summary.json"
+        if not sp.is_file():
+            continue
+        try:
+            data = json.loads(sp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, Mapping):
+            continue
+        for entry in data.get("base") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            lbl = str(entry.get("label") or "")
+            if lbl in (f"base{rep_idx}", f"b{rep_idx}"):
+                raw_rd = entry.get("run_dir")
+                if isinstance(raw_rd, str) and raw_rd:
+                    p = Path(raw_rd)
+                    cand = p if p.is_absolute() else (base_dir / p)
+                    if cand.is_dir():
+                        return cand
+    return None
+
+
 def resolve_rep_dir(results_dir: Path, task_id: str, rep_idx: int) -> Path:
-    """Locate `<task_id>/base<rep_idx>` under `results_dir` (direct, flat, or namespaced)."""
+    """Locate `<task_id>/base<rep_idx>` under `results_dir` (direct, safe_tid, flat, or namespaced)."""
     direct = results_dir / task_id / f"base{rep_idx}"
     if direct.is_dir():
         return direct
+    safe_sub = results_dir / safe_tid(task_id) / f"base{rep_idx}"
+    if safe_sub.is_dir():
+        return safe_sub
     flat = results_dir / f"{safe_tid(task_id)}__b{rep_idx}"
     if flat.is_dir():
         return flat
+    from_summary = _rep_from_summary_json(results_dir, task_id, rep_idx)
+    if from_summary is not None:
+        return from_summary
     for ns_dir in sorted(results_dir.glob("skillbench-*")):
-        cand = ns_dir / task_id / f"base{rep_idx}"
-        if cand.is_dir():
-            return cand
+        for cand in (
+            ns_dir / task_id / f"base{rep_idx}",
+            ns_dir / safe_tid(task_id) / f"base{rep_idx}",
+            ns_dir / f"{safe_tid(task_id)}__b{rep_idx}",
+        ):
+            if cand.is_dir():
+                return cand
+        from_ns_summary = _rep_from_summary_json(ns_dir, task_id, rep_idx)
+        if from_ns_summary is not None:
+            return from_ns_summary
     return direct
+
 
 IMPROVER_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -117,6 +178,7 @@ EVIDENCE_TRAJ_CHARS = 1800
 EVIDENCE_DELIV_CHARS = 1800
 MAX_EVIDENCE_CHARS = 70_000
 EFFICIENCY_GAIN_RATIO = 0.85
+DEFAULT_MAX_GROWTH_PCT = 50.0
 
 
 def improver_model(override: str | None = None) -> str:
@@ -129,10 +191,250 @@ def improver_model(override: str | None = None) -> str:
     return exec_model()
 
 
-def select_weak_skills(report: Mapping[str, Any]) -> list[str]:
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _str_or_none(val: Any) -> str | None:
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
+
+
+def _parse_models(
+    models: Sequence[str] | str | None = None,
+    executor: str | None = None,
+) -> tuple[str, ...]:
+    """Normalize `--models` / `models` / `executor` into a deduplicated tuple of model IDs."""
+    out: list[str] = []
+    if models is not None:
+        if isinstance(models, str):
+            items = [s.strip() for s in models.split(",") if s.strip()]
+        else:
+            items = []
+            for m in models:
+                for s in str(m).split(","):
+                    if s.strip():
+                        items.append(s.strip())
+        out.extend(items)
+    if executor and str(executor).strip():
+        out.append(str(executor).strip())
+    return tuple(dict.fromkeys(out))
+
+
+def detect_cell_executor(
+    results_dir: Path,
+    tasks: Sequence[SkillbenchTask] = (),
+    k: int = 3,
+) -> str | None:
+    """Detect the executor model recorded in a baseline cell (`run.json`, `config.json`, or
+    rollout `skill_timing.json`). Returns `None` when the cell records no model."""
+    results_dir = Path(results_dir)
+    if not results_dir.is_dir():
+        return None
+    for meta_name in ("run.json", "config.json"):
+        meta = _read_json(results_dir / meta_name)
+        ex = (
+            _str_or_none(meta.get("executor"))
+            or _str_or_none(meta.get("requested_exec_model"))
+            or _str_or_none(meta.get("actual_exec_model"))
+            or _str_or_none(meta.get("model"))
+        )
+        if ex:
+            return ex
+    for ns_dir in sorted(results_dir.glob("skillbench-*")):
+        for meta_name in ("run.json", "config.json"):
+            meta = _read_json(ns_dir / meta_name)
+            ex = (
+                _str_or_none(meta.get("executor"))
+                or _str_or_none(meta.get("requested_exec_model"))
+                or _str_or_none(meta.get("actual_exec_model"))
+                or _str_or_none(meta.get("model"))
+            )
+            if ex:
+                return ex
+    for task in tasks:
+        for i in range(1, max(1, k) + 1):
+            rdir = resolve_rep_dir(results_dir, task.task_id, i)
+            timing = _read_json(rdir / SKILL_TIMING_FILE)
+            ex = (
+                _str_or_none(timing.get("requested_model"))
+                or _str_or_none(timing.get("actual_model"))
+                or _str_or_none(timing.get("executor"))
+                or _str_or_none(timing.get("model"))
+            )
+            if ex:
+                return ex
+    for tp in sorted(results_dir.rglob(SKILL_TIMING_FILE)):
+        timing = _read_json(tp)
+        ex = (
+            _str_or_none(timing.get("requested_model"))
+            or _str_or_none(timing.get("actual_model"))
+            or _str_or_none(timing.get("executor"))
+            or _str_or_none(timing.get("model"))
+        )
+        if ex:
+            return ex
+    if (
+        results_dir.name in ("with", "without", "baseline")
+        or results_dir.name.startswith("suite-")
+    ) and results_dir.parent.parent.name in ("results", "adapt"):
+        parent_name = results_dir.parent.name
+        if parent_name not in ("results", "adapt", ""):
+            return parent_name
+    return None
+
+
+def detect_cell_judge(
+    results_dir: Path,
+    tasks: Sequence[SkillbenchTask] = (),
+    k: int = 3,
+) -> str | None:
+    """Detect the judge model recorded in a cell (`run.json`, `config.json`, or `judgments.json`)."""
+    results_dir = Path(results_dir)
+    if not results_dir.is_dir():
+        return None
+    for meta_name in ("run.json", "config.json"):
+        meta = _read_json(results_dir / meta_name)
+        jm = _str_or_none(meta.get("judge")) or _str_or_none(meta.get("requested_judge_model"))
+        if jm:
+            return jm
+    for ns_dir in sorted(results_dir.glob("skillbench-*")):
+        for meta_name in ("run.json", "config.json"):
+            meta = _read_json(ns_dir / meta_name)
+            jm = _str_or_none(meta.get("judge")) or _str_or_none(meta.get("requested_judge_model"))
+            if jm:
+                return jm
+    for task in tasks:
+        for i in range(1, max(1, k) + 1):
+            rdir = resolve_rep_dir(results_dir, task.task_id, i)
+            judg = _read_json(rdir / JUDGMENTS_FILE)
+            jm = _str_or_none(judg.get("judge_model")) or _str_or_none(judg.get("actual_model"))
+            if jm:
+                return jm
+    return None
+
+
+def _row_is_ceiling(row: Mapping[str, Any]) -> tuple[bool, int | None, int | None]:
+    """Whether a skill row from `report.json` or `summarize_arm_runs` is flagged `needs harder tasks`."""
+    rec = str(row.get("recommendation") or "").strip().lower()
+    if rec == NEEDS_HARDER_TASKS:
+        return True, row.get("ceiling_tasks"), row.get("total_tasks")
+    if row.get("needs_harder_tasks") is True:
+        return True, row.get("ceiling_tasks"), row.get("total_tasks")
+    ceil_t = row.get("ceiling_tasks")
+    tot_t = row.get("total_tasks", row.get("n_tasks"))
+    if (
+        isinstance(ceil_t, int)
+        and not isinstance(ceil_t, bool)
+        and isinstance(tot_t, int)
+        and not isinstance(tot_t, bool)
+        and tot_t > 0
+        and (ceil_t / tot_t) > CEILING_FLAG_SHARE
+    ):
+        return True, ceil_t, tot_t
+    share = row.get("ceiling_share")
+    if isinstance(share, (int, float)) and not isinstance(share, bool):
+        s_val = float(share) / 100.0 if float(share) > 1.0 else float(share)
+        if s_val > CEILING_FLAG_SHARE:
+            return True, ceil_t, tot_t
+    return False, ceil_t, tot_t
+
+
+def _report_skill_ceiling(
+    report: Mapping[str, Any],
+    skill: str,
+    executor: str | None = None,
+) -> tuple[bool, str]:
+    """Check whether `report` flags `skill` as `needs harder tasks` for `executor`."""
+    models = report.get("models")
+    if isinstance(models, list) and models:
+        for m_block in models:
+            if not isinstance(m_block, Mapping):
+                continue
+            m_exec = _str_or_none(m_block.get("executor"))
+            if executor is not None and m_exec is not None and m_exec != executor:
+                continue
+            by_skill = m_block.get("by_skill")
+            row = by_skill.get(skill) if isinstance(by_skill, Mapping) else None
+            if not isinstance(row, Mapping):
+                raw_sk = m_block.get("skills")
+                if isinstance(raw_sk, Mapping):
+                    row = raw_sk.get(skill)
+                elif isinstance(raw_sk, list):
+                    row = next(
+                        (
+                            r
+                            for r in raw_sk
+                            if isinstance(r, Mapping) and r.get("skill") == skill
+                        ),
+                        None,
+                    )
+            if isinstance(row, Mapping):
+                flagged, c_cnt, t_cnt = _row_is_ceiling(row)
+                if flagged:
+                    ex_str = m_exec or executor or "default"
+                    counts = f" ({c_cnt}/{t_cnt} tasks at ceiling)" if c_cnt is not None and t_cnt is not None else ""
+                    return (
+                        True,
+                        f"skill {skill!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {ex_str!r}{counts}",
+                    )
+            if executor is not None and m_exec == executor:
+                return False, ""
+
+    summary_rows = report.get("summary")
+    if isinstance(summary_rows, list):
+        for s_row in summary_rows:
+            if not isinstance(s_row, Mapping) or s_row.get("skill") != skill:
+                continue
+            row_model = _str_or_none(s_row.get("model"))
+            if executor is not None and row_model is not None and row_model != executor:
+                continue
+            flagged, c_cnt, t_cnt = _row_is_ceiling(s_row)
+            if flagged:
+                ex_str = row_model or executor or "default"
+                counts = f" ({c_cnt}/{t_cnt} tasks at ceiling)" if c_cnt is not None and t_cnt is not None else ""
+                return (
+                    True,
+                    f"skill {skill!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {ex_str!r}{counts}",
+                )
+
+    raw_skills = report.get("by_skill") or report.get("skills") or {}
+    row = None
+    if isinstance(raw_skills, Mapping):
+        row = raw_skills.get(skill)
+    elif isinstance(raw_skills, list):
+        row = next(
+            (r for r in raw_skills if isinstance(r, Mapping) and r.get("skill") == skill),
+            None,
+        )
+    if isinstance(row, Mapping):
+        flagged, c_cnt, t_cnt = _row_is_ceiling(row)
+        if flagged:
+            ex_str = executor or _str_or_none(report.get("requested_exec_model")) or "default"
+            counts = f" ({c_cnt}/{t_cnt} tasks at ceiling)" if c_cnt is not None and t_cnt is not None else ""
+            return (
+                True,
+                f"skill {skill!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {ex_str!r}{counts}",
+            )
+    return False, ""
+
+
+def select_weak_skills(
+    report: Mapping[str, Any],
+    *,
+    executor: str | None = None,
+) -> list[str]:
     """Identify skills from a `skillbench` `report.json` that can benefit from improvement.
 
-    A skill is selected when any of the following holds:
+    A skill is selected when any of the following holds (and it is not flagged
+    `needs harder tasks` for the chosen executor):
     - `with_mean < 1.0` (missed rubric criteria)
     - `lift <= 0.0` (no positive lift over WITHOUT)
     - `verify_with_rate < 1.0` (deterministic test failure)
@@ -140,7 +442,15 @@ def select_weak_skills(report: Mapping[str, Any]) -> list[str]:
       `t_total_with_median > 1.25 * t_total_without_median` (excessive overhead)
     """
     weak: list[str] = []
-    raw_skills = report.get("skills") or {}
+    raw_skills: Any = None
+    if executor is not None and isinstance(report.get("models"), list):
+        for m_block in report["models"]:
+            if isinstance(m_block, Mapping) and m_block.get("executor") == executor:
+                raw_skills = m_block.get("skills") or m_block.get("by_skill")
+                break
+    if raw_skills is None:
+        raw_skills = report.get("skills") or report.get("by_skill") or {}
+
     if isinstance(raw_skills, list):
         items = [
             (str(s.get("skill") or ""), s)
@@ -153,6 +463,17 @@ def select_weak_skills(report: Mapping[str, Any]) -> list[str]:
         items = []
 
     for skill, s in sorted(items, key=lambda pair: pair[0]):
+        flagged, reason = _report_skill_ceiling(report, skill, executor=executor)
+        if not flagged:
+            flagged, c_cnt, t_cnt = _row_is_ceiling(s)
+            if flagged:
+                ex_str = executor or _str_or_none(report.get("requested_exec_model")) or "default"
+                counts = f" ({c_cnt}/{t_cnt} tasks at ceiling)" if c_cnt is not None and t_cnt is not None else ""
+                reason = f"skill {skill!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {ex_str!r}{counts}"
+        if flagged:
+            print(f"skipping {skill}: {reason}", flush=True)
+            continue
+
         mean_w = s.get("with_mean", s.get("mean_with"))
         lift = s.get("lift")
         vw = s.get("verify_with_rate")
@@ -195,13 +516,39 @@ def validate_candidate_skill(
     target_skill: str,
     original_md: str,
     banned_tools: Iterable[str] | None = None,
+    max_growth: float | None = None,
+    max_growth_pct: float | None = None,
+    suite: SuiteConfig | None = None,
 ) -> list[str]:
     """Validate a proposed `SKILL.md` before staging it. Returns a list of errors (empty = valid).
 
-    `banned_tools` defaults to the suite's `banned_tools` (`BANNED_CLAUDE_TOOLS` when the
-    suite names none)."""
+    `banned_tools` defaults to the suite's `banned_tools` (`BANNED_CLAUDE_TOOLS` when no
+    suite is configured). `max_growth` (in percent, default `DEFAULT_MAX_GROWTH_PCT` = 50%)
+    rejects candidates whose character length grows beyond the threshold relative to
+    `original_md`."""
     errors: list[str] = []
-    banned = tuple(BANNED_CLAUDE_TOOLS if banned_tools is None else banned_tools)
+    if banned_tools is not None:
+        banned = tuple(banned_tools)
+    elif suite is not None:
+        banned = tuple(suite.banned_tools)
+    elif config.env("SKILLBENCH_SUITE"):
+        try:
+            banned = tuple(active_suite(quiet=True).banned_tools)
+        except config.ConfigError:
+            banned = tuple(BANNED_CLAUDE_TOOLS)
+    else:
+        banned = tuple(BANNED_CLAUDE_TOOLS)
+
+    growth_cap: float | None
+    if max_growth is not None:
+        growth_cap = float(max_growth)
+    elif max_growth_pct is not None:
+        growth_cap = float(max_growth_pct)
+    else:
+        growth_cap = DEFAULT_MAX_GROWTH_PCT
+    if growth_cap is not None and growth_cap < 0:
+        raise ValueError(f"max_growth must be >= 0, got {growth_cap!r}")
+
     text = (candidate_md or "").strip()
     if not text:
         return ["candidate SKILL.md is empty"]
@@ -233,20 +580,21 @@ def validate_candidate_skill(
         if re.search(rf"\b{re.escape(name)}\b", text):
             errors.append(f"contains banned tool name {name!r} (use AGY tool names)")
 
-    if text == original_md.strip():
+    orig_stripped = original_md.strip()
+    if text == orig_stripped:
         errors.append("candidate SKILL.md is identical to the current SKILL.md")
 
+    orig_len = len(orig_stripped)
+    cand_len = len(text)
+    if growth_cap is not None and orig_len > 0:
+        growth_pct = ((cand_len - orig_len) / orig_len) * 100.0
+        if growth_pct > growth_cap + 1e-9:
+            errors.append(
+                f"candidate SKILL.md grew by {growth_pct:.1f}% ({orig_len} -> {cand_len} chars), "
+                f"exceeding --max-growth {growth_cap:g}%"
+            )
+
     return errors
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
 
 
 def _format_rep_evidence(
@@ -259,7 +607,7 @@ def _format_rep_evidence(
         return f"#### {label}: (missing rollout directory)\n"
     timing = _read_json(run_dir / SKILL_TIMING_FILE)
     verify = _read_json(run_dir / VERIFY_FILE)
-    dstats = diff_stats(run_dir)
+    dstats = diff_stats(run_dir) or {"files": 0, "added": 0, "removed": 0}
     events_p = run_dir / "events.jsonl"
     traj = (
         render_trajectory(
@@ -305,7 +653,7 @@ def _format_rep_evidence(
                     passed = c.get("pass") if "pass" in c else c.get("passed")
                     if not passed:
                         parts.append(
-                            f"  - FAILED criterion `{c.get('id')}`: {c.get('rationale')}"
+                            f"  - FAILED criterion `{c.get('id')}`: {c.get('rationale') or c.get('reason')}"
                         )
 
     parts.append("<trajectory>")
@@ -317,6 +665,125 @@ def _format_rep_evidence(
     return "\n".join(parts) + "\n"
 
 
+def _locate_arm_dir_for_evidence(
+    runs_dir: Path,
+    arm: str,
+    executor: str | None = None,
+) -> Path:
+    """Find the directory holding `arm` rollouts under `runs_dir / 'results'`."""
+    results_root = runs_dir / "results"
+    if executor:
+        cand = results_root / _path_segment(executor) / arm
+        if cand.is_dir():
+            return cand
+        cand_raw = results_root / executor / arm
+        if cand_raw.is_dir():
+            return cand_raw
+    direct = results_root / arm
+    if direct.is_dir():
+        return direct
+    if results_root.is_dir():
+        for sub in sorted(p for p in results_root.iterdir() if p.is_dir()):
+            cand = sub / arm
+            if cand.is_dir():
+                return cand
+    return direct
+
+
+def _format_prior_round_block(pr: Mapping[str, Any]) -> list[str]:
+    """Render one prior round's candidate, 3-way numbers, and gate reasons for the evidence packet."""
+    r_num = pr.get("round")
+    accepted = bool(pr.get("accepted"))
+    status_str = "ACCEPTED" if accepted else "REJECTED"
+    reason = pr.get("decision_reason") or pr.get("reason") or ""
+    lines = [
+        f"### Round {r_num} ({status_str})",
+        (
+            f"- Round {r_num}: accepted={pr.get('accepted')} | "
+            f"reason={reason} | "
+            f"mean_score={pr.get('mean_candidate')} | "
+            f"tokens_median={pr.get('tokens_median')} | "
+            f"wall_median_s={pr.get('t_total_median_s')}"
+        ),
+    ]
+    if pr.get("diagnosis"):
+        lines.append(f"- diagnosis: {pr.get('diagnosis')}")
+    if pr.get("changes_summary"):
+        lines.append(f"- summary: {pr.get('changes_summary')}")
+
+    wo = pr.get("without") if isinstance(pr.get("without"), Mapping) else {}
+    cur = pr.get("current_with") if isinstance(pr.get("current_with"), Mapping) else {}
+    cand = pr.get("candidate") if isinstance(pr.get("candidate"), Mapping) else {}
+
+    wo_mean = wo.get("mean", pr.get("mean_without"))
+    cur_mean = cur.get("mean", pr.get("mean_current_with"))
+    cand_mean = cand.get("mean", pr.get("mean_candidate"))
+
+    wo_ver = (wo.get("verify") or {}).get("rate") if isinstance(wo.get("verify"), Mapping) else pr.get("verify_without")
+    cur_ver = (cur.get("verify") or {}).get("rate") if isinstance(cur.get("verify"), Mapping) else pr.get("verify_current_with")
+    cand_ver = (cand.get("verify") or {}).get("rate") if isinstance(cand.get("verify"), Mapping) else pr.get("verify_candidate")
+
+    wo_tok = wo.get("tokens_median", pr.get("tokens_without"))
+    cur_tok = cur.get("tokens_median", pr.get("tokens_current_with"))
+    cand_tok = cand.get("tokens_median", pr.get("tokens_median"))
+
+    wo_wall = wo.get("t_total_median_s", pr.get("wall_without_s"))
+    cur_wall = cur.get("t_total_median_s", pr.get("wall_current_with_s"))
+    cand_wall = cand.get("t_total_median_s", pr.get("t_total_median_s"))
+
+    lines.append(
+        "- 3-way numbers (WITHOUT -> Current WITH -> Candidate WITH): "
+        f"mean={_fmt_num(wo_mean)} -> {_fmt_num(cur_mean)} -> {_fmt_num(cand_mean)} | "
+        f"verify={_fmt_num(wo_ver, 'pct')} -> {_fmt_num(cur_ver, 'pct')} -> {_fmt_num(cand_ver, 'pct')} | "
+        f"tokens={_fmt_num(wo_tok, 'int')} -> {_fmt_num(cur_tok, 'int')} -> {_fmt_num(cand_tok, 'int')} | "
+        f"wall={_fmt_num(wo_wall, '.1f', 's')} -> {_fmt_num(cur_wall, '.1f', 's')} -> {_fmt_num(cand_wall, '.1f', 's')}"
+    )
+
+    model_gates = pr.get("model_gates")
+    if isinstance(model_gates, list) and model_gates:
+        lines.append("- Per-model gate results:")
+        for mg in model_gates:
+            if not isinstance(mg, Mapping):
+                continue
+            m_ex = mg.get("executor")
+            m_ok = "ACCEPTED" if mg.get("accepted") else "REJECTED"
+            m_rsn = mg.get("decision_reason") or ""
+            m_wo = mg.get("without") if isinstance(mg.get("without"), Mapping) else {}
+            m_cur = mg.get("current_with") if isinstance(mg.get("current_with"), Mapping) else {}
+            m_cand = mg.get("candidate") if isinstance(mg.get("candidate"), Mapping) else {}
+            lines.append(
+                f"  - `{m_ex}`: {m_ok} ({m_rsn}) | "
+                f"3-way mean={_fmt_num(m_wo.get('mean'))} -> {_fmt_num(m_cur.get('mean'))} -> {_fmt_num(m_cand.get('mean'))} | "
+                f"verify={_fmt_num((m_wo.get('verify') or {}).get('rate'), 'pct')} -> "
+                f"{_fmt_num((m_cur.get('verify') or {}).get('rate'), 'pct')} -> "
+                f"{_fmt_num((m_cand.get('verify') or {}).get('rate'), 'pct')} | "
+                f"tokens={_fmt_num(m_wo.get('tokens_median'), 'int')} -> "
+                f"{_fmt_num(m_cur.get('tokens_median'), 'int')} -> "
+                f"{_fmt_num(m_cand.get('tokens_median'), 'int')} | "
+                f"wall={_fmt_num(m_wo.get('t_total_median_s'), '.1f', 's')} -> "
+                f"{_fmt_num(m_cur.get('t_total_median_s'), '.1f', 's')} -> "
+                f"{_fmt_num(m_cand.get('t_total_median_s'), '.1f', 's')}"
+            )
+
+    cand_md = (
+        pr.get("skill_markdown")
+        or pr.get("candidate_markdown")
+        or pr.get("candidate_skill_md")
+        or ""
+    )
+    if isinstance(cand_md, str) and cand_md.strip():
+        lines.append(f"- Round {r_num} Candidate `SKILL.md`:")
+        lines.append("```markdown")
+        lines.append(cand_md.strip())
+        lines.append("```")
+    elif isinstance(pr.get("diff"), str) and pr["diff"].strip():
+        lines.append(f"- Round {r_num} Candidate Diff:")
+        lines.append("```diff")
+        lines.append(pr["diff"].strip())
+        lines.append("```")
+    return lines
+
+
 def build_evidence_packet(
     *,
     skill: str,
@@ -326,6 +793,7 @@ def build_evidence_packet(
     k: int,
     include_verdicts: bool = False,
     prior_rounds: Sequence[Mapping[str, Any]] = (),
+    executor: str | None = None,
 ) -> str:
     """Assemble the contrastive evidence packet for `skill` across its tasks."""
     lines = [
@@ -354,7 +822,7 @@ def build_evidence_packet(
         lines.append("```")
         lines.append("")
         for arm in ("with", "without"):
-            arm_root = runs_dir / "results" / arm
+            arm_root = _locate_arm_dir_for_evidence(runs_dir, arm, executor=executor)
             for i in range(1, k + 1):
                 rdir = resolve_rep_dir(arm_root, task.task_id, i)
                 lines.append(
@@ -365,24 +833,19 @@ def build_evidence_packet(
                     )
                 )
 
+    prior_lines: list[str] = []
     if prior_rounds:
-        lines.append("## Prior Improvement Rounds in This Session")
+        prior_lines.append("## Prior Improvement Rounds in This Session")
         for pr in prior_rounds:
-            lines.append(
-                f"- Round {pr.get('round')}: accepted={pr.get('accepted')} | "
-                f"reason={pr.get('decision_reason')} | "
-                f"mean_score={pr.get('mean_candidate')} | "
-                f"tokens_median={pr.get('tokens_median')} | "
-                f"wall_median_s={pr.get('t_total_median_s')}"
-            )
-            if pr.get("changes_summary"):
-                lines.append(f"  summary: {pr.get('changes_summary')}")
-        lines.append("")
+            prior_lines.extend(_format_prior_round_block(pr))
+        prior_lines.append("")
 
-    out = "\n".join(lines)
-    if len(out) > MAX_EVIDENCE_CHARS:
-        out = out[:MAX_EVIDENCE_CHARS] + "\n\n...[evidence packet truncated to fit CLI limit]...\n"
-    return out
+    body = "\n".join(lines)
+    tail = ("\n" + "\n".join(prior_lines)) if prior_lines else ""
+    if len(body) + len(tail) > MAX_EVIDENCE_CHARS:
+        budget = max(1000, MAX_EVIDENCE_CHARS - len(tail))
+        body = body[:budget] + "\n\n...[evidence packet truncated to fit CLI limit]...\n"
+    return body + tail
 
 
 def build_improver_prompt(
@@ -392,6 +855,7 @@ def build_improver_prompt(
     validation_error: str = "",
     suite_name: str = "",
     banned_tools: Iterable[str] = BANNED_CLAUDE_TOOLS,
+    max_growth: float | None = DEFAULT_MAX_GROWTH_PCT,
 ) -> str:
     """Build the single-turn prompt sent to the isolated `agy` improver. `suite_name` and
     `banned_tools` come from the suite config; nothing suite-specific is hard-coded here."""
@@ -402,6 +866,11 @@ def build_improver_prompt(
     )
     suite_phrase = f"the `{suite_name}` plugin suite" if suite_name else "an AGY plugin suite"
     banned_list = ", ".join(f"`{b}`" for b in banned_tools) or "(none)"
+    growth_rule = (
+        f" Keep the candidate concise (at most +{max_growth:g}% character growth over the original)."
+        if max_growth is not None
+        else ""
+    )
     return (
         f"You are an expert Agent Harness Engineer optimizing a `SKILL.md` file in {suite_phrase} "
         "for Google Antigravity (AGY) / Jetski.\n\n"
@@ -416,7 +885,7 @@ def build_improver_prompt(
         f"use these banned tool names: {banned_list}.\n"
         "4. Fix any quality gaps where `WITH` missed root causes, edge cases, or verification checks.\n"
         "5. Streamline instructions that caused unnecessary tool calls, redundant searches for "
-        "other skills in headless/leave-one-out runs, or high token/time overhead.\n"
+        f"other skills in headless/leave-one-out runs, or high token/time overhead.{growth_rule}\n"
         "6. Return the complete, ready-to-save `SKILL.md` content in `skill_markdown`.\n"
         f"{retry_block}\n"
         "## Evidence Packet\n\n"
@@ -540,10 +1009,17 @@ def propose_skill(
     timeout: int = DEFAULT_JUDGE_TIMEOUT_S,
     max_attempts: int = 2,
     suite: SuiteConfig | None = None,
+    max_growth: float | None = None,
+    max_growth_pct: float | None = None,
 ) -> dict[str, Any]:
     """Propose and validate a candidate `SKILL.md` (with up to `max_attempts` retries). The
     prompt names `suite` and its `banned_tools` (the active suite when None)."""
     suite = suite if suite is not None else active_suite()
+    eff_growth = (
+        max_growth
+        if max_growth is not None
+        else (max_growth_pct if max_growth_pct is not None else DEFAULT_MAX_GROWTH_PCT)
+    )
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         prompt = build_improver_prompt(
@@ -552,6 +1028,7 @@ def propose_skill(
             validation_error=last_err,
             suite_name=suite.name,
             banned_tools=suite.banned_tools,
+            max_growth=eff_growth,
         )
         res = run_improver_once(prompt, model=model, timeout=timeout)
         if res is None:
@@ -562,6 +1039,7 @@ def propose_skill(
             target_skill=skill,
             original_md=original_md,
             banned_tools=suite.banned_tools,
+            max_growth=eff_growth,
         )
         if errs:
             last_err = "; ".join(errs)
@@ -583,13 +1061,44 @@ def unified_skill_diff(original_md: str, candidate_md: str, *, skill: str) -> st
     )
 
 
+def _judged_scores_map(results_dir: Path) -> dict[tuple[str, str], dict[str, int]]:
+    """Fallback `(task_id, label) -> {n_passed, n_criteria}` from `base_judged.json`."""
+    jp = Path(results_dir) / "base_judged.json"
+    if not jp.is_file():
+        return {}
+    try:
+        rows = json.loads(jp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    out: dict[tuple[str, str], dict[str, int]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        tid = str(row.get("task") or row.get("task_id") or "")
+        lbl = str(row.get("label") or "")
+        sc = row.get("score")
+        if tid and lbl and isinstance(sc, Mapping):
+            np = sc.get("n_passed")
+            nc = sc.get("n_criteria")
+            if isinstance(np, int) and isinstance(nc, int) and nc > 0:
+                out[(tid, lbl)] = {"n_passed": np, "n_criteria": nc}
+    return out
+
+
 def summarize_arm_runs(
     tasks: Sequence[SkillbenchTask],
     results_dir: Path,
     *,
     k: int,
+    executor: str | None = None,
 ) -> dict[str, Any]:
     """Compute aggregate metrics over `<results_dir>/<safe_tid>__b1..bk` for `tasks`."""
+    results_dir = Path(results_dir)
+    detected_exec = detect_cell_executor(results_dir, tasks, k=k)
+    fallback_scores = _judged_scores_map(results_dir)
+
     task_means: dict[str, float] = {}
     all_fracs: list[float] = []
     invoked_count = 0
@@ -604,9 +1113,12 @@ def summarize_arm_runs(
     criteria_totals: dict[str, list[bool]] = {}
     invalid_reasons: list[str] = []
     per_task: dict[str, Any] = {}
+    task_hardness_labels: list[str] = []
+    eff_min_reps = min(MIN_BASELINE_REPS, max(1, k))
 
     for task in tasks:
         t_fracs: list[float] = []
+        t_missed: list[int] = []
         t_reps: list[dict[str, Any]] = []
         for i in range(1, k + 1):
             total_reps += 1
@@ -614,11 +1126,16 @@ def summarize_arm_runs(
             timing = _read_json(rdir / SKILL_TIMING_FILE)
             judg = _read_json(rdir / JUDGMENTS_FILE)
             verify = _read_json(rdir / VERIFY_FILE)
-            dstats = diff_stats(rdir) if rdir.is_dir() else {"files": 0, "added": 0, "removed": 0}
+            dstats = (diff_stats(rdir) if rdir.is_dir() else None) or {
+                "files": 0,
+                "added": 0,
+                "removed": 0,
+            }
             valid = bool(timing.get("valid"))
             if not valid and timing.get("invalid_reason"):
                 invalid_reasons.append(str(timing["invalid_reason"]))
             frac: float | None = None
+            n_missed: int | None = None
             if valid:
                 valid_count += 1
                 if timing.get("invoked"):
@@ -635,13 +1152,21 @@ def summarize_arm_runs(
                     if verify["passed"]:
                         verify_passed += 1
                 j_list = judg.get("judgments")
+                first: Mapping[str, Any] | None = None
                 if isinstance(j_list, list) and j_list and isinstance(j_list[0], dict):
                     first = j_list[0]
+                elif (task.task_id, f"base{i}") in fallback_scores:
+                    first = fallback_scores[(task.task_id, f"base{i}")]
+                elif (task.task_id, f"b{i}") in fallback_scores:
+                    first = fallback_scores[(task.task_id, f"b{i}")]
+                if first is not None:
                     np = first.get("n_passed")
                     nc = first.get("n_criteria")
                     if isinstance(np, int) and isinstance(nc, int) and nc > 0:
                         frac = np / nc
+                        n_missed = nc - np
                         t_fracs.append(frac)
+                        t_missed.append(n_missed)
                         all_fracs.append(frac)
                     for c in first.get("criteria") or []:
                         if isinstance(c, dict) and isinstance(c.get("id"), str):
@@ -657,6 +1182,7 @@ def summarize_arm_runs(
                     "t_total_s": timing.get("t_total_s"),
                     "total_tokens": timing.get("total_tokens"),
                     "frac": frac,
+                    "n_missed": n_missed,
                     "verify_passed": verify.get("passed") if verify else None,
                     "diff_lines": dstats["added"] + dstats["removed"],
                 }
@@ -664,14 +1190,33 @@ def summarize_arm_runs(
         t_mean = st.fmean(t_fracs) if t_fracs else None
         if t_mean is not None:
             task_means[task.task_id] = t_mean
+        min_fail = max(1, int(getattr(task, "min_baseline_fail", 1) or 1))
+        if len(t_missed) < eff_min_reps:
+            thard = HARDNESS_UNCLASSIFIED
+        elif any(m >= min_fail for m in t_missed):
+            thard = HARDNESS_INFORMATIVE
+        else:
+            thard = HARDNESS_CEILING
+        task_hardness_labels.append(thard)
         per_task[task.task_id] = {
             "mean": t_mean,
             "n_valid": sum(1 for r in t_reps if r["valid"]),
+            "hardness": thard,
+            "baseline_missed": t_missed,
             "reps": t_reps,
         }
 
     mean_score = st.fmean(task_means.values()) if task_means else None
+    total_tasks = len(task_hardness_labels)
+    ceiling_tasks = sum(1 for lbl in task_hardness_labels if lbl == HARDNESS_CEILING)
+    informative_tasks = sum(1 for lbl in task_hardness_labels if lbl == HARDNESS_INFORMATIVE)
+    unclassified_tasks = sum(1 for lbl in task_hardness_labels if lbl == HARDNESS_UNCLASSIFIED)
+    ceiling_share = (ceiling_tasks / total_tasks) if total_tasks > 0 else None
+    needs_harder = ceiling_share is not None and ceiling_share > CEILING_FLAG_SHARE
+
     return {
+        "executor": detected_exec or executor,
+        "recorded_executor": detected_exec,
         "mean": mean_score,
         "n_valid": valid_count,
         "n_total": total_reps,
@@ -685,6 +1230,12 @@ def summarize_arm_runs(
             "total": verify_total,
             "rate": (verify_passed / verify_total) if verify_total > 0 else None,
         },
+        "ceiling_tasks": ceiling_tasks,
+        "informative_tasks": informative_tasks,
+        "unclassified_tasks": unclassified_tasks,
+        "total_tasks": total_tasks,
+        "ceiling_share": ceiling_share,
+        "needs_harder_tasks": needs_harder,
         "criteria_pass_rates": {
             cid: sum(1 for v in vals if v) / len(vals)
             for cid, vals in sorted(criteria_totals.items())
@@ -703,50 +1254,68 @@ def probe_candidate(
     out_results_dir: Path,
     k: int,
     root: Path | None = None,
+    executor: str | None = None,
+    judge: str | None = None,
+    baseline_executor: str | None = None,
+    allow_model_mismatch: bool = False,
 ) -> dict[str, Any]:
     """Stage `candidate_skill_path`, run all `tasks` for `k` reps, and score each rollout."""
-    adapter = SkillbenchAdapter(arm="with", root=root)
-    install = adapter.substrate.materialise(
-        adapter.base_harness(),
-        adapter.spec,
-        {
-            "arm": "with",
-            "target_skill": skill,
-            "skill_override": str(candidate_skill_path),
-        },
-    )
-    out_results_dir.mkdir(parents=True, exist_ok=True)
-    jobs: list[tuple[SkillbenchTask, str, Path]] = []
-    for task in tasks:
-        prompt = build_prompt(task)
-        for i in range(1, k + 1):
-            rdir = out_results_dir / task.task_id / f"base{i}"
-            jobs.append((task, prompt, rdir))
+    eff_exec = executor.strip() if executor and executor.strip() else (baseline_executor or exec_model())
+    if (
+        baseline_executor
+        and eff_exec != baseline_executor
+        and not allow_model_mismatch
+    ):
+        raise ValueError(
+            f"model mismatch: probe executor {eff_exec!r} does not match baseline executor "
+            f"{baseline_executor!r} (pass --allow-model-mismatch to override)"
+        )
+    with executor_env(eff_exec, judge, matrix=False):
+        adapter = SkillbenchAdapter(arm="with", root=root, executor=eff_exec)
+        install = adapter.substrate.materialise(
+            adapter.base_harness(),
+            adapter.spec,
+            {
+                "arm": "with",
+                "target_skill": skill,
+                "skill_override": str(candidate_skill_path),
+            },
+        )
+        out_results_dir.mkdir(parents=True, exist_ok=True)
+        jobs: list[tuple[SkillbenchTask, str, Path]] = []
+        for task in tasks:
+            prompt = build_prompt(task)
+            for i in range(1, k + 1):
+                rdir = out_results_dir / task.task_id / f"base{i}"
+                jobs.append((task, prompt, rdir))
 
-    def _run_one(job: tuple[SkillbenchTask, str, Path]) -> None:
-        t, p, rd = job
-        if not (rd / SKILL_TIMING_FILE).is_file() or not rollout_valid(rd):
-            run_rollout(
-                install,
-                rd,
-                prompt=p,
-                fixture=t.fixture,
-                timeout=t.timeout,
-            )
-        score(rd, t, root=root)
+        def _run_one(job: tuple[SkillbenchTask, str, Path]) -> None:
+            t, p, rd = job
+            if not (rd / SKILL_TIMING_FILE).is_file() or not rollout_valid(rd):
+                run_rollout(
+                    install,
+                    rd,
+                    prompt=p,
+                    fixture=t.fixture,
+                    timeout=t.timeout,
+                )
+            score(rd, t, root=root)
 
-    try:
-        workers = max(1, min(len(jobs), 3))
-        if workers == 1:
-            for j in jobs:
-                _run_one(j)
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                list(pool.map(_run_one, jobs))
-    finally:
-        shutil.rmtree(install.staging_dir, ignore_errors=True)
+        try:
+            workers = max(1, min(len(jobs), 3))
+            if workers == 1:
+                for j in jobs:
+                    _run_one(j)
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(_run_one, jobs))
+        finally:
+            shutil.rmtree(install.staging_dir, ignore_errors=True)
 
-    return summarize_arm_runs(tasks, out_results_dir, k=k)
+        summary = summarize_arm_runs(tasks, out_results_dir, k=k, executor=eff_exec)
+        if not summary.get("executor"):
+            summary["executor"] = eff_exec
+        return summary
 
 
 def evaluate_acceptance(
@@ -825,6 +1394,62 @@ def evaluate_acceptance(
     )
 
 
+def _summary_rank_tuple(summary: Mapping[str, Any]) -> tuple[float, float, float, float]:
+    """`(verify, mean, -tokens, -wall)` for one candidate summary dict."""
+    ver_obj = summary.get("verify")
+    ver_rate = ver_obj.get("rate") if isinstance(ver_obj, Mapping) else summary.get("verify_rate")
+    v_val = (
+        float(ver_rate)
+        if isinstance(ver_rate, (int, float)) and not isinstance(ver_rate, bool)
+        else -1.0
+    )
+    m_raw = summary.get("mean", summary.get("mean_candidate"))
+    m_val = (
+        float(m_raw)
+        if isinstance(m_raw, (int, float)) and not isinstance(m_raw, bool)
+        else -1.0
+    )
+    tok_raw = summary.get("tokens_median")
+    neg_tok = (
+        -float(tok_raw)
+        if isinstance(tok_raw, (int, float)) and not isinstance(tok_raw, bool)
+        else float("-inf")
+    )
+    wall_raw = summary.get("t_total_median_s")
+    neg_wall = (
+        -float(wall_raw)
+        if isinstance(wall_raw, (int, float)) and not isinstance(wall_raw, bool)
+        else float("-inf")
+    )
+    return (v_val, m_val, neg_tok, neg_wall)
+
+
+def round_rank_key(summary_or_round: Mapping[str, Any]) -> tuple[float, float, float, float]:
+    """Lexicographic key `(verify, mean, -tokens, -wall)` for selecting the best round."""
+    gates = summary_or_round.get("model_gates")
+    if isinstance(gates, list) and gates:
+        tuples = [
+            _summary_rank_tuple(g["candidate"])
+            for g in gates
+            if isinstance(g, Mapping) and isinstance(g.get("candidate"), Mapping)
+        ]
+        if tuples:
+            v_vals = [t[0] for t in tuples if t[0] >= 0.0]
+            m_vals = [t[1] for t in tuples if t[1] >= 0.0]
+            tok_vals = [t[2] for t in tuples if t[2] != float("-inf")]
+            wall_vals = [t[3] for t in tuples if t[3] != float("-inf")]
+            return (
+                st.fmean(v_vals) if v_vals else -1.0,
+                st.fmean(m_vals) if m_vals else -1.0,
+                st.fmean(tok_vals) if tok_vals else float("-inf"),
+                st.fmean(wall_vals) if wall_vals else float("-inf"),
+            )
+    cand = summary_or_round.get("candidate")
+    if isinstance(cand, Mapping):
+        return _summary_rank_tuple(cand)
+    return _summary_rank_tuple(summary_or_round)
+
+
 def _fmt_num(v: Any, fmt: str = ".2f", suffix: str = "") -> str:
     if v is None or isinstance(v, bool) or not isinstance(v, (int, float)):
         return "—"
@@ -835,32 +1460,91 @@ def _fmt_num(v: Any, fmt: str = ".2f", suffix: str = "") -> str:
     return f"{v:{fmt}}{suffix}"
 
 
+def _arm_exec_str(arm_summary: Mapping[str, Any], fallback: Any) -> str:
+    return (
+        _str_or_none(arm_summary.get("executor"))
+        or _str_or_none(arm_summary.get("recorded_executor"))
+        or _str_or_none(fallback)
+        or "—"
+    )
+
+
+def _model_gates_for_skill_record(
+    s: Mapping[str, Any],
+    fallback_exec: Any,
+    fallback_judge: Any,
+) -> list[dict[str, Any]]:
+    gates = s.get("model_gates")
+    if isinstance(gates, list) and gates:
+        return [dict(g) for g in gates if isinstance(g, Mapping)]
+    wo = s.get("without") if isinstance(s.get("without"), Mapping) else {}
+    cur = s.get("current_with") if isinstance(s.get("current_with"), Mapping) else {}
+    cand = s.get("best_candidate") if isinstance(s.get("best_candidate"), Mapping) else {}
+    wo_ex = _arm_exec_str(wo, fallback_exec)
+    cur_ex = _arm_exec_str(cur, fallback_exec)
+    cand_ex = _arm_exec_str(cand, fallback_exec)
+    return [
+        {
+            "executor": cand_ex if cand_ex != "—" else (cur_ex if cur_ex != "—" else wo_ex),
+            "judge": _str_or_none(fallback_judge) or "—",
+            "without_executor": wo_ex,
+            "current_with_executor": cur_ex,
+            "candidate_executor": cand_ex,
+            "accepted": bool(s.get("accepted")),
+            "skipped": bool(s.get("skipped")),
+            "decision_reason": str(s.get("decision_reason") or ""),
+            "without": wo,
+            "current_with": cur,
+            "candidate": cand,
+        }
+    ]
+
+
 def render_improve_markdown(record: Mapping[str, Any]) -> str:
     """Render `improve_report.md` for one or more improved skills."""
+    fallback_exec = record.get("executor_model")
+    fallback_judge = record.get("judge_model")
+    models_hdr = record.get("models")
+    models_line = (
+        f"- **Models**: `{', '.join(str(m) for m in models_hdr)}`"
+        if isinstance(models_hdr, list) and models_hdr
+        else None
+    )
     lines = [
         "# skillbench Skill Improvement Report (3-Way Comparison)",
         "",
         f"- **Improver model**: `{record.get('improver_model')}`",
-        f"- **Executor model**: `{record.get('executor_model')}`",
-        f"- **Judge model**: `{record.get('judge_model')}`",
-        f"- **Include verdicts in evidence**: `{record.get('include_verdicts')}`",
-        "",
-        "## Summary: `WITHOUT` vs `Current WITH` vs `Candidate WITH`",
-        "",
-        "| Skill | Status | WITHOUT | Current WITH | Candidate WITH | Lift (Cand vs Cur) | Verify (W/O → Cur → Cand) | Tokens (W/O → Cur → Cand) | Wall s (W/O → Cur → Cand) |",
-        "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        f"- **Executor model**: `{fallback_exec}`",
+        f"- **Judge model**: `{fallback_judge}`",
     ]
+    if models_line:
+        lines.append(models_line)
+    lines.extend(
+        [
+            f"- **Include verdicts in evidence**: `{record.get('include_verdicts')}`",
+            "",
+            "## Summary: `WITHOUT` vs `Current WITH` vs `Candidate WITH`",
+            "",
+            "| Skill | Status | WITHOUT | Current WITH | Candidate WITH | Lift (Cand vs Cur) | Verify (W/O → Cur → Cand) | Tokens (W/O → Cur → Cand) | Wall s (W/O → Cur → Cand) |",
+            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
     for skill, s in sorted((record.get("skills") or {}).items()):
-        wo = s["without"]
-        cur = s["current_with"]
-        cand = s["best_candidate"]
+        wo = s.get("without") or {}
+        cur = s.get("current_with") or {}
+        cand = s.get("best_candidate") or {}
         delta_cur = (
             cand["mean"] - cur["mean"]
             if isinstance(cand.get("mean"), (int, float))
             and isinstance(cur.get("mean"), (int, float))
             else None
         )
-        status = "ACCEPTED" if s.get("accepted") else "REJECTED"
+        if s.get("skipped"):
+            status = "SKIPPED"
+        elif s.get("accepted"):
+            status = "ACCEPTED"
+        else:
+            status = "REJECTED"
         lines.append(
             f"| `{skill}` | **{status}** | {_fmt_num(wo.get('mean'))} | "
             f"{_fmt_num(cur.get('mean'))} | **{_fmt_num(cand.get('mean'))}** | "
@@ -877,15 +1561,77 @@ def render_improve_markdown(record: Mapping[str, Any]) -> str:
         )
 
     for skill, s in sorted((record.get("skills") or {}).items()):
+        wo = s.get("without") or {}
+        cur = s.get("current_with") or {}
+        cand = s.get("best_candidate") or {}
+        wo_ex = _arm_exec_str(wo, fallback_exec)
+        cur_ex = _arm_exec_str(cur, fallback_exec)
+        cand_ex = _arm_exec_str(cand, fallback_exec)
+        if s.get("skipped"):
+            status = "SKIPPED"
+        elif s.get("accepted"):
+            status = "ACCEPTED"
+        else:
+            status = "REJECTED"
+        gates = _model_gates_for_skill_record(s, fallback_exec, fallback_judge)
         lines.extend(
             [
                 "",
-                f"## Skill: `{skill}` ({'ACCEPTED' if s.get('accepted') else 'REJECTED'})",
+                f"## Skill: `{skill}` ({status})",
                 "",
                 f"- **Decision**: {s.get('decision_reason')}",
+                (
+                    f"- **Arm executors**: WITHOUT=`{wo_ex}` | "
+                    f"Current WITH=`{cur_ex}` | Candidate WITH=`{cand_ex}`"
+                ),
                 f"- **Winning round**: `{s.get('best_round')}` (of {len(s.get('rounds') or [])})",
                 f"- **Diagnosis**: {s.get('diagnosis')}",
                 f"- **Changes summary**: {s.get('changes_summary')}",
+                "",
+                "### Per-Model Gate (`WITHOUT` vs `Current WITH` vs `Candidate WITH`)",
+                "",
+                "| Executor | Gate | WITHOUT (executor) | Current WITH (executor) | Candidate WITH (executor) | Lift (Cand vs Cur) | Verify (W/O → Cur → Cand) | Tokens (W/O → Cur → Cand) | Wall s (W/O → Cur → Cand) | Reason |",
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |",
+            ]
+        )
+        for g in gates:
+            g_wo = g.get("without") or {}
+            g_cur = g.get("current_with") or {}
+            g_cand = g.get("candidate") or {}
+            g_wo_ex = g.get("without_executor") or _arm_exec_str(g_wo, g.get("executor") or fallback_exec)
+            g_cur_ex = g.get("current_with_executor") or _arm_exec_str(g_cur, g.get("executor") or fallback_exec)
+            g_cand_ex = g.get("candidate_executor") or _arm_exec_str(g_cand, g.get("executor") or fallback_exec)
+            g_delta = (
+                g_cand["mean"] - g_cur["mean"]
+                if isinstance(g_cand.get("mean"), (int, float))
+                and isinstance(g_cur.get("mean"), (int, float))
+                else None
+            )
+            if g.get("skipped"):
+                g_status = "SKIPPED"
+            elif g.get("accepted"):
+                g_status = "ACCEPTED"
+            else:
+                g_status = "REJECTED"
+            lines.append(
+                f"| `{g.get('executor')}` | **{g_status}** | "
+                f"{_fmt_num(g_wo.get('mean'))} (`{g_wo_ex}`) | "
+                f"{_fmt_num(g_cur.get('mean'))} (`{g_cur_ex}`) | "
+                f"**{_fmt_num(g_cand.get('mean'))}** (`{g_cand_ex}`) | "
+                f"{_fmt_num(g_delta, '+.2f')} | "
+                f"{_fmt_num((g_wo.get('verify') or {}).get('rate'), 'pct')} → "
+                f"{_fmt_num((g_cur.get('verify') or {}).get('rate'), 'pct')} → "
+                f"{_fmt_num((g_cand.get('verify') or {}).get('rate'), 'pct')} | "
+                f"{_fmt_num(g_wo.get('tokens_median'), 'int')} → "
+                f"{_fmt_num(g_cur.get('tokens_median'), 'int')} → "
+                f"{_fmt_num(g_cand.get('tokens_median'), 'int')} | "
+                f"{_fmt_num(g_wo.get('t_total_median_s'), '.1f', 's')} → "
+                f"{_fmt_num(g_cur.get('t_total_median_s'), '.1f', 's')} → "
+                f"{_fmt_num(g_cand.get('t_total_median_s'), '.1f', 's')} | "
+                f"{g.get('decision_reason') or ''} |"
+            )
+        lines.extend(
+            [
                 "",
                 "### Proposed `SKILL.md` Diff (`best.patch`)",
                 "",
@@ -903,19 +1649,28 @@ def render_improve_markdown(record: Mapping[str, Any]) -> str:
 def render_improve_html(record: Mapping[str, Any]) -> str:
     """Render a self-contained interactive 3-way HTML dashboard (`improve_report.html`)."""
     e = html.escape
+    fallback_exec = record.get("executor_model")
+    fallback_judge = record.get("judge_model")
     rows_html: list[str] = []
     cards_html: list[str] = []
     for skill, s in sorted((record.get("skills") or {}).items()):
-        wo = s["without"]
-        cur = s["current_with"]
-        cand = s["best_candidate"]
+        wo = s.get("without") or {}
+        cur = s.get("current_with") or {}
+        cand = s.get("best_candidate") or {}
+        wo_ex = _arm_exec_str(wo, fallback_exec)
+        cur_ex = _arm_exec_str(cur, fallback_exec)
+        cand_ex = _arm_exec_str(cand, fallback_exec)
+        skipped = bool(s.get("skipped"))
         accepted = bool(s.get("accepted"))
-        badge_cls = (
-            "bg-emerald-500/15 text-emerald-500"
-            if accepted
-            else "bg-amber-500/15 text-amber-500"
-        )
-        badge_txt = "ACCEPTED" if accepted else "REJECTED"
+        if skipped:
+            badge_cls = "bg-slate-500/15 text-slate-400"
+            badge_txt = "SKIPPED"
+        elif accepted:
+            badge_cls = "bg-emerald-500/15 text-emerald-500"
+            badge_txt = "ACCEPTED"
+        else:
+            badge_cls = "bg-amber-500/15 text-amber-500"
+            badge_txt = "REJECTED"
         delta_cur = (
             cand["mean"] - cur["mean"]
             if isinstance(cand.get("mean"), (int, float))
@@ -926,9 +1681,9 @@ def render_improve_html(record: Mapping[str, Any]) -> str:
             f"<tr class='border-b border-[var(--border,#334155)]'>"
             f"<td class='py-2.5 px-3 font-mono text-xs'>{e(skill)}</td>"
             f"<td class='py-2.5 px-3'><span class='inline-block rounded-full px-2.5 py-0.5 text-xs font-semibold {badge_cls}'>{badge_txt}</span></td>"
-            f"<td class='py-2.5 px-3 text-right tabular-nums'>{e(_fmt_num(wo.get('mean')))}</td>"
-            f"<td class='py-2.5 px-3 text-right tabular-nums'>{e(_fmt_num(cur.get('mean')))}</td>"
-            f"<td class='py-2.5 px-3 text-right tabular-nums font-semibold'>{e(_fmt_num(cand.get('mean')))}</td>"
+            f"<td class='py-2.5 px-3 text-right tabular-nums'>{e(_fmt_num(wo.get('mean')))} <span class='text-xs text-[var(--muted-foreground,#94a3b8)] font-mono'>({e(wo_ex)})</span></td>"
+            f"<td class='py-2.5 px-3 text-right tabular-nums'>{e(_fmt_num(cur.get('mean')))} <span class='text-xs text-[var(--muted-foreground,#94a3b8)] font-mono'>({e(cur_ex)})</span></td>"
+            f"<td class='py-2.5 px-3 text-right tabular-nums font-semibold'>{e(_fmt_num(cand.get('mean')))} <span class='text-xs text-[var(--muted-foreground,#94a3b8)] font-mono'>({e(cand_ex)})</span></td>"
             f"<td class='py-2.5 px-3 text-right tabular-nums'>{e(_fmt_num(delta_cur, '+.2f'))}</td>"
             f"<td class='py-2.5 px-3 text-right tabular-nums'>{e(_fmt_num((wo.get('verify') or {}).get('rate'), 'pct'))} → "
             f"{e(_fmt_num((cur.get('verify') or {}).get('rate'), 'pct'))} → "
@@ -943,11 +1698,59 @@ def render_improve_html(record: Mapping[str, Any]) -> str:
             f"<strong>{e(_fmt_num(cand.get('t_total_median_s'), '.1f', 's'))}</strong></td>"
             f"</tr>"
         )
+
+        gates = _model_gates_for_skill_record(s, fallback_exec, fallback_judge)
+        gate_rows_html: list[str] = []
+        for g in gates:
+            g_wo = g.get("without") or {}
+            g_cur = g.get("current_with") or {}
+            g_cand = g.get("candidate") or {}
+            g_wo_ex = g.get("without_executor") or _arm_exec_str(g_wo, g.get("executor") or fallback_exec)
+            g_cur_ex = g.get("current_with_executor") or _arm_exec_str(g_cur, g.get("executor") or fallback_exec)
+            g_cand_ex = g.get("candidate_executor") or _arm_exec_str(g_cand, g.get("executor") or fallback_exec)
+            g_delta = (
+                g_cand["mean"] - g_cur["mean"]
+                if isinstance(g_cand.get("mean"), (int, float))
+                and isinstance(g_cur.get("mean"), (int, float))
+                else None
+            )
+            if g.get("skipped"):
+                g_cls = "bg-slate-500/15 text-slate-400"
+                g_txt = "SKIPPED"
+            elif g.get("accepted"):
+                g_cls = "bg-emerald-500/15 text-emerald-500"
+                g_txt = "ACCEPTED"
+            else:
+                g_cls = "bg-amber-500/15 text-amber-500"
+                g_txt = "REJECTED"
+            gate_rows_html.append(
+                f"<tr class='border-b border-[var(--border,#334155)]' data-executor='{e(str(g.get('executor') or ''))}'>"
+                f"<td class='py-1.5 px-2 font-mono text-xs'>{e(str(g.get('executor') or ''))}</td>"
+                f"<td class='py-1.5 px-2'><span class='inline-block rounded-full px-2 py-0.5 text-xs font-semibold {g_cls}'>{g_txt}</span></td>"
+                f"<td class='py-1.5 px-2 text-right tabular-nums'>{e(_fmt_num(g_wo.get('mean')))} <code class='text-xs'>({e(str(g_wo_ex))})</code></td>"
+                f"<td class='py-1.5 px-2 text-right tabular-nums'>{e(_fmt_num(g_cur.get('mean')))} <code class='text-xs'>({e(str(g_cur_ex))})</code></td>"
+                f"<td class='py-1.5 px-2 text-right tabular-nums font-semibold'>{e(_fmt_num(g_cand.get('mean')))} <code class='text-xs'>({e(str(g_cand_ex))})</code></td>"
+                f"<td class='py-1.5 px-2 text-right tabular-nums'>{e(_fmt_num(g_delta, '+.2f'))}</td>"
+                f"<td class='py-1.5 px-2 text-left text-xs'>{e(str(g.get('decision_reason') or ''))}</td>"
+                f"</tr>"
+            )
+
         cards_html.append(
             f"<div class='bg-[var(--card,#1e293b)] border border-[var(--border,#334155)] rounded-xl p-5 mb-4 shadow-sm'>"
             f"<h3 class='text-base font-semibold mb-2'><code class='font-mono'>{e(skill)}</code> — "
             f"<span class='inline-block rounded-full px-2.5 py-0.5 text-xs font-semibold {badge_cls}'>{badge_txt}</span></h3>"
-            f"<p class='text-sm mb-2'><strong>Decision:</strong> {e(str(s.get('decision_reason') or ''))}</p>"
+            f"<p class='text-sm mb-1'><strong>Decision:</strong> {e(str(s.get('decision_reason') or ''))}</p>"
+            f"<p class='text-xs text-[var(--muted-foreground,#94a3b8)] mb-3'><strong>Arm executors:</strong> "
+            f"WITHOUT <code class='font-mono'>{e(wo_ex)}</code> · "
+            f"Current WITH <code class='font-mono'>{e(cur_ex)}</code> · "
+            f"Candidate WITH <code class='font-mono'>{e(cand_ex)}</code></p>"
+            f"<table class='w-full text-xs border-collapse mb-3'>"
+            f"<thead><tr class='border-b border-[var(--border,#334155)] text-[var(--muted-foreground,#94a3b8)]'>"
+            f"<th class='py-1 px-2 text-left'>Executor</th><th class='py-1 px-2 text-left'>Gate</th>"
+            f"<th class='py-1 px-2 text-right'>WITHOUT</th><th class='py-1 px-2 text-right'>Current WITH</th>"
+            f"<th class='py-1 px-2 text-right'>Candidate WITH</th><th class='py-1 px-2 text-right'>Δ</th>"
+            f"<th class='py-1 px-2 text-left'>Reason</th></tr></thead>"
+            f"<tbody>{''.join(gate_rows_html)}</tbody></table>"
             f"<p class='text-sm text-[var(--muted-foreground,#94a3b8)] mb-2 whitespace-pre-line'><strong>Diagnosis:</strong>\n{e(str(s.get('diagnosis') or ''))}</p>"
             f"<p class='text-sm text-[var(--muted-foreground,#94a3b8)] mb-3 whitespace-pre-line'><strong>Changes Summary:</strong>\n{e(str(s.get('changes_summary') or ''))}</p>"
             f"<details open><summary class='text-xs font-semibold cursor-pointer mb-2'>Unified Diff (<code>best.patch</code>)</summary>"
@@ -967,8 +1770,8 @@ def render_improve_html(record: Mapping[str, Any]) -> str:
   <h1 class="text-xl font-bold mb-1">skillbench-improve: 3-Way Skill Optimization Report</h1>
   <div class="text-xs text-[var(--muted-foreground,#94a3b8)] mb-5">
     Improver: <code class="font-mono">{e(str(record.get('improver_model')))}</code> ·
-    Executor: <code class="font-mono">{e(str(record.get('executor_model')))}</code> ·
-    Judge: <code class="font-mono">{e(str(record.get('judge_model')))}</code> ·
+    Executor: <code class="font-mono">{e(str(fallback_exec))}</code> ·
+    Judge: <code class="font-mono">{e(str(fallback_judge))}</code> ·
     Verdicts in evidence: <code class="font-mono">{e(str(record.get('include_verdicts')))}</code>
   </div>
   <div class="bg-[var(--card,#1e293b)] border border-[var(--border,#334155)] rounded-xl p-5 mb-5 shadow-sm overflow-x-auto">
@@ -1000,6 +1803,279 @@ def render_improve_html(record: Mapping[str, Any]) -> str:
 """
 
 
+def _has_cell_content(cell_dir: Path, tasks: Sequence[SkillbenchTask], k: int) -> bool:
+    if not cell_dir.is_dir():
+        return False
+    if (cell_dir / "run.json").is_file() or (cell_dir / "config.json").is_file():
+        return True
+    for task in tasks:
+        for i in range(1, max(1, k) + 1):
+            if resolve_rep_dir(cell_dir, task.task_id, i).is_dir():
+                return True
+    return any(cell_dir.glob("**/skill_timing.json"))
+
+
+def _discover_matrix_exec_dirs(results_root: Path) -> list[Path]:
+    if not results_root.is_dir():
+        return []
+    out: list[Path] = []
+    for p in sorted(results_root.iterdir()):
+        if not p.is_dir() or p.name in ("with", "without", "baseline") or p.name.startswith("suite-"):
+            continue
+        if (p / "without").is_dir() or (p / "with").is_dir():
+            out.append(p)
+    return out
+
+
+def _resolve_model_cells(
+    runs_dir: Path,
+    tasks: Sequence[SkillbenchTask],
+    k: int,
+    *,
+    models: Sequence[str] | str | None = None,
+    executor: str | None = None,
+    allow_model_mismatch: bool = False,
+) -> list[tuple[str, Path, Path, str | None, str | None]]:
+    """Resolve `[(probe_executor, without_dir, with_dir, recorded_wo_exec, recorded_w_exec), ...]`.
+
+    Enforces that the probe executor matches the executor recorded in the baseline cell(s) unless
+    `allow_model_mismatch=True`."""
+    results_root = runs_dir / "results"
+    explicit = _parse_models(models, executor)
+    env_exec = _str_or_none(config.env("SKILLBENCH_EXEC_MODEL"))
+
+    flat_wo = results_root / "without"
+    flat_w = results_root / "with"
+    has_flat = _has_cell_content(flat_wo, tasks, k) or _has_cell_content(flat_w, tasks, k)
+    matrix_dirs = _discover_matrix_exec_dirs(results_root)
+
+    if not explicit:
+        if has_flat:
+            wo_exec = detect_cell_executor(flat_wo, tasks, k)
+            w_exec = detect_cell_executor(flat_w, tasks, k)
+            if wo_exec and w_exec and wo_exec != w_exec and not allow_model_mismatch:
+                raise ValueError(
+                    f"model mismatch between baseline cells: WITHOUT recorded {wo_exec!r}, "
+                    f"Current WITH recorded {w_exec!r} (pass --allow-model-mismatch to override)"
+                )
+            recorded_base = wo_exec or w_exec
+            if recorded_base is not None:
+                if env_exec is not None and env_exec != recorded_base:
+                    if not allow_model_mismatch:
+                        raise ValueError(
+                            f"model mismatch: probe executor {env_exec!r} does not match "
+                            f"baseline cell executor {recorded_base!r} "
+                            f"(pass --allow-model-mismatch to override)"
+                        )
+                    probe_exec = env_exec
+                else:
+                    probe_exec = recorded_base
+            else:
+                probe_exec = env_exec or exec_model()
+            return [(probe_exec, flat_wo, flat_w, wo_exec, w_exec)]
+
+        if matrix_dirs:
+            by_name: dict[str, tuple[Path, Path, str | None, str | None]] = {}
+            for mdir in matrix_dirs:
+                wo_d, w_d = mdir / "without", mdir / "with"
+                wo_ex = detect_cell_executor(wo_d, tasks, k) or mdir.name
+                w_ex = detect_cell_executor(w_d, tasks, k) or mdir.name
+                if wo_ex and w_ex and wo_ex != w_ex and not allow_model_mismatch:
+                    raise ValueError(
+                        f"model mismatch between baseline cells in {mdir}: WITHOUT recorded "
+                        f"{wo_ex!r}, Current WITH recorded {w_ex!r} "
+                        f"(pass --allow-model-mismatch to override)"
+                    )
+                key = wo_ex or w_ex or mdir.name
+                by_name[key] = (wo_d, w_d, wo_ex, w_ex)
+                by_name.setdefault(mdir.name, (wo_d, w_d, wo_ex, w_ex))
+
+            if env_exec is not None:
+                if env_exec in by_name:
+                    wo_d, w_d, wo_ex, w_ex = by_name[env_exec]
+                    rec_base = wo_ex or w_ex
+                    if rec_base and rec_base != env_exec and not allow_model_mismatch:
+                        raise ValueError(
+                            f"model mismatch: probe executor {env_exec!r} does not match "
+                            f"baseline cell executor {rec_base!r} "
+                            f"(pass --allow-model-mismatch to override)"
+                        )
+                    return [(env_exec, wo_d, w_d, wo_ex, w_ex)]
+                first_mdir = matrix_dirs[0]
+                wo_d, w_d, wo_ex, w_ex = by_name[first_mdir.name]
+                rec_base = wo_ex or w_ex or first_mdir.name
+                if not allow_model_mismatch:
+                    raise ValueError(
+                        f"model mismatch: probe executor {env_exec!r} does not match "
+                        f"baseline cell executor {rec_base!r} "
+                        f"(pass --allow-model-mismatch to override)"
+                    )
+                return [(env_exec, wo_d, w_d, wo_ex, w_ex)]
+
+            first_mdir = matrix_dirs[0]
+            wo_d, w_d, wo_ex, w_ex = by_name[first_mdir.name]
+            probe_exec = wo_ex or w_ex or first_mdir.name
+            return [(probe_exec, wo_d, w_d, wo_ex, w_ex)]
+
+        probe_exec = env_exec or exec_model()
+        return [(probe_exec, flat_wo, flat_w, None, None)]
+
+    resolved: list[tuple[str, Path, Path, str | None, str | None]] = []
+    for m in explicit:
+        seg = _path_segment(m)
+        cand_dirs = [results_root / seg, results_root / m]
+        matched_mdir = next(
+            (
+                d
+                for d in cand_dirs
+                if _has_cell_content(d / "without", tasks, k)
+                or _has_cell_content(d / "with", tasks, k)
+            ),
+            None,
+        )
+        if matched_mdir is not None:
+            wo_d = matched_mdir / "without"
+            w_d = matched_mdir / "with"
+            wo_ex = detect_cell_executor(wo_d, tasks, k)
+            w_ex = detect_cell_executor(w_d, tasks, k)
+            if wo_ex and w_ex and wo_ex != w_ex and not allow_model_mismatch:
+                raise ValueError(
+                    f"model mismatch between baseline cells for {m!r}: WITHOUT recorded "
+                    f"{wo_ex!r}, Current WITH recorded {w_ex!r} "
+                    f"(pass --allow-model-mismatch to override)"
+                )
+            for arm_lbl, rec_ex in (("WITHOUT", wo_ex), ("Current WITH", w_ex)):
+                if rec_ex is not None and rec_ex != m and not allow_model_mismatch:
+                    raise ValueError(
+                        f"model mismatch: probe executor {m!r} does not match {arm_lbl} "
+                        f"baseline cell executor {rec_ex!r} "
+                        f"(pass --allow-model-mismatch to override)"
+                    )
+            resolved.append((m, wo_d, w_d, wo_ex or m, w_ex or m))
+            continue
+
+        if has_flat:
+            wo_ex = detect_cell_executor(flat_wo, tasks, k)
+            w_ex = detect_cell_executor(flat_w, tasks, k)
+            if wo_ex and w_exec_mismatch(wo_ex, w_ex) and not allow_model_mismatch:
+                raise ValueError(
+                    f"model mismatch between baseline cells: WITHOUT recorded {wo_ex!r}, "
+                    f"Current WITH recorded {w_ex!r} (pass --allow-model-mismatch to override)"
+                )
+            rec_base = wo_ex or w_ex
+            if rec_base is not None and rec_base != m and not allow_model_mismatch:
+                raise ValueError(
+                    f"model mismatch: probe executor {m!r} does not match baseline cell "
+                    f"executor {rec_base!r} (pass --allow-model-mismatch to override)"
+                )
+            resolved.append((m, flat_wo, flat_w, wo_ex or m, w_ex or m))
+            continue
+
+        if matrix_dirs:
+            first_mdir = matrix_dirs[0]
+            wo_d, w_d = first_mdir / "without", first_mdir / "with"
+            wo_ex = detect_cell_executor(wo_d, tasks, k) or first_mdir.name
+            w_ex = detect_cell_executor(w_d, tasks, k) or first_mdir.name
+            avail = [d.name for d in matrix_dirs]
+            if not allow_model_mismatch:
+                raise ValueError(
+                    f"model mismatch: no baseline cell for probe executor {m!r} under "
+                    f"{results_root} (found {avail}; pass --allow-model-mismatch to override)"
+                )
+            resolved.append((m, wo_d, w_d, wo_ex, w_ex))
+            continue
+
+        resolved.append((m, flat_wo, flat_w, None, None))
+
+    return resolved
+
+
+def w_exec_mismatch(wo_ex: str | None, w_ex: str | None) -> bool:
+    return bool(wo_ex and w_ex and wo_ex != w_ex)
+
+
+def _resolve_judge_for_probe(
+    executor: str,
+    wo_dir: Path,
+    w_dir: Path,
+    tasks: Sequence[SkillbenchTask],
+    k: int,
+    suite: SuiteConfig,
+) -> str:
+    """Resolve the judge model for `executor` from the baseline cell, suite `[matrix.judge_for]`,
+    or `judge_model()`."""
+    cell_j = detect_cell_judge(w_dir, tasks, k) or detect_cell_judge(wo_dir, tasks, k)
+    if cell_j:
+        return cell_j
+    if suite.judge_for:
+        try:
+            return suite.judge_for_executor(executor)
+        except SuiteError:
+            pass
+    return judge_model()
+
+
+def _call_probe_candidate(
+    *,
+    skill: str,
+    candidate_skill_path: Path,
+    tasks: Sequence[SkillbenchTask],
+    out_results_dir: Path,
+    k: int,
+    root: Path | None,
+    executor: str,
+    judge: str,
+    baseline_executor: str | None,
+    allow_model_mismatch: bool,
+) -> dict[str, Any]:
+    """Invoke `probe_candidate` inside `executor_env(executor, judge)`, passing `executor` /
+    `judge` kwargs when supported by `probe_candidate`'s signature (so custom test mocks with
+    the legacy 6-kwarg signature keep working)."""
+    kwargs: dict[str, Any] = {
+        "skill": skill,
+        "candidate_skill_path": candidate_skill_path,
+        "tasks": tasks,
+        "out_results_dir": out_results_dir,
+        "k": k,
+        "root": root,
+    }
+    try:
+        sig = inspect.signature(probe_candidate)
+        params = sig.parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if has_varkw or "executor" in params:
+            kwargs["executor"] = executor
+        if has_varkw or "judge" in params:
+            kwargs["judge"] = judge
+        if has_varkw or "baseline_executor" in params:
+            kwargs["baseline_executor"] = baseline_executor
+        if has_varkw or "allow_model_mismatch" in params:
+            kwargs["allow_model_mismatch"] = allow_model_mismatch
+    except (TypeError, ValueError):
+        pass
+
+    with executor_env(executor, judge, matrix=False):
+        raw = probe_candidate(**kwargs)
+    summary = dict(raw) if isinstance(raw, Mapping) else {}
+    rec_cand_exec = _str_or_none(summary.get("recorded_executor")) or _str_or_none(
+        summary.get("executor")
+    )
+    if (
+        rec_cand_exec is not None
+        and baseline_executor is not None
+        and rec_cand_exec != baseline_executor
+        and not allow_model_mismatch
+    ):
+        raise ValueError(
+            f"model mismatch: candidate probe reported executor {rec_cand_exec!r}, "
+            f"baseline cell recorded {baseline_executor!r} "
+            f"(pass --allow-model-mismatch to override)"
+        )
+    if not summary.get("executor"):
+        summary["executor"] = executor
+    return summary
+
+
 def improve_skill(
     skill: str,
     *,
@@ -1011,6 +2087,11 @@ def improve_skill(
     apply_accepted: bool = False,
     improver_model_name: str | None = None,
     root: Path | None = None,
+    models: Sequence[str] | str | None = None,
+    executor: str | None = None,
+    allow_model_mismatch: bool = False,
+    max_growth: float | None = DEFAULT_MAX_GROWTH_PCT,
+    suite: SuiteConfig | Path | str | None = None,
 ) -> dict[str, Any]:
     """Run up to `rounds` of Propose -> Probe -> Judge for `skill`."""
     all_tasks = load_tasks(root)
@@ -1023,12 +2104,95 @@ def improve_skill(
     if not tasks:
         raise ValueError(f"no skillbench tasks found for skill {skill!r} (pilot={pilot_only})")
 
-    suite = active_suite()
-    skill_path = target_skill_file(skill, suite)
+    resolved_suite = (
+        suite
+        if isinstance(suite, SuiteConfig)
+        else (load_suite(suite) if suite is not None else active_suite())
+    )
+    skill_path = target_skill_file(skill, resolved_suite)
     original_md = skill_path.read_text(encoding="utf-8")
 
-    without_summary = summarize_arm_runs(tasks, runs_dir / "results" / "without", k=k)
-    current_with_summary = summarize_arm_runs(tasks, runs_dir / "results" / "with", k=k)
+    model_cells = _resolve_model_cells(
+        runs_dir,
+        tasks,
+        k,
+        models=models,
+        executor=executor,
+        allow_model_mismatch=allow_model_mismatch,
+    )
+    models_list = [mc[0] for mc in model_cells]
+
+    without_by_model: dict[str, dict[str, Any]] = {}
+    current_with_by_model: dict[str, dict[str, Any]] = {}
+    judge_by_model: dict[str, str] = {}
+    baseline_exec_by_model: dict[str, str | None] = {}
+
+    for m, wo_dir, w_dir, wo_ex, w_ex in model_cells:
+        wo_sum = summarize_arm_runs(tasks, wo_dir, k=k, executor=wo_ex or m)
+        w_sum = summarize_arm_runs(tasks, w_dir, k=k, executor=w_ex or m)
+        without_by_model[m] = wo_sum
+        current_with_by_model[m] = w_sum
+        judge_by_model[m] = _resolve_judge_for_probe(m, wo_dir, w_dir, tasks, k, resolved_suite)
+        baseline_exec_by_model[m] = wo_ex or w_ex
+
+    # Check if the skill is flagged `needs harder tasks` for any chosen executor.
+    report_json = _read_json(runs_dir / "report.json")
+    for m in models_list:
+        wo_sum = without_by_model[m]
+        flagged, reason = False, ""
+        if report_json:
+            flagged, reason = _report_skill_ceiling(report_json, skill, executor=m)
+        if not flagged and wo_sum.get("needs_harder_tasks"):
+            c_cnt = wo_sum.get("ceiling_tasks")
+            t_cnt = wo_sum.get("total_tasks")
+            flagged = True
+            reason = (
+                f"skill {skill!r} is flagged '{NEEDS_HARDER_TASKS}' for executor {m!r} "
+                f"({c_cnt}/{t_cnt} tasks at ceiling, > 50%)"
+            )
+        if flagged:
+            print(f"skipping {skill}: {reason}", flush=True)
+            primary = models_list[0]
+            skipped_gates = [
+                {
+                    "executor": mod,
+                    "judge": judge_by_model[mod],
+                    "without_executor": without_by_model[mod].get("executor") or mod,
+                    "current_with_executor": current_with_by_model[mod].get("executor") or mod,
+                    "candidate_executor": mod,
+                    "accepted": False,
+                    "skipped": True,
+                    "decision_reason": reason,
+                    "without": without_by_model[mod],
+                    "current_with": current_with_by_model[mod],
+                    "candidate": current_with_by_model[mod],
+                }
+                for mod in models_list
+            ]
+            return {
+                "skill": skill,
+                "skipped": True,
+                "skip_reason": reason,
+                "accepted": False,
+                "decision_reason": reason,
+                "best_round": 0,
+                "models": models_list,
+                "executors": {
+                    "without": without_by_model[primary].get("executor") or primary,
+                    "current_with": current_with_by_model[primary].get("executor") or primary,
+                    "candidate": primary,
+                },
+                "diagnosis": "",
+                "changes_summary": "",
+                "diff": "",
+                "applied_to": None,
+                "without": without_by_model[primary],
+                "current_with": current_with_by_model[primary],
+                "best_candidate": current_with_by_model[primary],
+                "by_model": {g["executor"]: g for g in skipped_gates},
+                "model_gates": skipped_gates,
+                "rounds": [],
+            }
 
     skill_out = runs_dir / "improve" / skill
     skill_out.mkdir(parents=True, exist_ok=True)
@@ -1036,11 +2200,10 @@ def improve_skill(
     imp_model = improver_model(improver_model_name)
     round_records: list[dict[str, Any]] = []
     best_round = 1
-    best_summary: dict[str, Any] | None = None
+    best_rec: dict[str, Any] | None = None
     best_proposal: dict[str, Any] | None = None
-    best_accepted = False
-    best_reason = ""
     working_md = original_md
+    primary_model = models_list[0]
 
     for r in range(1, max(1, rounds) + 1):
         rdir = skill_out / f"round_{r}"
@@ -1053,6 +2216,7 @@ def improve_skill(
             k=k,
             include_verdicts=include_verdicts,
             prior_rounds=round_records,
+            executor=primary_model,
         )
         (rdir / "evidence.md").write_text(evidence, encoding="utf-8")
 
@@ -1068,7 +2232,8 @@ def improve_skill(
                 cached_prop["skill_markdown"],
                 target_skill=skill,
                 original_md=original_md,
-                banned_tools=suite.banned_tools,
+                banned_tools=resolved_suite.banned_tools,
+                max_growth=max_growth,
             )
         ):
             proposal = cached_prop
@@ -1078,7 +2243,8 @@ def improve_skill(
                 original_md=original_md,
                 evidence_packet=evidence,
                 model=imp_model,
-                suite=suite,
+                suite=resolved_suite,
+                max_growth=max_growth,
             )
             cand_path.write_text(proposal["skill_markdown"], encoding="utf-8")
             (rdir / "proposal.json").write_text(
@@ -1087,47 +2253,121 @@ def improve_skill(
         patch_txt = unified_skill_diff(original_md, proposal["skill_markdown"], skill=skill)
         (rdir / "skill.patch").write_text(patch_txt, encoding="utf-8")
 
-        cand_summary = probe_candidate(
-            skill=skill,
-            candidate_skill_path=cand_path,
-            tasks=tasks,
-            out_results_dir=rdir / "results",
-            k=k,
-            root=root,
+        val_errs = validate_candidate_skill(
+            proposal["skill_markdown"],
+            target_skill=skill,
+            original_md=original_md,
+            banned_tools=resolved_suite.banned_tools,
+            max_growth=max_growth,
         )
-        accepted, reason = evaluate_acceptance(current_with_summary, cand_summary)
-        rec = {
+
+        model_gates: list[dict[str, Any]] = []
+        cand_by_model: dict[str, dict[str, Any]] = {}
+        for m in models_list:
+            out_res_dir = (
+                rdir / "results"
+                if len(models_list) == 1
+                else rdir / "results" / _path_segment(m)
+            )
+            cand_m = _call_probe_candidate(
+                skill=skill,
+                candidate_skill_path=cand_path,
+                tasks=tasks,
+                out_results_dir=out_res_dir,
+                k=k,
+                root=root,
+                executor=m,
+                judge=judge_by_model[m],
+                baseline_executor=baseline_exec_by_model[m],
+                allow_model_mismatch=allow_model_mismatch,
+            )
+            cand_by_model[m] = cand_m
+            if val_errs:
+                acc_m = False
+                rsn_m = f"candidate validation failed: {'; '.join(val_errs)}"
+            else:
+                acc_m, rsn_m = evaluate_acceptance(current_with_by_model[m], cand_m)
+            model_gates.append(
+                {
+                    "executor": m,
+                    "judge": judge_by_model[m],
+                    "without_executor": without_by_model[m].get("executor") or m,
+                    "current_with_executor": current_with_by_model[m].get("executor") or m,
+                    "candidate_executor": cand_m.get("executor") or m,
+                    "accepted": acc_m,
+                    "decision_reason": rsn_m,
+                    "without": without_by_model[m],
+                    "current_with": current_with_by_model[m],
+                    "candidate": cand_m,
+                }
+            )
+
+        accepted = bool(model_gates) and all(g["accepted"] for g in model_gates)
+        if len(model_gates) == 1:
+            reason = model_gates[0]["decision_reason"]
+        else:
+            parts = [
+                f"{g['executor']}: {'ACCEPTED' if g['accepted'] else 'REJECTED'} ({g['decision_reason']})"
+                for g in model_gates
+            ]
+            reason = "; ".join(parts)
+
+        primary_cand = cand_by_model[primary_model]
+        primary_wo = without_by_model[primary_model]
+        primary_cur = current_with_by_model[primary_model]
+        rec: dict[str, Any] = {
             "round": r,
             "accepted": accepted,
             "decision_reason": reason,
             "diagnosis": proposal["diagnosis"],
             "changes_summary": proposal["changes_summary"],
-            "mean_candidate": cand_summary.get("mean"),
-            "tokens_median": cand_summary.get("tokens_median"),
-            "t_total_median_s": cand_summary.get("t_total_median_s"),
-            "candidate": cand_summary,
+            "skill_markdown": proposal["skill_markdown"],
+            "mean_without": primary_wo.get("mean"),
+            "mean_current_with": primary_cur.get("mean"),
+            "mean_candidate": primary_cand.get("mean"),
+            "verify_without": (primary_wo.get("verify") or {}).get("rate"),
+            "verify_current_with": (primary_cur.get("verify") or {}).get("rate"),
+            "verify_candidate": (primary_cand.get("verify") or {}).get("rate"),
+            "tokens_without": primary_wo.get("tokens_median"),
+            "tokens_current_with": primary_cur.get("tokens_median"),
+            "tokens_median": primary_cand.get("tokens_median"),
+            "wall_without_s": primary_wo.get("t_total_median_s"),
+            "wall_current_with_s": primary_cur.get("t_total_median_s"),
+            "t_total_median_s": primary_cand.get("t_total_median_s"),
+            "without": primary_wo,
+            "current_with": primary_cur,
+            "candidate": primary_cand,
+            "by_model": {g["executor"]: g for g in model_gates},
+            "model_gates": model_gates,
             "diff": patch_txt,
         }
         round_records.append(rec)
 
-        if best_summary is None or (
-            accepted and not best_accepted
-        ) or (
-            isinstance(cand_summary.get("mean"), (int, float))
-            and isinstance(best_summary.get("mean"), (int, float))
-            and cand_summary["mean"] > best_summary["mean"]
+        if best_rec is None or (
+            bool(rec["accepted"]),
+            *round_rank_key(rec),
+        ) > (
+            bool(best_rec["accepted"]),
+            *round_rank_key(best_rec),
         ):
             best_round = r
-            best_summary = cand_summary
+            best_rec = rec
             best_proposal = proposal
-            best_accepted = accepted
-            best_reason = reason
 
-        if accepted and (cand_summary.get("mean") or 0.0) >= 1.0 - 1e-6:
+        # Early stop as soon as a round is accepted on every requested executor.
+        if accepted:
             break
         working_md = proposal["skill_markdown"]
 
-    assert best_summary is not None and best_proposal is not None
+    assert best_rec is not None and best_proposal is not None
+    best_summary = best_rec["candidate"]
+    best_accepted = bool(best_rec["accepted"])
+    best_reason = str(best_rec["decision_reason"])
+    best_gates = best_rec["model_gates"]
+    best_by_model = best_rec["by_model"]
+    best_wo = without_by_model[primary_model]
+    best_cur = current_with_by_model[primary_model]
+
     best_diff = unified_skill_diff(original_md, best_proposal["skill_markdown"], skill=skill)
     (skill_out / "best_SKILL.md").write_text(best_proposal["skill_markdown"], encoding="utf-8")
     (skill_out / "best.patch").write_text(best_diff, encoding="utf-8")
@@ -1139,21 +2379,31 @@ def improve_skill(
 
     return {
         "skill": skill,
+        "skipped": False,
+        "skip_reason": None,
         "accepted": best_accepted,
         "decision_reason": best_reason,
         "best_round": best_round,
+        "models": models_list,
+        "executors": {
+            "without": best_wo.get("executor") or primary_model,
+            "current_with": best_cur.get("executor") or primary_model,
+            "candidate": best_summary.get("executor") or primary_model,
+        },
         "diagnosis": best_proposal["diagnosis"],
         "changes_summary": best_proposal["changes_summary"],
         "diff": best_diff,
         "applied_to": applied_to,
-        "without": without_summary,
-        "current_with": current_with_summary,
+        "without": best_wo,
+        "current_with": best_cur,
         "best_candidate": best_summary,
+        "by_model": best_by_model,
+        "model_gates": best_gates,
         "rounds": round_records,
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="skillbench-improve",
         description="Propose, probe, and verify improvements for weak skills of a plugin suite.",
@@ -1174,6 +2424,29 @@ def main(argv: list[str] | None = None) -> int:
         "--auto",
         action="store_true",
         help="automatically select skills with score < 1.0, lift <= 0, or >25%% overhead",
+    )
+    ap.add_argument(
+        "--models",
+        default=None,
+        help=(
+            "comma-separated executor model IDs to probe against (reusing matrix cells for "
+            "WITHOUT and Current WITH; gate must pass on every model; default: baseline cell executor)"
+        ),
+    )
+    ap.add_argument(
+        "--allow-model-mismatch",
+        action="store_true",
+        help="allow probing with an executor model different from the one recorded in the baseline cell",
+    )
+    ap.add_argument(
+        "--max-growth",
+        type=float,
+        default=DEFAULT_MAX_GROWTH_PCT,
+        help=(
+            "maximum allowed candidate SKILL.md size growth in percent over the original "
+            "(default: 50; prevents prompt bloat that inflates token cost and latency "
+            "on every rollout that reads the skill)"
+        ),
     )
     ap.add_argument("--k", type=int, default=3, help="reps per task (default: 3)")
     ap.add_argument("--rounds", type=int, default=1, help="max propose-probe rounds (default: 1)")
@@ -1202,12 +2475,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write evidence packet and print selected skills without calling agy",
     )
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = _build_parser()
     args = ap.parse_args(argv)
     C.apply_suite(args.suite)
 
     runs_dir = (
         args.runs_dir.expanduser().resolve() if args.runs_dir else _default_runs_root()
     )
+    req_models = _parse_models(args.models)
+    primary_exec = req_models[0] if req_models else None
+
     skills = [s.strip() for s in args.skill.split(",") if s.strip()]
     if args.auto and not skills:
         report_json = runs_dir / "report.json"
@@ -1216,7 +2497,7 @@ def main(argv: list[str] | None = None) -> int:
             if report_json.is_file()
             else build_report(runs_dir, k=args.k, pilot=args.pilot or None)
         )
-        skills = select_weak_skills(rep)
+        skills = select_weak_skills(rep, executor=primary_exec)
     if not skills:
         print(
             "error: specify --skill <name> or --auto (with an existing skillbench run)",
@@ -1241,6 +2522,7 @@ def main(argv: list[str] | None = None) -> int:
                 runs_dir=runs_dir,
                 k=args.k,
                 include_verdicts=args.include_verdicts,
+                executor=primary_exec,
             )
             out_p = runs_dir / "improve" / sk / "round_1" / "evidence.md"
             out_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1248,32 +2530,48 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[dry-run] {sk}: {len(tlist)} task(s) -> {out_p} ({len(ev)} chars)")
         return 0
 
-    from ..benchmarks.skillbench import judge_model
-
     results: dict[str, Any] = {}
-    for sk in skills:
-        print(f"improving skill {sk!r} (k={args.k}, rounds={args.rounds})...", flush=True)
-        res = improve_skill(
-            sk,
-            runs_dir=runs_dir,
-            k=args.k,
-            rounds=args.rounds,
-            pilot=args.pilot or None,
-            include_verdicts=args.include_verdicts,
-            apply_accepted=args.apply,
-            improver_model_name=args.improver_model,
-        )
-        results[sk] = res
-        status = "ACCEPTED" if res["accepted"] else "REJECTED"
-        print(f"  [{sk}] {status}: {res['decision_reason']}", flush=True)
+    recorded_models: list[str] = []
+    try:
+        for sk in skills:
+            print(f"improving skill {sk!r} (k={args.k}, rounds={args.rounds})...", flush=True)
+            res = improve_skill(
+                sk,
+                runs_dir=runs_dir,
+                k=args.k,
+                rounds=args.rounds,
+                pilot=args.pilot or None,
+                include_verdicts=args.include_verdicts,
+                apply_accepted=args.apply,
+                improver_model_name=args.improver_model,
+                models=req_models or None,
+                allow_model_mismatch=args.allow_model_mismatch,
+                max_growth=args.max_growth,
+            )
+            results[sk] = res
+            for m in res.get("models") or []:
+                if m not in recorded_models:
+                    recorded_models.append(m)
+            status = (
+                "SKIPPED"
+                if res.get("skipped")
+                else ("ACCEPTED" if res["accepted"] else "REJECTED")
+            )
+            print(f"  [{sk}] {status}: {res['decision_reason']}", flush=True)
+    except (ValueError, RuntimeError, config.ConfigError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     out_dir = runs_dir / "improve"
     out_dir.mkdir(parents=True, exist_ok=True)
+    rep_exec = recorded_models[0] if recorded_models else exec_model()
     record = {
         "improver_model": improver_model(args.improver_model),
-        "executor_model": exec_model(),
+        "executor_model": rep_exec,
+        "models": recorded_models or [rep_exec],
         "judge_model": judge_model(),
         "include_verdicts": bool(args.include_verdicts),
+        "max_growth": args.max_growth,
         "k": args.k,
         "rounds": args.rounds,
         "skills": results,
