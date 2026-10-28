@@ -1,0 +1,9 @@
+{
+  "effort": "high",
+  "executor": "exec-a",
+  "judge": "judge-b",
+  "manifest_hash": "fixture-manifest-hash",
+  "method_version": 1,
+  "seed": 3,
+  "tag": "with"
+}

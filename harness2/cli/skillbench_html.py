@@ -18,7 +18,9 @@ One file, no build step: styled with the Tailwind script that AGY / Jetski allow
 generative UI, coloured with the host's `--app-*` theme variables (each with an inline fallback,
 so the file also reads well in a plain browser), and driven by a few lines of vanilla JS
 (tabs and the task picker). Every value is rendered server-side and HTML-escaped; the page
-works without JS except for switching tabs. Open it in a browser or embed it in AGY chat with
+works without JS except for switching tabs. Accepts a schema-v1 dictionary or a schema-v2 one
+(`models[]`: one block per executor, each rendered under its own heading inside every tab).
+Open it in a browser or embed it in AGY chat with
 `<agent-embed src="file:///.../report.html" height="800px"></agent-embed>`.
 """
 
@@ -343,31 +345,45 @@ def _rep_panel(rep: Mapping[str, Any], idx: int, total: int) -> str:
 
 
 def _side_by_side_tab(report: Mapping[str, Any]) -> str:
+    models = _models(report)
+    multi = len(models) > 1
     options = []
     panels = []
     n = 0
-    for r in report.get("skills") or []:
-        for tid, t in sorted((r.get("tasks") or {}).items()):
-            reps = t.get("reps") or {}
-            cols = []
-            for arm in ("with", "without"):
-                arm_reps = list(reps.get(arm) or [])
-                arm_reps.sort(key=lambda x: (not x.get("valid"), str(x.get("label"))))
-                inner = "".join(_rep_panel(x, i, len(arm_reps)) for i, x in enumerate(arm_reps))
-                if not inner:
-                    inner = f'<p class="{MUTED} text-xs">no reps</p>'
-                title = "WITH skill" if arm == "with" else "WITHOUT skill"
-                cols.append(
-                    f'<div class="space-y-2"><h4 class="{FG} text-sm font-semibold">{title} '
-                    f'<span class="{MUTED} font-normal">mean '
-                    f'{_e(_pct(t.get(arm + "_mean")))}</span></h4>{inner}</div>'
+    for model in models:
+        exec_name = _executor_name(model)
+        model_options = []
+        for r in model.get("skills") or []:
+            for tid, t in sorted((r.get("tasks") or {}).items()):
+                reps = t.get("reps") or {}
+                cols = []
+                for arm in ("with", "without"):
+                    arm_reps = list(reps.get(arm) or [])
+                    arm_reps.sort(key=lambda x: (not x.get("valid"), str(x.get("label"))))
+                    inner = "".join(
+                        _rep_panel(x, i, len(arm_reps)) for i, x in enumerate(arm_reps)
+                    )
+                    if not inner:
+                        inner = f'<p class="{MUTED} text-xs">no reps</p>'
+                    title = "WITH skill" if arm == "with" else "WITHOUT skill"
+                    cols.append(
+                        f'<div class="space-y-2"><h4 class="{FG} text-sm font-semibold">{title} '
+                        f'<span class="{MUTED} font-normal">mean '
+                        f'{_e(_pct(t.get(arm + "_mean")))}</span></h4>{inner}</div>'
+                    )
+                label = f"{exec_name} · {tid}" if multi else tid
+                model_options.append(f'<option value="sbs-{n}">{_e(label)}</option>')
+                panels.append(
+                    f'<div class="sbs-panel grid md:grid-cols-2 gap-4 {"" if n == 0 else "hidden"}" '
+                    f'id="sbs-{n}">{"".join(cols)}</div>'
                 )
-            options.append(f'<option value="sbs-{n}">{_e(tid)}</option>')
-            panels.append(
-                f'<div class="sbs-panel grid md:grid-cols-2 gap-4 {"" if n == 0 else "hidden"}" '
-                f'id="sbs-{n}">{"".join(cols)}</div>'
+                n += 1
+        if multi and model_options:
+            options.append(
+                f'<optgroup label="{_e(exec_name)}">{"".join(model_options)}</optgroup>'
             )
-            n += 1
+        else:
+            options.extend(model_options)
     if not panels:
         return f'<p class="{MUTED} text-sm">No task data.</p>'
     return (
@@ -380,26 +396,49 @@ def _side_by_side_tab(report: Mapping[str, Any]) -> str:
     )
 
 
-def _diagnostics_tab(report: Mapping[str, Any]) -> str:
-    noise = report.get("judge_noise_rate")
+def _model_diag_rows(model: Mapping[str, Any]) -> list[tuple[str, str]]:
+    noise = model.get("judge_noise_rate")
     noise_str = (
         "n/a (single judgment per rollout)"
         if noise is None
-        else f'{noise * 100:.1f}% ({report.get("judge_noise_disagreed", 0)}/'
-        f'{report.get("judge_noise_total", 0)} criteria disagreed)'
+        else f'{noise * 100:.1f}% ({model.get("judge_noise_disagreed", 0)}/'
+        f'{model.get("judge_noise_total", 0)} criteria disagreed)'
     )
-    invalid = report.get("invalid_by_reason") or {}
-    items = [
+    invalid = model.get("invalid_by_reason") or {}
+    return [
         (
             "Executor model",
-            f'requested {report.get("requested_exec_model")}, actual '
-            f'{report.get("actual_exec_model") or "unverified"}',
+            f'requested {model.get("requested_exec_model") or model.get("executor")}, actual '
+            f'{model.get("actual_exec_model") or "unverified"}',
         ),
         (
             "Judge model",
-            f'requested {report.get("requested_judge_model")}, actual '
-            f'{report.get("actual_judge_model") or "unverified"}',
+            f'requested {model.get("requested_judge_model") or model.get("judge")}, actual '
+            f'{model.get("actual_judge_model") or "unverified"}',
         ),
+        ("Judge noise", noise_str),
+        (
+            "Invalid rollouts",
+            f'{model.get("invalid_total", 0)}'
+            + (
+                " (" + ", ".join(f"{k}: {v}" for k, v in sorted(invalid.items())) + ")"
+                if invalid
+                else ""
+            ),
+        ),
+    ]
+
+
+def _diagnostics_tab(report: Mapping[str, Any]) -> str:
+    models = _models(report)
+    multi = len(models) > 1
+    suite = report.get("suite") if isinstance(report.get("suite"), Mapping) else {}
+    items: list[tuple[str, str]] = []
+    if suite.get("name") or suite.get("hash"):
+        items.append(
+            ("Suite", f'{suite.get("name") or "unnamed"} (hash {suite.get("hash") or "unknown"})')
+        )
+    items += [
         ("Manifest hash", str(report.get("manifest_hash"))),
         (
             "Run scale",
@@ -410,20 +449,57 @@ def _diagnostics_tab(report: Mapping[str, Any]) -> str:
             "Bootstrap",
             f'{report.get("bootstrap_draws")} draws, seed {report.get("bootstrap_seed")}',
         ),
-        ("Judge noise", noise_str),
-        (
-            "Invalid rollouts",
-            f'{report.get("invalid_total", 0)}'
-            + (
-                " (" + ", ".join(f"{k}: {v}" for k, v in sorted(invalid.items())) + ")"
-                if invalid
-                else ""
-            ),
-        ),
         ("Statistical power", str(report.get("power_note") or "")),
     ]
+    if multi:
+        items.insert(
+            0,
+            (
+                "Executors",
+                ", ".join(f"{_executor_name(m)} (judge {_judge_name(m)})" for m in models),
+            ),
+        )
+    else:
+        items = _model_diag_rows(models[0]) + items
     rows = [[f'<span class="font-medium">{_e(k)}</span>', _e(v)] for k, v in items]
-    return _table(["item", "value"], rows, "ll")
+    out = _table(["item", "value"], rows, "ll")
+    if multi:
+        for model in models:
+            mrows = [
+                [f'<span class="font-medium">{_e(k)}</span>', _e(v)]
+                for k, v in _model_diag_rows(model)
+            ]
+            out += _section_title(_executor_name(model)) + _table(["item", "value"], mrows, "ll")
+    return out
+
+
+def _models(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Per-executor blocks (`models[]`); a schema-v1 dictionary is its own single block."""
+    models = report.get("models")
+    if isinstance(models, list) and models:
+        return [m for m in models if isinstance(m, Mapping)]
+    return [report]
+
+
+def _executor_name(model: Mapping[str, Any]) -> str:
+    return str(model.get("executor") or model.get("requested_exec_model") or "executor")
+
+
+def _judge_name(model: Mapping[str, Any]) -> str:
+    return str(model.get("judge") or model.get("requested_judge_model") or "judge")
+
+
+def _section_title(text: str) -> str:
+    return f'<h3 class="{FG} text-base font-semibold mt-6 mb-3">executor {_e(text)}</h3>'
+
+
+def _per_model(report: Mapping[str, Any], render) -> str:
+    """Concatenate `render(model)` over the executors, titled per executor when there are
+    several."""
+    models = _models(report)
+    if len(models) == 1:
+        return render(models[0])
+    return "".join(_section_title(_executor_name(m)) + render(m) for m in models)
 
 
 _JS = """
@@ -460,10 +536,13 @@ pre{white-space:pre-wrap}
 
 
 def render_html(report: Mapping[str, Any]) -> str:
-    """Self-contained `report.html` for the skillbench report dictionary."""
+    """Self-contained `report.html` for the skillbench report dictionary (schema v1 or v2); a
+    v2 report with several executors repeats every tab's content once per executor."""
+    models = _models(report)
+    multi = len(models) > 1
     tabs = [
-        ("skills", "Skills", _skills_tab(report)),
-        ("tasks", "Tasks & criteria", _tasks_tab(report)),
+        ("skills", "Skills", _per_model(report, _skills_tab)),
+        ("tasks", "Tasks & criteria", _per_model(report, _tasks_tab)),
         ("sbs", "Side by side", _side_by_side_tab(report)),
         ("diag", "Diagnostics", _diagnostics_tab(report)),
     ]
@@ -478,10 +557,30 @@ def render_html(report: Mapping[str, Any]) -> str:
         for i, (key, _, body) in enumerate(tabs)
     )
     mode = "pilot" if report.get("pilot") else "full"
+    suite = report.get("suite") if isinstance(report.get("suite"), Mapping) else {}
+    suite_part = f'suite {suite.get("name")} · ' if suite.get("name") else ""
+    if multi:
+        models_part = (
+            f'{len(models)} executors: '
+            + ", ".join(f"{_executor_name(m)} (judge {_judge_name(m)})" for m in models)
+        )
+    else:
+        models_part = (
+            f'executor {_executor_name(models[0])} · judge {_judge_name(models[0])}'
+        )
     subtitle = (
-        f'executor {report.get("requested_exec_model")} · judge '
-        f'{report.get("requested_judge_model")} · k={report.get("k")} · {mode} mode · '
+        f'{suite_part}{models_part} · k={report.get("k")} · {mode} mode · '
         f'manifest {str(report.get("manifest_hash") or "unverified")[:12]}'
+    )
+    kpis = (
+        "".join(
+            f'<div><h3 class="{FG} text-sm font-semibold mb-2">executor {_e(_executor_name(m))} '
+            f'<span class="{MUTED} font-normal">judge {_e(_judge_name(m))}</span></h3>{_kpis(m)}'
+            "</div>"
+            for m in models
+        )
+        if multi
+        else _kpis(models[0])
     )
     return (
         "<!DOCTYPE html>\n"
@@ -495,7 +594,7 @@ def render_html(report: Mapping[str, Any]) -> str:
         '<main class="max-w-7xl mx-auto space-y-5">\n'
         f'<header><h1 class="{FG} text-xl font-semibold">skillbench report</h1>'
         f'<p class="{MUTED} text-sm">{_e(subtitle)}</p></header>\n'
-        f"{_kpis(report)}\n"
+        f"{kpis}\n"
         f'<nav class="flex gap-1 border-b {BORDER}" role="tablist">{buttons}</nav>\n'
         f"{panels}\n"
         "</main>\n"

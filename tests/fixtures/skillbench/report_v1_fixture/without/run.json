@@ -1,0 +1,10 @@
+{
+  "arm": "without",
+  "benchmark": "skillbench",
+  "effort": "high",
+  "executor": "exec-a",
+  "judge": "judge-b",
+  "manifest_hash": "fixture-manifest-hash",
+  "suite": "fixture-suite",
+  "suite_hash": "fixture-suite-hash"
+}

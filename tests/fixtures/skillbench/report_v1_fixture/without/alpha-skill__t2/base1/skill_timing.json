@@ -1,0 +1,12 @@
+{
+  "actual_model": "exec-a",
+  "exit_code": 0,
+  "invalid_reason": null,
+  "invoked": false,
+  "requested_model": "exec-a",
+  "step_idx": null,
+  "t_skill_s": null,
+  "t_total_s": 20.0,
+  "total_tokens": 800,
+  "valid": true
+}

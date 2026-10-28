@@ -267,15 +267,15 @@ Key design decisions:
 - Create: `tests/fixtures/skillbench/report_v1_fixture/` (small synthetic WITH/WITHOUT namespaces + expected v1 numbers)
 - Create: `tests/test_skillbench_report_v2.py`
 
-- [ ] `build_report(cells: list[ReportCell])` where `ReportCell = (executor, judge, arm_label, ns_dir)`;
+- [x] `build_report(cells: list[ReportCell])` where `ReportCell = (executor, judge, arm_label, ns_dir)`;
       the old `(with_dir, without_dir)` call becomes one cell pair with the executor from `run.json`
-- [ ] emit `schema_version: 2` with `suite`, `models[]` (one entry per executor, each holding the existing
+- [x] emit `schema_version: 2` with `suite`, `models[]` (one entry per executor, each holding the existing
       per-skill block) — no new metrics yet; `render_markdown` / HTML iterate over `models[]`
-- [ ] `--with-dir/--without-dir` keep working; new `--results-root runs/<id>/results` auto-discovers
+- [x] `--with-dir/--without-dir` keep working; new `--results-root runs/<id>/results` auto-discovers
       `<executor>/<arm-label>` namespaces
-- [ ] write tests: v1 parity (same per-skill lift, CI, verdict, medians from the stored fixture), two
+- [x] write tests: v1 parity (same per-skill lift, CI, verdict, medians from the stored fixture), two
       executors produce two `models[]` entries, mixed-judge cells for one executor → error, auto-discovery
-- [ ] run tests - must pass before task 4
+- [x] run tests - must pass before task 4
 
 ### Task 4: Per-executor hardness flag
 

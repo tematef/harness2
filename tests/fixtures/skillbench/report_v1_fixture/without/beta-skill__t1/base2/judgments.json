@@ -1,0 +1,41 @@
+{
+  "actual_model": "judge-b",
+  "cache_key": "beta-skill/t1-without-base2",
+  "deliverable_sha256": "deliv",
+  "judge_model": "judge-b",
+  "judgments": [
+    {
+      "actual_model": "judge-b",
+      "criteria": [
+        {
+          "id": "c0",
+          "pass": true,
+          "reason": "criterion 0 met"
+        },
+        {
+          "id": "c1",
+          "pass": true,
+          "reason": "criterion 1 met"
+        },
+        {
+          "id": "c2",
+          "pass": false,
+          "reason": "criterion 2 missed"
+        },
+        {
+          "id": "c3",
+          "pass": false,
+          "reason": "criterion 3 missed"
+        }
+      ],
+      "n_criteria": 4,
+      "n_passed": 2,
+      "total_tokens": 400
+    }
+  ],
+  "rubric_sha256": "rubric",
+  "score": {
+    "n_criteria": 4,
+    "n_passed": 2
+  }
+}

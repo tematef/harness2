@@ -1,0 +1,110 @@
+[
+  {
+    "label": "base1",
+    "run_id": "without/alpha-skill/t1/base1",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 2
+    },
+    "task": "alpha-skill/t1"
+  },
+  {
+    "label": "base2",
+    "run_id": "without/alpha-skill/t1/base2",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 1
+    },
+    "task": "alpha-skill/t1"
+  },
+  {
+    "label": "base1",
+    "run_id": "without/alpha-skill/t2/base1",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 2
+    },
+    "task": "alpha-skill/t2"
+  },
+  {
+    "label": "base2",
+    "run_id": "without/alpha-skill/t2/base2",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 2
+    },
+    "task": "alpha-skill/t2"
+  },
+  {
+    "label": "base1",
+    "run_id": "without/alpha-skill/t3/base1",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 3
+    },
+    "task": "alpha-skill/t3"
+  },
+  {
+    "label": "base2",
+    "run_id": "without/alpha-skill/t3/base2",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 1
+    },
+    "task": "alpha-skill/t3"
+  },
+  {
+    "label": "base1",
+    "run_id": "without/beta-skill/t1/base1",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 3
+    },
+    "task": "beta-skill/t1"
+  },
+  {
+    "label": "base2",
+    "run_id": "without/beta-skill/t1/base2",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 2
+    },
+    "task": "beta-skill/t1"
+  },
+  {
+    "label": "base1",
+    "run_id": "without/beta-skill/t2/base1",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 3
+    },
+    "task": "beta-skill/t2"
+  },
+  {
+    "label": "base2",
+    "run_id": "without/beta-skill/t2/base2",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 3
+    },
+    "task": "beta-skill/t2"
+  },
+  {
+    "label": "base1",
+    "run_id": "without/beta-skill/t3/base1",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 2
+    },
+    "task": "beta-skill/t3"
+  },
+  {
+    "label": "base2",
+    "run_id": "without/beta-skill/t3/base2",
+    "score": {
+      "n_criteria": 4,
+      "n_passed": 2
+    },
+    "task": "beta-skill/t3"
+  }
+]

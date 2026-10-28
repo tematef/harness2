@@ -14,8 +14,11 @@
 
 """Render the skillbench leave-one-out report (`report.json`, `report.md` and `report.html`).
 
-Reads the `with` and `without` arm namespaces produced by `harness2 --bench skillbench` and
-`harness2-judge --bench skillbench --bases`:
+Reads judged arm namespaces produced by `harness2 --bench skillbench` and
+`harness2-judge --bench skillbench --bases`, one `with` / `without` pair per executor
+(`--with-dir` / `--without-dir`, the conventional `adapt/` namespaces of `--k` / `--seed`, or
+`--results-root runs/<id>/results` holding `<executor>/<arm-label>/` namespaces), and
+computes per executor:
 
 - Outcome lift: per-task paired delta `d_t = mean_k(frac WITH) - mean_k(frac WITHOUT)` over valid
   graded reps, `lift = mean_t(d_t)`, 95% CI from a two-level bootstrap (resample tasks, then reps
@@ -30,8 +33,12 @@ Reads the `with` and `without` arm namespaces produced by `harness2 --bench skil
 - Diagnostics: invalid rollout counts per reason, judge-noise rate (criterion-level disagreement
   across repeated judgments when `SKILLBENCH_JUDGE_REPEAT >= 2`), model-verification status, and
   the statistical-power note.
-- `report.html`: the same data as a self-contained dashboard (KPI cards, per-skill and per-task
-  tables, criteria pass rates, side-by-side WITH / WITHOUT answers, diagnostics).
+
+`report.json` is schema v2: `{schema_version: 2, suite: {name, hash}, models: [{executor, judge,
+skills, by_skill, ...}], ...}`; the first executor's block is also mirrored at the top level, so
+a single-executor report reads exactly like schema v1. `report.html` shows the same data as a
+self-contained dashboard (KPI cards, per-skill and per-task tables, criteria pass rates,
+side-by-side WITH / WITHOUT answers, diagnostics), one section per executor.
 """
 
 from __future__ import annotations
@@ -58,11 +65,14 @@ from ..benchmarks.skillbench import (
     diff_stats,
     judge_model,
 )
+from ..benchmarks.skillbench_suite import active_suite
 from ..core import schedule as SCHED
 from ..substrate.agy import DEFAULT_EXEC_MODEL, exec_model
 from . import _common as C
+from .run_sweep import RUN_JSON
 from .skillbench_html import render_html
 
+SCHEMA_VERSION = 2
 DEFAULT_BOOTSTRAP_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_SEED = 0
 MIN_TASKS_FULL = 3
@@ -76,8 +86,98 @@ POWER_NOTE = (
     "are expected to land `inconclusive` in the first full run."
 )
 
-_IDENTITY_KEYS = ("executor", "judge", "effort", "manifest_hash")
+# Identity keys that the two arms of one executor must agree on (where both are known).
+_IDENTITY_KEYS = ("executor", "judge", "effort", "manifest_hash", "suite_hash")
+# Identity keys every cell of the whole report must agree on (where known).
+_GLOBAL_IDENTITY_KEYS = ("manifest_hash", "suite_hash")
 FINAL_EXCERPT_CHARS = 6000
+
+# Arm pairs the per-skill block is computed from: treatment label -> control label.
+ARM_PAIRS: dict[str, str] = {"with": "without"}
+ARM_LABELS = frozenset(ARM_PAIRS) | frozenset(ARM_PAIRS.values())
+
+# Per-executor keys mirrored at the top level of `report.json` for schema-v1 consumers.
+_LEGACY_MODEL_KEYS = (
+    "requested_exec_model",
+    "actual_exec_model",
+    "exec_model_verified",
+    "requested_judge_model",
+    "actual_judge_model",
+    "judge_model_verified",
+    "model_verified",
+    "judge_noise_rate",
+    "judge_noise_disagreed",
+    "judge_noise_total",
+    "invalid_total",
+    "invalid_by_reason",
+    "skills",
+    "by_skill",
+)
+
+
+@dataclass(frozen=True)
+class ReportCell:
+    """One judged arm namespace of the matrix: `arm_label` run on `executor` and graded by
+    `judge`, living at `ns_dir`. `executor` / `judge` may be `None`: they are then read from
+    the namespace's `run.json` / `config.json`, else from the rollouts, else from the env."""
+
+    executor: str | None
+    judge: str | None
+    arm_label: str
+    ns_dir: Path
+
+
+def cells_from_dirs(with_ns_dir: Path, without_ns_dir: Path) -> list[ReportCell]:
+    """The schema-v1 call: one `with` / `without` pair; each cell's executor and judge come
+    from its own `run.json` / `config.json`, else from the other namespace's."""
+    with_meta = _load_cell_meta(Path(with_ns_dir))
+    without_meta = _load_cell_meta(Path(without_ns_dir))
+
+    def pick(own: Mapping[str, Any], other: Mapping[str, Any], key: str) -> str | None:
+        return _str_or_none(own.get(key)) or _str_or_none(other.get(key))
+
+    return [
+        ReportCell(
+            pick(with_meta, without_meta, "executor"),
+            pick(with_meta, without_meta, "judge"),
+            "with",
+            Path(with_ns_dir),
+        ),
+        ReportCell(
+            pick(without_meta, with_meta, "executor"),
+            pick(without_meta, with_meta, "judge"),
+            "without",
+            Path(without_ns_dir),
+        ),
+    ]
+
+
+def discover_cells(results_root: Path) -> list[ReportCell]:
+    """Auto-discover `<results_root>/<executor>/<arm-label>/` namespaces that have been judged
+    (`base_judged.json` present). The executor is the directory name; `run.json` may refine
+    the judge. Raises `FileNotFoundError` when nothing judged is found."""
+    root = Path(results_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"results root {root} does not exist")
+    cells: list[ReportCell] = []
+    for exec_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        for arm_dir in sorted(p for p in exec_dir.iterdir() if p.is_dir()):
+            if not (arm_dir / "base_judged.json").is_file():
+                continue
+            meta = _load_cell_meta(arm_dir)
+            label = _str_or_none(meta.get("arm")) or arm_dir.name
+            cells.append(
+                ReportCell(exec_dir.name, _str_or_none(meta.get("judge")), label, arm_dir)
+            )
+    if not cells:
+        raise FileNotFoundError(
+            f"no judged namespaces under {root}; expected <executor>/<arm-label>/base_judged.json"
+        )
+    return cells
+
+
+def _str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 @dataclass(frozen=True)
@@ -254,6 +354,27 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+_META_FILES = ("config.json", RUN_JSON)
+
+
+def _load_cell_meta(ns_dir: Path) -> dict[str, Any]:
+    """What a namespace was run with: `config.json` (resume identity: executor, judge, effort,
+    manifest_hash, seed) overlaid with `run.json` (adds suite, suite_hash, arm). Unreadable or
+    missing files contribute nothing; `None` values never override a known one."""
+    meta: dict[str, Any] = {}
+    for name in _META_FILES:
+        path = Path(ns_dir) / name
+        if not path.is_file():
+            continue
+        try:
+            loaded = _read_json(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(loaded, dict):
+            meta.update({k: v for k, v in loaded.items() if v is not None})
+    return meta
+
+
 def _load_arm_records(ns_dir: Path) -> tuple[dict[str, Any], list[_RepRecord]]:
     ns_dir = Path(ns_dir)
     if not ns_dir.is_dir():
@@ -286,15 +407,7 @@ def _load_arm_records(ns_dir: Path) -> tuple[dict[str, Any], list[_RepRecord]]:
         if rid:
             scores_by_run_id[rid] = sc
 
-    cfg: dict[str, Any] = {}
-    cfg_path = ns_dir / "config.json"
-    if cfg_path.is_file():
-        try:
-            loaded = _read_json(cfg_path)
-            if isinstance(loaded, dict):
-                cfg = loaded
-        except (OSError, json.JSONDecodeError):
-            pass
+    cfg = _load_cell_meta(ns_dir)
 
     records: list[_RepRecord] = []
     for summary_path in sorted(ns_dir.glob("*/summary.json")):
@@ -317,6 +430,8 @@ def _load_arm_records(ns_dir: Path) -> tuple[dict[str, Any], list[_RepRecord]]:
             run_id = str(entry.get("run_id") or "")
             raw_run_dir = entry.get("run_dir")
             run_dir = Path(raw_run_dir) if isinstance(raw_run_dir, str) and raw_run_dir else None
+            if run_dir is not None and not run_dir.is_absolute():
+                run_dir = ns_dir / run_dir  # stored fixtures keep run dirs inside the namespace
             records.append(
                 _load_rep(
                     task_id=task_id,
@@ -498,21 +613,134 @@ def _criteria_rates(recs: Sequence[_RepRecord]) -> dict[str, float]:
     return {cid: sum(v) / len(v) for cid, v in seen.items()}
 
 
-def _check_arm_configs(with_cfg: Mapping[str, Any], without_cfg: Mapping[str, Any]) -> None:
+def _check_arm_configs(
+    with_cfg: Mapping[str, Any], without_cfg: Mapping[str, Any], *, executor: str = ""
+) -> None:
     if not with_cfg or not without_cfg:
         return
+    who = f" of executor {executor!r}" if executor else ""
     for key in _IDENTITY_KEYS:
         v_with = with_cfg.get(key)
         v_without = without_cfg.get(key)
         if v_with is not None and v_without is not None and v_with != v_without:
             raise ValueError(
-                f"WITH and WITHOUT namespaces disagree on {key}: {v_with!r} vs {v_without!r}"
+                f"WITH and WITHOUT namespaces{who} disagree on {key}: {v_with!r} vs {v_without!r}"
             )
 
 
+@dataclass(frozen=True)
+class _LoadedCell:
+    cell: ReportCell
+    executor: str
+    judge: str
+    meta: dict[str, Any]
+    recs: list[_RepRecord]
+
+
+def _load_cell(cell: ReportCell) -> _LoadedCell:
+    if cell.arm_label not in ARM_LABELS:
+        raise ValueError(
+            f"unknown arm label {cell.arm_label!r} for {cell.ns_dir}; "
+            f"expected one of {sorted(ARM_LABELS)}"
+        )
+    meta, recs = _load_arm_records(cell.ns_dir)
+    meta_exec = _str_or_none(meta.get("executor"))
+    meta_judge = _str_or_none(meta.get("judge"))
+    if cell.executor and meta_exec and cell.executor != meta_exec:
+        raise ValueError(
+            f"{cell.ns_dir}: cell executor {cell.executor!r} but the namespace was run with "
+            f"{meta_exec!r}"
+        )
+    if cell.judge and meta_judge and cell.judge != meta_judge:
+        raise ValueError(
+            f"{cell.ns_dir}: cell judge {cell.judge!r} but the namespace was judged by "
+            f"{meta_judge!r}"
+        )
+    executor = (
+        cell.executor
+        or meta_exec
+        or next((r.requested_model for r in recs if r.requested_model), None)
+        or exec_model()
+    )
+    judge = (
+        cell.judge
+        or meta_judge
+        or next((r.judge_model for r in recs if r.judge_model), None)
+        or judge_model()
+    )
+    return _LoadedCell(cell, executor, judge, meta, recs)
+
+
+def _group_cells(loaded: Sequence[_LoadedCell]) -> dict[str, dict[str, _LoadedCell]]:
+    """`executor -> arm label -> cell`, in first-seen executor order; every executor must hold
+    exactly one complete treatment / control pair graded by one judge."""
+    groups: dict[str, dict[str, _LoadedCell]] = {}
+    for lc in loaded:
+        arms = groups.setdefault(lc.executor, {})
+        if lc.cell.arm_label in arms:
+            raise ValueError(
+                f"executor {lc.executor!r} has two {lc.cell.arm_label!r} cells: "
+                f"{arms[lc.cell.arm_label].cell.ns_dir} and {lc.cell.ns_dir}"
+            )
+        arms[lc.cell.arm_label] = lc
+    for executor, arms in groups.items():
+        judges = sorted({lc.judge for lc in arms.values()})
+        if len(judges) > 1:
+            raise ValueError(
+                f"cells of executor {executor!r} were graded by different judges: "
+                f"{', '.join(judges)}; one executor needs one judge"
+            )
+        for treatment, control in ARM_PAIRS.items():
+            have = [lbl for lbl in (treatment, control) if lbl in arms]
+            if len(have) == 1:
+                missing = control if have[0] == treatment else treatment
+                raise ValueError(
+                    f"executor {executor!r} has a {have[0]!r} cell but no {missing!r} cell"
+                )
+        if not any(t in arms for t in ARM_PAIRS):
+            raise ValueError(
+                f"executor {executor!r} has no complete arm pair (labels: {sorted(arms)})"
+            )
+    return groups
+
+
+def _check_global_identity(loaded: Sequence[_LoadedCell]) -> None:
+    for key in _GLOBAL_IDENTITY_KEYS:
+        seen: dict[Any, Path] = {}
+        for lc in loaded:
+            value = lc.meta.get(key)
+            if value is None:
+                continue
+            if seen and value not in seen:
+                other_value, other_dir = next(iter(seen.items()))
+                raise ValueError(
+                    f"namespaces disagree on {key}: {other_value!r} ({other_dir}) vs "
+                    f"{value!r} ({lc.cell.ns_dir}); report one corpus and one suite at a time"
+                )
+            seen.setdefault(value, lc.cell.ns_dir)
+
+
+def _first_meta(loaded: Sequence[_LoadedCell], key: str) -> Any:
+    return next((lc.meta.get(key) for lc in loaded if lc.meta.get(key) is not None), None)
+
+
+def _suite_info(loaded: Sequence[_LoadedCell]) -> dict[str, Any]:
+    """`{name, hash}` from `run.json`; the active suite fills in only when no namespace
+    recorded a suite at all (older runs)."""
+    name = _str_or_none(_first_meta(loaded, "suite"))
+    suite_hash = _str_or_none(_first_meta(loaded, "suite_hash"))
+    if name is None and suite_hash is None:
+        try:
+            suite = active_suite(quiet=True)
+            name, suite_hash = suite.name, suite.suite_hash
+        except (config.ConfigError, OSError):
+            pass
+    return {"name": name, "hash": suite_hash}
+
+
 def build_report(
-    with_ns_dir: Path,
-    without_ns_dir: Path,
+    cells: Sequence[ReportCell] | Path | str,
+    without_ns_dir: Path | str | None = None,
     *,
     k: int | None = None,
     seed: int | None = None,
@@ -520,31 +748,109 @@ def build_report(
     draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     pilot: bool | None = None,
 ) -> dict[str, Any]:
-    """Compute the full skillbench report dictionary from the `with` and `without` namespaces."""
-    with_cfg, with_recs = _load_arm_records(with_ns_dir)
-    without_cfg, without_recs = _load_arm_records(without_ns_dir)
-    _check_arm_configs(with_cfg, without_cfg)
+    """Compute the schema-v2 skillbench report dictionary from a list of `ReportCell`s.
+
+    Accepted inputs:
+    - `build_report(cells)` — any number of `(executor, judge, arm_label, ns_dir)` cells; the
+      cells are grouped per executor and each executor's `with` / `without` pair yields one
+      `models[]` entry;
+    - `build_report(with_ns_dir, without_ns_dir)` — the schema-v1 call: one pair, executor
+      and judge taken from the namespaces' `run.json` / `config.json`;
+    - `build_report(results_root)` — one path: auto-discovers `<executor>/<arm-label>`
+      namespaces under it (see `discover_cells`).
+
+    Shape: `{schema_version: 2, suite: {name, hash}, k, seed, bootstrap_*, pilot,
+    manifest_hash, power_note, models: [{executor, judge, arms, k, requested_* / actual_*
+    model fields, judge_noise_*, invalid_*, skills, by_skill}], ...}` plus the per-executor
+    keys of `models[0]` mirrored at the top level, so schema-v1 consumers keep reading the
+    same `skills` / `by_skill` numbers from a single-model report.
+    """
+    if isinstance(cells, (str, Path)):
+        cell_list = (
+            discover_cells(Path(cells))
+            if without_ns_dir is None
+            else cells_from_dirs(Path(cells), Path(without_ns_dir))
+        )
+    else:
+        if without_ns_dir is not None:
+            raise ValueError("pass either a list of ReportCell or (with_dir, without_dir)")
+        cell_list = list(cells)
+    if not cell_list:
+        raise ValueError("build_report needs at least one ReportCell")
+
+    loaded = [_load_cell(c) for c in cell_list]
+    _check_global_identity(loaded)
+    groups = _group_cells(loaded)
 
     is_pilot = (
         bool(pilot)
         if pilot is not None
         else _env_pilot()
     )
-    eff_seed = (
-        seed
-        if seed is not None
-        else (
-            with_cfg.get("seed")
-            if with_cfg.get("seed") is not None
-            else without_cfg.get("seed")
-        )
-    )
+    eff_seed = seed if seed is not None else _first_meta(loaded, "seed")
     eff_boot_seed = (
         int(bootstrap_seed)
         if bootstrap_seed is not None
         else (int(eff_seed) if eff_seed is not None else DEFAULT_BOOTSTRAP_SEED)
     )
 
+    manifest_hash = _first_meta(loaded, "manifest_hash")
+    if not manifest_hash:
+        try:
+            manifest_hash = check_manifest()
+        except ManifestError:
+            manifest_hash = "unverified"
+
+    models: list[dict[str, Any]] = []
+    for executor, arms in groups.items():
+        with_cell = arms["with"]
+        without_cell = arms["without"]
+        _check_arm_configs(with_cell.meta, without_cell.meta, executor=executor)
+        models.append(
+            _model_block(
+                executor=executor,
+                judge=with_cell.judge,
+                with_cell=with_cell,
+                without_cell=without_cell,
+                k=k,
+                draws=draws,
+                boot_seed=eff_boot_seed,
+                pilot=is_pilot,
+            )
+        )
+
+    report: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "suite": _suite_info(loaded),
+        "k": int(k) if k is not None else max(m["k"] for m in models),
+        "seed": eff_seed,
+        "bootstrap_seed": eff_boot_seed,
+        "bootstrap_draws": draws,
+        "pilot": is_pilot,
+        "manifest_hash": manifest_hash,
+        "power_note": POWER_NOTE,
+        "models": models,
+    }
+    report.update({key: models[0][key] for key in _LEGACY_MODEL_KEYS})
+    return report
+
+
+def _model_block(
+    *,
+    executor: str,
+    judge: str,
+    with_cell: _LoadedCell,
+    without_cell: _LoadedCell,
+    k: int | None,
+    draws: int,
+    boot_seed: int,
+    pilot: bool,
+) -> dict[str, Any]:
+    """One `models[]` entry: the per-skill leave-one-out block of a single executor."""
+    with_recs = with_cell.recs
+    without_recs = without_cell.recs
+    is_pilot = pilot
+    eff_boot_seed = boot_seed
     all_recs = with_recs + without_recs
     if k is None:
         counts_per_task: dict[str, int] = {}
@@ -554,25 +860,8 @@ def build_report(
     else:
         eff_k = int(k)
 
-    manifest_hash = with_cfg.get("manifest_hash") or without_cfg.get("manifest_hash")
-    if not manifest_hash:
-        try:
-            manifest_hash = check_manifest()
-        except ManifestError:
-            manifest_hash = "unverified"
-
-    req_exec = (
-        with_cfg.get("executor")
-        or without_cfg.get("executor")
-        or next((r.requested_model for r in all_recs if r.requested_model), None)
-        or exec_model()
-    )
-    req_judge = (
-        with_cfg.get("judge")
-        or without_cfg.get("judge")
-        or next((r.judge_model for r in all_recs if r.judge_model), None)
-        or judge_model()
-    )
+    req_exec = executor
+    req_judge = judge
 
     valid_recs = [r for r in all_recs if r.valid]
     exec_model_verified = bool(valid_recs) and all(r.actual_model is not None for r in valid_recs)
@@ -740,12 +1029,10 @@ def build_report(
         by_skill[skill] = row
 
     return {
+        "executor": executor,
+        "judge": judge,
+        "arms": {"with": str(with_cell.cell.ns_dir), "without": str(without_cell.cell.ns_dir)},
         "k": eff_k,
-        "seed": eff_seed,
-        "bootstrap_seed": eff_boot_seed,
-        "bootstrap_draws": draws,
-        "pilot": is_pilot,
-        "manifest_hash": manifest_hash,
         "requested_exec_model": req_exec,
         "actual_exec_model": actual_exec_model,
         "exec_model_verified": exec_model_verified,
@@ -758,10 +1045,17 @@ def build_report(
         "judge_noise_total": noise_total,
         "invalid_total": overall_invalid_total,
         "invalid_by_reason": dict(sorted(overall_invalid_by_reason.items())),
-        "power_note": POWER_NOTE,
         "skills": skill_rows,
         "by_skill": by_skill,
     }
+
+
+def models_of(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The per-executor blocks of a report; a schema-v1 dictionary is its own single block."""
+    models = report.get("models")
+    if isinstance(models, list) and models:
+        return [m for m in models if isinstance(m, Mapping)]
+    return [report]
 
 
 def _fmt_frac(val: float | None) -> str:
@@ -795,31 +1089,40 @@ def _fmt_invalid(total: int, by_reason: Mapping[str, int]) -> str:
     return f"{total} ({details})"
 
 
-def render_markdown(report: Mapping[str, Any]) -> str:
-    """Format `report` as `report.md` (header metadata, power note, and per-skill table)."""
-    req_exec = report.get("requested_exec_model") or DEFAULT_EXEC_MODEL
-    act_exec = report.get("actual_exec_model")
-    exec_str = (
+def _model_str(model: Mapping[str, Any]) -> str:
+    req_exec = model.get("requested_exec_model") or model.get("executor") or DEFAULT_EXEC_MODEL
+    act_exec = model.get("actual_exec_model")
+    return (
         f"requested `{req_exec}`, actual `{act_exec}`"
         if act_exec
         else f"requested `{req_exec}`, actual: {MODEL_UNVERIFIED}"
     )
 
-    req_judge = report.get("requested_judge_model") or DEFAULT_JUDGE_MODEL
-    act_judge = report.get("actual_judge_model")
-    judge_str = (
+
+def _judge_str(model: Mapping[str, Any]) -> str:
+    req_judge = model.get("requested_judge_model") or model.get("judge") or DEFAULT_JUDGE_MODEL
+    act_judge = model.get("actual_judge_model")
+    return (
         f"requested `{req_judge}`, actual `{act_judge}`"
         if act_judge
         else f"requested `{req_judge}`, actual: {MODEL_UNVERIFIED}"
     )
 
-    noise_rate = report.get("judge_noise_rate")
+
+def _noise_str(model: Mapping[str, Any]) -> str:
+    noise_rate = model.get("judge_noise_rate")
     if noise_rate is None:
-        noise_str = "n/a (single judgment per rollout)"
-    else:
-        dis = report.get("judge_noise_disagreed", 0)
-        tot = report.get("judge_noise_total", 0)
-        noise_str = f"{noise_rate * 100:.1f}% ({dis}/{tot} criteria disagreed)"
+        return "n/a (single judgment per rollout)"
+    dis = model.get("judge_noise_disagreed", 0)
+    tot = model.get("judge_noise_total", 0)
+    return f"{noise_rate * 100:.1f}% ({dis}/{tot} criteria disagreed)"
+
+
+def render_markdown(report: Mapping[str, Any]) -> str:
+    """Format `report` as `report.md`: header metadata and the power note, then one block per
+    executor in `models[]` (its models, judge noise and the two per-skill tables)."""
+    models = models_of(report)
+    multi = len(models) > 1
 
     k = report.get("k", 1)
     seed = report.get("seed")
@@ -831,18 +1134,55 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     mode_label = "pilot" if pilot else "full"
     manifest_hash = report.get("manifest_hash") or "unverified"
     power_note = report.get("power_note") or POWER_NOTE
+    suite = report.get("suite") if isinstance(report.get("suite"), Mapping) else {}
 
-    lines = [
-        "# skillbench report",
-        "",
-        f"- **Executor model**: {exec_str}",
-        f"- **Judge model**: {judge_str}",
+    lines = ["# skillbench report", ""]
+    if suite.get("name") or suite.get("hash"):
+        lines.append(
+            f"- **Suite**: `{suite.get('name') or 'unnamed'}` "
+            f"(hash `{str(suite.get('hash') or 'unknown')[:12]}`)"
+        )
+    if multi:
+        lines.append(
+            "- **Executors**: "
+            + ", ".join(
+                f"`{m.get('executor') or m.get('requested_exec_model')}` "
+                f"(judge `{m.get('judge') or m.get('requested_judge_model')}`)"
+                for m in models
+            )
+        )
+    else:
+        lines += [
+            f"- **Executor model**: {_model_str(models[0])}",
+            f"- **Judge model**: {_judge_str(models[0])}",
+        ]
+    lines += [
         f"- **Manifest hash**: `{manifest_hash}`",
         f"- **Run scale / seed**: `k={k}`, `seed={seed_str}` "
         f"(bootstrap `seed={boot_seed}`, `{draws}` draws, mode `{mode_label}`, "
         f"min `{min_tasks}` tasks with >= `{MIN_VALID_REPS_PER_ARM}` valid reps/arm)",
-        f"- **Judge-noise rate**: {noise_str}",
-        f"- **Statistical power**: {power_note}",
+    ]
+    if not multi:
+        lines.append(f"- **Judge-noise rate**: {_noise_str(models[0])}")
+    lines.append(f"- **Statistical power**: {power_note}")
+
+    for model in models:
+        if multi:
+            lines += [
+                "",
+                f"## executor `{model.get('executor') or model.get('requested_exec_model')}`",
+                "",
+                f"- **Executor model**: {_model_str(model)}",
+                f"- **Judge model**: {_judge_str(model)}",
+                f"- **Judge-noise rate**: {_noise_str(model)}",
+            ]
+        lines += _render_model_tables(model)
+    return "\n".join(lines) + "\n"
+
+
+def _render_model_tables(report: Mapping[str, Any]) -> list[str]:
+    """The per-skill outcome table and the deterministic-checks table of one model block."""
+    lines = [
         "",
         "| skill | tasks | WITH | WITHOUT | lift [95% CI] | verdict | invoked | t_skill p50/p90 | invalid |",
         "| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- |",
@@ -905,7 +1245,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             )
             + " |"
         )
-    return "\n".join(lines) + "\n"
+    return lines
 
 
 def _fmt_verify(passed: Any, total: Any) -> str:
@@ -936,17 +1276,27 @@ def write_report(report: Mapping[str, Any], out_dir: Path) -> tuple[Path, Path, 
     return (json_path, md_path, html_path)
 
 
-def _resolve_ns_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
-    if args.with_dir is not None or args.without_dir is not None:
+def _resolve_cells(args: argparse.Namespace) -> tuple[list[ReportCell], Path]:
+    """The cells to report on and the default output directory, from `--results-root`,
+    `--with-dir` / `--without-dir`, or the conventional `adapt/` namespaces of `--k` / `--seed`."""
+    explicit_pair = args.with_dir is not None or args.without_dir is not None
+    if args.results_root is not None:
+        if explicit_pair:
+            raise ValueError("--results-root cannot be combined with --with-dir / --without-dir")
+        root = Path(args.results_root)
+        return (discover_cells(root), root.parent)
+    if explicit_pair:
         if args.with_dir is None or args.without_dir is None:
             raise ValueError("pass both --with-dir and --without-dir, or neither")
-        return (Path(args.with_dir), Path(args.without_dir))
-
-    with_ns = SCHED.ns("skillbench", "agy", "agg", args.k, seed=args.seed, tag="with")
-    without_ns = SCHED.ns("skillbench", "agy", "agg", args.k, seed=args.seed, tag="without")
-    base = Path(args.runs_root) if args.runs_root is not None else _default_runs_root()
-    adapt = base / "adapt"
-    return (adapt / with_ns, adapt / without_ns)
+        with_dir, without_dir = Path(args.with_dir), Path(args.without_dir)
+    else:
+        with_ns = SCHED.ns("skillbench", "agy", "agg", args.k, seed=args.seed, tag="with")
+        without_ns = SCHED.ns("skillbench", "agy", "agg", args.k, seed=args.seed, tag="without")
+        base = Path(args.runs_root) if args.runs_root is not None else _default_runs_root()
+        adapt = base / "adapt"
+        with_dir, without_dir = adapt / with_ns, adapt / without_ns
+    out_dir = with_dir.parent.parent if with_dir.parent.name == "adapt" else with_dir.parent
+    return (cells_from_dirs(with_dir, without_dir), out_dir)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -987,6 +1337,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--with-dir", type=Path, default=None, help="explicit WITH namespace dir")
     p.add_argument("--without-dir", type=Path, default=None, help="explicit WITHOUT namespace dir")
+    p.add_argument(
+        "--results-root",
+        type=Path,
+        default=None,
+        help="matrix layout: runs/<id>/results holding <executor>/<arm-label>/ namespaces; "
+        "every judged pair becomes one models[] entry (default out-dir: its parent)",
+    )
     C.add_suite_arg(p)
     p.add_argument(
         "--out-dir",
@@ -1003,21 +1360,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.k < 1:
             raise ValueError("--k must be positive")
         C.apply_suite(args.suite)
-        with_dir, without_dir = _resolve_ns_dirs(args)
+        cells, default_out = _resolve_cells(args)
         report = build_report(
-            with_dir,
-            without_dir,
+            cells,
             k=args.k,
             seed=args.seed,
             bootstrap_seed=args.bootstrap_seed,
             draws=args.draws,
             pilot=True if args.pilot else None,
         )
-        out_dir = (
-            args.out_dir
-            if args.out_dir is not None
-            else (with_dir.parent.parent if with_dir.parent.name == "adapt" else with_dir.parent)
-        )
+        out_dir = args.out_dir if args.out_dir is not None else default_out
         json_path, md_path, html_path = write_report(report, out_dir)
         print(md_path.read_text(encoding="utf-8"), end="")
         print(f"wrote {md_path}, {json_path} and {html_path}")

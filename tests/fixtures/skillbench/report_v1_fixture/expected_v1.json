@@ -1,0 +1,136 @@
+{
+  "build_args": {
+    "bootstrap_seed": 11,
+    "draws": 2000
+  },
+  "by_skill": {
+    "alpha-skill": {
+      "ci_high": 0.625,
+      "ci_low": 0.2916666666666667,
+      "diff_lines_with_median": 4.5,
+      "diff_lines_without_median": 11.5,
+      "invalid_by_reason": {},
+      "invalid_total": 0,
+      "invalid_with": 0,
+      "invalid_without": 0,
+      "invocation_rate": 0.8333333333333334,
+      "invoked": 5,
+      "lift": 0.4583333333333333,
+      "n_paired_tasks": 3,
+      "n_qualifying_tasks": 3,
+      "n_tasks": 3,
+      "t_skill_p50": 3.5,
+      "t_skill_p90": 4.6,
+      "t_total_with_median": 29.5,
+      "t_total_without_median": 20.5,
+      "task_deltas": {
+        "alpha-skill/t1": 0.5,
+        "alpha-skill/t2": 0.375,
+        "alpha-skill/t3": 0.5
+      },
+      "tokens_with_median": 1225.0,
+      "tokens_without_median": 825.0,
+      "valid_with_reps": 6,
+      "verdict": "helps",
+      "verify_with_passed": 6,
+      "verify_with_total": 6,
+      "verify_without_passed": 2,
+      "verify_without_total": 6,
+      "with_mean": 0.9166666666666666,
+      "without_mean": 0.4583333333333333
+    },
+    "beta-skill": {
+      "ci_high": 0.5,
+      "ci_low": -0.3333333333333333,
+      "diff_lines_with_median": 10.0,
+      "diff_lines_without_median": 9.0,
+      "invalid_by_reason": {
+        "exit 1": 1
+      },
+      "invalid_total": 1,
+      "invalid_with": 1,
+      "invalid_without": 0,
+      "invocation_rate": 0.8,
+      "invoked": 4,
+      "lift": 0.041666666666666664,
+      "n_paired_tasks": 3,
+      "n_qualifying_tasks": 2,
+      "n_tasks": 3,
+      "t_skill_p50": 6.5,
+      "t_skill_p90": 7.7,
+      "t_total_with_median": 49.0,
+      "t_total_without_median": 38.5,
+      "task_deltas": {
+        "beta-skill/t1": -0.125,
+        "beta-skill/t2": -0.25,
+        "beta-skill/t3": 0.5
+      },
+      "tokens_with_median": 1950.0,
+      "tokens_without_median": 1425.0,
+      "valid_with_reps": 5,
+      "verdict": "insufficient data",
+      "verify_with_passed": 2,
+      "verify_with_total": 5,
+      "verify_without_passed": 4,
+      "verify_without_total": 6,
+      "with_mean": 0.6666666666666666,
+      "without_mean": 0.625
+    }
+  },
+  "task_means": {
+    "alpha-skill": {
+      "alpha-skill/t1": [
+        0.875,
+        0.375,
+        0.5
+      ],
+      "alpha-skill/t2": [
+        0.875,
+        0.5,
+        0.375
+      ],
+      "alpha-skill/t3": [
+        1.0,
+        0.5,
+        0.5
+      ]
+    },
+    "beta-skill": {
+      "beta-skill/t1": [
+        0.5,
+        0.625,
+        -0.125
+      ],
+      "beta-skill/t2": [
+        0.5,
+        0.75,
+        -0.25
+      ],
+      "beta-skill/t3": [
+        1.0,
+        0.5,
+        0.5
+      ]
+    }
+  },
+  "top": {
+    "actual_exec_model": "exec-a",
+    "actual_judge_model": "judge-b",
+    "bootstrap_draws": 2000,
+    "bootstrap_seed": 11,
+    "exec_model_verified": true,
+    "invalid_by_reason": {
+      "exit 1": 1
+    },
+    "invalid_total": 1,
+    "judge_model_verified": true,
+    "judge_noise_rate": null,
+    "k": 2,
+    "manifest_hash": "fixture-manifest-hash",
+    "model_verified": true,
+    "pilot": false,
+    "requested_exec_model": "exec-a",
+    "requested_judge_model": "judge-b",
+    "seed": 3
+  }
+}

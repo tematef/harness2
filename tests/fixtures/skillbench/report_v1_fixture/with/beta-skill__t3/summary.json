@@ -1,0 +1,24 @@
+{
+  "base": [
+    {
+      "delivered": true,
+      "label": "base1",
+      "ok": true,
+      "run_dir": "beta-skill__t3/base1",
+      "run_id": "with/beta-skill/t3/base1"
+    },
+    {
+      "delivered": false,
+      "label": "base2",
+      "ok": false,
+      "run_dir": "beta-skill__t3/base2",
+      "run_id": "with/beta-skill/t3/base2"
+    }
+  ],
+  "domain": "beta-skill",
+  "k": 2,
+  "seed": 3,
+  "status": "bases-only",
+  "tag": "with",
+  "task_id": "beta-skill/t3"
+}
