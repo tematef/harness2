@@ -426,15 +426,15 @@ Key design decisions:
 - Modify: `pyproject.toml`
 - Create: `tests/test_skillbench_cycle.py`
 
-- [ ] `skillbench-cycle --suite S [--executors ...] [--k 3] [--arms both] [--improve] [--yes]`: stages
+- [x] `skillbench-cycle --suite S [--executors ...] [--k 3] [--arms both] [--improve] [--yes]`: stages
       `matrix → report → history append → improve (optional)`; prints the Summary table and the paths of
       `report.html`, `summary.md`, `improve_report.html`
-- [ ] every stage resumable and skippable (`--from report`); `cycle.log` with per-stage wall time and
+- [x] every stage resumable and skippable (`--from report`); `cycle.log` with per-stage wall time and
       token totals
-- [ ] register `skillbench-cycle` console script
-- [ ] write tests: stage ordering with mocked stages, `--from`, a failing stage stops the cycle and reports,
+- [x] register `skillbench-cycle` console script
+- [x] write tests: stage ordering with mocked stages, `--from`, a failing stage stops the cycle and reports,
       `--improve` off by default
-- [ ] run tests - must pass before task 12
+- [x] run tests - must pass before task 12
 
 ### Task 12: Author the external corpus for the planning / analysis family (cc-thingz suite)
 

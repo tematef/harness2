@@ -35,6 +35,7 @@ skillbench-report = "harness2.cli.skillbench_report:main"
 skillbench-improve = "harness2.cli.skillbench_improve:main"
 skillbench-tasks = "harness2.cli.skillbench_tasks:main"
 skillbench-matrix = "harness2.cli.skillbench_matrix:main"
+skillbench-cycle = "harness2.cli.skillbench_cycle:main"
 
 [tool.setuptools.packages.find]
 include = ["harness2*"]
