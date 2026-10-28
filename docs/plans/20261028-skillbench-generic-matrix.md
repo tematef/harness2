@@ -284,17 +284,17 @@ Key design decisions:
 - Modify: `harness2/cli/skillbench_html.py`
 - Create: `tests/test_skillbench_hardness.py`
 
-- [ ] `task_hardness(baseline_records, min_baseline_fail=1, min_reps=2)` → `informative | ceiling |
+- [x] `task_hardness(baseline_records, min_baseline_fail=1, min_reps=2)` → `informative | ceiling |
       unclassified`, computed per executor from that executor's `without` / `baseline` cell
-- [ ] per skill per executor: `ceiling_tasks`, `total_tasks`, `unclassified_tasks`; ceiling tasks stay in
+- [x] per skill per executor: `ceiling_tasks`, `total_tasks`, `unclassified_tasks`; ceiling tasks stay in
       lift / CI / verdict; a `needs harder tasks` flag when > 50 % are at the ceiling (consumed by Task 8's
       recommendation rule)
-- [ ] `skillbench-report --hardness-only`: prints the task × executor hardness table and exits (the
+- [x] `skillbench-report --hardness-only`: prints the task × executor hardness table and exits (the
       corpus-authoring loop); task tab in HTML shows the hardness badge
-- [ ] legend text: what ceiling means and why such tasks are flagged, not dropped
-- [ ] write tests: classification incl. `min_reps`, per-executor independence (ceiling for one executor,
+- [x] legend text: what ceiling means and why such tasks are flagged, not dropped
+- [x] write tests: classification incl. `min_reps`, per-executor independence (ceiling for one executor,
       informative for another), flag threshold, `--hardness-only` output, lift unchanged by ceiling tasks
-- [ ] run tests - must pass before task 5
+- [x] run tests - must pass before task 5
 
 ### Task 5: Suite-mode arms (suite vs built-in vs further suites)
 

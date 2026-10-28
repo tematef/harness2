@@ -33,6 +33,13 @@ computes per executor:
 - Diagnostics: invalid rollout counts per reason, judge-noise rate (criterion-level disagreement
   across repeated judgments when `SKILLBENCH_JUDGE_REPEAT >= 2`), model-verification status, and
   the statistical-power note.
+- Hardness, per executor and never an exclusion: from that executor's control arm alone a task is
+  `informative` (the control arm misses >= `min_baseline_fail` criteria in >= 1 valid rep),
+  `ceiling` (every valid control rep passes the whole rubric) or `unclassified` (< 2 valid
+  control reps). Ceiling tasks stay in the lift / CI / verdict; the per-skill row carries
+  `ceiling_tasks / total_tasks` and `needs_harder_tasks` (> 50 % at the ceiling), the flag
+  Task 8's recommendation rule consumes. `--hardness-only` prints the task x executor hardness
+  table from control-arm cells alone (the corpus-authoring loop) and writes nothing.
 
 `report.json` is schema v2: `{schema_version: 2, suite: {name, hash}, models: [{executor, judge,
 skills, by_skill, ...}], ...}`; the first executor's block is also mirrored at the top level, so
@@ -59,11 +66,13 @@ from ..benchmarks.skillbench import (
     SKILL_TIMING_FILE,
     VERIFY_FILE,
     ManifestError,
+    TaskError,
     _default_runs_root,
     _env_pilot,
     check_manifest,
     diff_stats,
     judge_model,
+    load_tasks,
 )
 from ..benchmarks.skillbench_suite import active_suite
 from ..core import schedule as SCHED
@@ -78,6 +87,28 @@ DEFAULT_BOOTSTRAP_SEED = 0
 MIN_TASKS_FULL = 3
 MIN_TASKS_PILOT = 2
 MIN_VALID_REPS_PER_ARM = 2
+
+# Hardness flag: computed per executor from its control arm; a label, never an exclusion.
+HARDNESS_INFORMATIVE = "informative"
+HARDNESS_CEILING = "ceiling"
+HARDNESS_UNCLASSIFIED = "unclassified"
+HARDNESS_LABELS = (HARDNESS_INFORMATIVE, HARDNESS_CEILING, HARDNESS_UNCLASSIFIED)
+DEFAULT_MIN_BASELINE_FAIL = 1
+MIN_BASELINE_REPS = 2
+# A skill whose ceiling share (ceiling_tasks / total_tasks) exceeds this is flagged.
+CEILING_FLAG_SHARE = 0.5
+NEEDS_HARDER_TASKS = "needs harder tasks"
+HARDNESS_NOTE = (
+    "Hardness is judged per executor from its control arm (WITHOUT / baseline) alone: a task is "
+    "`informative` when that arm misses at least `min_baseline_fail` criteria (default 1) in at "
+    "least one valid graded rep, `ceiling` when every valid control rep passes the whole rubric "
+    "(the task cannot show a lift for this executor), and `unclassified` with fewer than "
+    f"{MIN_BASELINE_REPS} valid control reps. Ceiling tasks are flagged, not dropped: they stay "
+    "in the lift, CI and verdict, because excluding them would select tasks on the control arm's "
+    "luck and bias the lift upward. A skill with more than "
+    f"{CEILING_FLAG_SHARE * 100:.0f} % of its tasks at the ceiling is flagged "
+    f"`{NEEDS_HARDER_TASKS}` for that executor."
+)
 
 MODEL_UNVERIFIED = "model unverified (agy reports no model)"
 POWER_NOTE = (
@@ -94,7 +125,8 @@ FINAL_EXCERPT_CHARS = 6000
 
 # Arm pairs the per-skill block is computed from: treatment label -> control label.
 ARM_PAIRS: dict[str, str] = {"with": "without"}
-ARM_LABELS = frozenset(ARM_PAIRS) | frozenset(ARM_PAIRS.values())
+CONTROL_LABELS = frozenset(ARM_PAIRS.values())
+ARM_LABELS = frozenset(ARM_PAIRS) | CONTROL_LABELS
 
 # Per-executor keys mirrored at the top level of `report.json` for schema-v1 consumers.
 _LEGACY_MODEL_KEYS = (
@@ -202,6 +234,8 @@ class _RepRecord:
     total_tokens: int | None = None
     t_total_s: float | None = None
     final_excerpt: str = ""
+    # Criteria the judge marked failed (`n_criteria - n_passed`); None when ungraded / invalid.
+    n_missed: int | None = None
 
     @property
     def diff_lines(self) -> int | None:
@@ -218,6 +252,7 @@ class _RepRecord:
             "invoked": self.invoked,
             "t_skill_s": self.t_skill_s,
             "frac": self.frac,
+            "n_missed": self.n_missed,
             "verify_passed": self.verify_passed,
             "diff": self.diff,
             "total_tokens": self.total_tokens,
@@ -292,6 +327,113 @@ def decide_verdict(
     return "inconclusive"
 
 
+def task_hardness(
+    baseline_records: Iterable[Any],
+    min_baseline_fail: int = DEFAULT_MIN_BASELINE_FAIL,
+    min_reps: int = MIN_BASELINE_REPS,
+) -> str:
+    """Hardness of one task for one executor from that executor's control-arm reps
+    (`without` / `baseline`), each with `.valid` and `.n_missed` (criteria failed):
+
+    - `unclassified` — fewer than `min_reps` valid graded control reps;
+    - `informative` — some valid control rep misses >= `min_baseline_fail` criteria;
+    - `ceiling` — every valid control rep passes the whole rubric (for this executor the task
+      cannot show a lift).
+
+    A label only: ceiling tasks are never removed from the lift, CI or verdict.
+    """
+    if isinstance(min_baseline_fail, bool) or min_baseline_fail < 1:
+        raise ValueError(f"min_baseline_fail must be >= 1, got {min_baseline_fail!r}")
+    if isinstance(min_reps, bool) or min_reps < 1:
+        raise ValueError(f"min_reps must be >= 1, got {min_reps!r}")
+    missed = baseline_missed(baseline_records)
+    if len(missed) < min_reps:
+        return HARDNESS_UNCLASSIFIED
+    if any(m >= min_baseline_fail for m in missed):
+        return HARDNESS_INFORMATIVE
+    return HARDNESS_CEILING
+
+
+def baseline_missed(records: Iterable[Any]) -> list[int]:
+    """Criteria missed per valid graded rep, in record order."""
+    return [
+        int(r.n_missed)
+        for r in records
+        if getattr(r, "valid", False) and getattr(r, "n_missed", None) is not None
+    ]
+
+
+def skill_hardness(task_labels: Iterable[str]) -> dict[str, Any]:
+    """Per-skill (per-executor) hardness counts from its tasks' labels: `ceiling_tasks`,
+    `informative_tasks`, `unclassified_tasks`, `total_tasks`, `ceiling_share`
+    (`ceiling / total`, None without tasks) and `needs_harder_tasks` (share > 50 %)."""
+    labels = list(task_labels)
+    total = len(labels)
+    ceiling = sum(1 for lbl in labels if lbl == HARDNESS_CEILING)
+    share = (ceiling / total) if total else None
+    return {
+        "ceiling_tasks": ceiling,
+        "informative_tasks": sum(1 for lbl in labels if lbl == HARDNESS_INFORMATIVE),
+        "unclassified_tasks": sum(1 for lbl in labels if lbl == HARDNESS_UNCLASSIFIED),
+        "total_tasks": total,
+        "ceiling_share": share,
+        "needs_harder_tasks": share is not None and share > CEILING_FLAG_SHARE,
+    }
+
+
+Thresholds = tuple[int, dict[str, int]]
+
+
+def _thresholds(spec: int | Mapping[str, int] | None) -> Thresholds:
+    """`(default, per_task)` `min_baseline_fail` thresholds: an int applies to every task, a
+    mapping is per task id (others default to 1), None reads the task corpus."""
+    if spec is None:
+        return (DEFAULT_MIN_BASELINE_FAIL, corpus_thresholds())
+    if isinstance(spec, Mapping):
+        per_task = {str(tid): int(v) for tid, v in spec.items()}
+        bad = {tid: v for tid, v in per_task.items() if v < 1}
+        if bad:
+            raise ValueError(f"min_baseline_fail must be >= 1 per task, got {bad}")
+        return (DEFAULT_MIN_BASELINE_FAIL, per_task)
+    if isinstance(spec, bool) or int(spec) < 1:
+        raise ValueError(f"min_baseline_fail must be >= 1, got {spec!r}")
+    return (int(spec), {})
+
+
+def corpus_thresholds() -> dict[str, int]:
+    """`task_id -> min_baseline_fail` from the resolved task corpus; empty when the corpus
+    cannot be loaded (the report then falls back to the default of 1 for every task)."""
+    try:
+        tasks = load_tasks()
+    except (TaskError, config.ConfigError, OSError, ValueError):
+        return {}
+    return {tid: int(t.min_baseline_fail) for tid, t in tasks.items()}
+
+
+def hardness_rows(
+    control_recs: Sequence[_RepRecord], thresholds: Thresholds
+) -> dict[str, dict[str, Any]]:
+    """`task_id -> {skill, hardness, baseline_missed, valid_reps, min_baseline_fail}` from one
+    executor's control-arm records (sorted by task id)."""
+    default, per_task = thresholds
+    by_task: dict[str, list[_RepRecord]] = {}
+    for r in control_recs:
+        by_task.setdefault(r.task_id, []).append(r)
+    rows: dict[str, dict[str, Any]] = {}
+    for tid in sorted(by_task):
+        recs = by_task[tid]
+        thr = per_task.get(tid, default)
+        missed = baseline_missed(recs)
+        rows[tid] = {
+            "skill": recs[0].skill,
+            "hardness": task_hardness(recs, min_baseline_fail=thr),
+            "baseline_missed": missed,
+            "valid_reps": len(missed),
+            "min_baseline_fail": thr,
+        }
+    return rows
+
+
 def judge_noise(
     judgments_lists: Iterable[Sequence[Mapping[str, Any]]],
 ) -> tuple[float | None, int, int]:
@@ -335,6 +477,17 @@ def judge_noise(
 
 
 def _score_to_frac(score: Any) -> float | None:
+    counts = _score_counts(score)
+    return None if counts is None else counts[0] / counts[1]
+
+
+def _score_to_missed(score: Any) -> int | None:
+    counts = _score_counts(score)
+    return None if counts is None else counts[1] - counts[0]
+
+
+def _score_counts(score: Any) -> tuple[int, int] | None:
+    """`(n_passed, n_criteria)` of a judge score, or None when it is not a graded score."""
     if not isinstance(score, Mapping):
         return None
     n_passed = score.get("n_passed")
@@ -347,7 +500,7 @@ def _score_to_frac(score: Any) -> float | None:
         or n_criteria <= 0
     ):
         return None
-    return n_passed / n_criteria
+    return (n_passed, n_criteria)
 
 
 def _read_json(path: Path) -> Any:
@@ -566,6 +719,7 @@ def _load_rep(
         raw_score = None
 
     frac = _score_to_frac(raw_score) if valid else None
+    n_missed = _score_to_missed(raw_score) if valid else None
     return _RepRecord(
         task_id=task_id,
         skill=skill,
@@ -587,6 +741,7 @@ def _load_rep(
         total_tokens=total_tokens,
         t_total_s=t_total_s,
         final_excerpt=final_excerpt,
+        n_missed=n_missed,
     )
 
 
@@ -671,9 +826,12 @@ def _load_cell(cell: ReportCell) -> _LoadedCell:
     return _LoadedCell(cell, executor, judge, meta, recs)
 
 
-def _group_cells(loaded: Sequence[_LoadedCell]) -> dict[str, dict[str, _LoadedCell]]:
+def _group_cells(
+    loaded: Sequence[_LoadedCell], *, require_pairs: bool = True
+) -> dict[str, dict[str, _LoadedCell]]:
     """`executor -> arm label -> cell`, in first-seen executor order; every executor must hold
-    exactly one complete treatment / control pair graded by one judge."""
+    exactly one complete treatment / control pair graded by one judge (with `require_pairs`
+    off — the hardness-only path — a control cell alone is enough)."""
     groups: dict[str, dict[str, _LoadedCell]] = {}
     for lc in loaded:
         arms = groups.setdefault(lc.executor, {})
@@ -690,6 +848,14 @@ def _group_cells(loaded: Sequence[_LoadedCell]) -> dict[str, dict[str, _LoadedCe
                 f"cells of executor {executor!r} were graded by different judges: "
                 f"{', '.join(judges)}; one executor needs one judge"
             )
+        if not require_pairs:
+            if not any(lbl in arms for lbl in CONTROL_LABELS):
+                raise ValueError(
+                    f"executor {executor!r} has no control arm cell "
+                    f"({' / '.join(sorted(CONTROL_LABELS))}) to judge hardness from "
+                    f"(labels: {sorted(arms)})"
+                )
+            continue
         for treatment, control in ARM_PAIRS.items():
             have = [lbl for lbl in (treatment, control) if lbl in arms]
             if len(have) == 1:
@@ -738,6 +904,25 @@ def _suite_info(loaded: Sequence[_LoadedCell]) -> dict[str, Any]:
     return {"name": name, "hash": suite_hash}
 
 
+def _resolve_cell_list(
+    cells: Sequence[ReportCell] | Path | str, without_ns_dir: Path | str | None
+) -> list[ReportCell]:
+    """The cells behind the three accepted call shapes (see `build_report`)."""
+    if isinstance(cells, (str, Path)):
+        cell_list = (
+            discover_cells(Path(cells))
+            if without_ns_dir is None
+            else cells_from_dirs(Path(cells), Path(without_ns_dir))
+        )
+    else:
+        if without_ns_dir is not None:
+            raise ValueError("pass either a list of ReportCell or (with_dir, without_dir)")
+        cell_list = list(cells)
+    if not cell_list:
+        raise ValueError("the report needs at least one ReportCell")
+    return cell_list
+
+
 def build_report(
     cells: Sequence[ReportCell] | Path | str,
     without_ns_dir: Path | str | None = None,
@@ -747,6 +932,7 @@ def build_report(
     bootstrap_seed: int | None = None,
     draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     pilot: bool | None = None,
+    min_baseline_fail: int | Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Compute the schema-v2 skillbench report dictionary from a list of `ReportCell`s.
 
@@ -759,24 +945,21 @@ def build_report(
     - `build_report(results_root)` — one path: auto-discovers `<executor>/<arm-label>`
       namespaces under it (see `discover_cells`).
 
+    `min_baseline_fail` sets the hardness threshold: an int for every task, a `task_id -> int`
+    mapping, or None to read each task's `min_baseline_fail` from the resolved corpus
+    (default 1 when the corpus or the task is not found).
+
     Shape: `{schema_version: 2, suite: {name, hash}, k, seed, bootstrap_*, pilot,
-    manifest_hash, power_note, models: [{executor, judge, arms, k, requested_* / actual_*
-    model fields, judge_noise_*, invalid_*, skills, by_skill}], ...}` plus the per-executor
-    keys of `models[0]` mirrored at the top level, so schema-v1 consumers keep reading the
-    same `skills` / `by_skill` numbers from a single-model report.
+    manifest_hash, power_note, hardness_note, models: [{executor, judge, arms, k,
+    requested_* / actual_* model fields, judge_noise_*, invalid_*, skills, by_skill,
+    task_hardness}], ...}` plus the per-executor keys of `models[0]` mirrored at the top
+    level, so schema-v1 consumers keep reading the same `skills` / `by_skill` numbers from a
+    single-model report. Every per-skill row carries `ceiling_tasks`, `informative_tasks`,
+    `unclassified_tasks`, `total_tasks`, `ceiling_share` and `needs_harder_tasks`; every task
+    entry its `hardness`, `baseline_missed` and `min_baseline_fail`.
     """
-    if isinstance(cells, (str, Path)):
-        cell_list = (
-            discover_cells(Path(cells))
-            if without_ns_dir is None
-            else cells_from_dirs(Path(cells), Path(without_ns_dir))
-        )
-    else:
-        if without_ns_dir is not None:
-            raise ValueError("pass either a list of ReportCell or (with_dir, without_dir)")
-        cell_list = list(cells)
-    if not cell_list:
-        raise ValueError("build_report needs at least one ReportCell")
+    cell_list = _resolve_cell_list(cells, without_ns_dir)
+    thresholds = _thresholds(min_baseline_fail)
 
     loaded = [_load_cell(c) for c in cell_list]
     _check_global_identity(loaded)
@@ -816,6 +999,7 @@ def build_report(
                 draws=draws,
                 boot_seed=eff_boot_seed,
                 pilot=is_pilot,
+                thresholds=thresholds,
             )
         )
 
@@ -829,10 +1013,100 @@ def build_report(
         "pilot": is_pilot,
         "manifest_hash": manifest_hash,
         "power_note": POWER_NOTE,
+        "hardness_note": HARDNESS_NOTE,
         "models": models,
     }
     report.update({key: models[0][key] for key in _LEGACY_MODEL_KEYS})
     return report
+
+
+def build_hardness(
+    cells: Sequence[ReportCell] | Path | str,
+    without_ns_dir: Path | str | None = None,
+    *,
+    min_baseline_fail: int | Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """The task x executor hardness view from control-arm cells alone (treatment cells are
+    accepted and ignored), for the corpus-authoring loop (`skillbench-matrix --arms baseline`
+    then `skillbench-report --hardness-only`). Same inputs as `build_report`.
+
+    Shape: `{schema_version: 2, suite, manifest_hash, min_reps, hardness_note,
+    models: [{executor, judge, control_arm, tasks: {task_id: {skill, hardness,
+    baseline_missed, valid_reps, min_baseline_fail}}, skills: {skill: {ceiling_tasks,
+    informative_tasks, unclassified_tasks, total_tasks, ceiling_share, needs_harder_tasks}}}]}`.
+    """
+    cell_list = _resolve_cell_list(cells, without_ns_dir)
+    thresholds = _thresholds(min_baseline_fail)
+    loaded = [_load_cell(c) for c in cell_list]
+    _check_global_identity(loaded)
+    groups = _group_cells(loaded, require_pairs=False)
+
+    models: list[dict[str, Any]] = []
+    for executor, arms in groups.items():
+        control_label = next(lbl for lbl in sorted(CONTROL_LABELS) if lbl in arms)
+        control = arms[control_label]
+        tasks = hardness_rows(control.recs, thresholds)
+        skills: dict[str, dict[str, Any]] = {}
+        for skill in sorted({row["skill"] for row in tasks.values()}):
+            skills[skill] = skill_hardness(
+                row["hardness"] for row in tasks.values() if row["skill"] == skill
+            )
+        models.append(
+            {
+                "executor": executor,
+                "judge": control.judge,
+                "control_arm": control_label,
+                "tasks": tasks,
+                "skills": skills,
+            }
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "suite": _suite_info(loaded),
+        "manifest_hash": _first_meta(loaded, "manifest_hash"),
+        "min_reps": MIN_BASELINE_REPS,
+        "hardness_note": HARDNESS_NOTE,
+        "models": models,
+    }
+
+
+def hardness_of_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    """The `build_hardness` view of a full `build_report` dictionary (schema v2 with the
+    hardness fields), so one rendering serves both."""
+    models: list[dict[str, Any]] = []
+    for model in models_of(report):
+        tasks: dict[str, dict[str, Any]] = {}
+        skills: dict[str, dict[str, Any]] = {}
+        for row in model.get("skills") or []:
+            skill = str(row.get("skill"))
+            for tid, t in sorted((row.get("tasks") or {}).items()):
+                tasks[str(tid)] = {
+                    "skill": skill,
+                    "hardness": t.get("hardness", HARDNESS_UNCLASSIFIED),
+                    "baseline_missed": list(t.get("baseline_missed") or []),
+                    "valid_reps": len(t.get("baseline_missed") or []),
+                    "min_baseline_fail": t.get("min_baseline_fail", DEFAULT_MIN_BASELINE_FAIL),
+                }
+            skills[skill] = skill_hardness(
+                t.get("hardness", HARDNESS_UNCLASSIFIED) for t in (row.get("tasks") or {}).values()
+            )
+        models.append(
+            {
+                "executor": model.get("executor") or model.get("requested_exec_model"),
+                "judge": model.get("judge") or model.get("requested_judge_model"),
+                "control_arm": next(iter(sorted(CONTROL_LABELS))),
+                "tasks": tasks,
+                "skills": skills,
+            }
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "suite": report.get("suite"),
+        "manifest_hash": report.get("manifest_hash"),
+        "min_reps": MIN_BASELINE_REPS,
+        "hardness_note": report.get("hardness_note") or HARDNESS_NOTE,
+        "models": models,
+    }
 
 
 def _model_block(
@@ -845,6 +1119,7 @@ def _model_block(
     draws: int,
     boot_seed: int,
     pilot: bool,
+    thresholds: Thresholds = (DEFAULT_MIN_BASELINE_FAIL, {}),
 ) -> dict[str, Any]:
     """One `models[]` entry: the per-skill leave-one-out block of a single executor."""
     with_recs = with_cell.recs
@@ -852,6 +1127,7 @@ def _model_block(
     is_pilot = pilot
     eff_boot_seed = boot_seed
     all_recs = with_recs + without_recs
+    hardness = hardness_rows(without_recs, thresholds)
     if k is None:
         counts_per_task: dict[str, int] = {}
         for r in with_recs:
@@ -918,12 +1194,20 @@ def _model_block(
                 n_qualifying += 1
             tw_pass, tw_total, _ = _verify_counts(t_with)
             tu_pass, tu_total, _ = _verify_counts(t_without)
+            hard = hardness.get(tid) or {  # task swept in WITH only: no control reps at all
+                "hardness": HARDNESS_UNCLASSIFIED,
+                "baseline_missed": [],
+                "min_baseline_fail": thresholds[1].get(tid, thresholds[0]),
+            }
             tasks_detail[tid] = {
                 "with_fracs": w_fracs,
                 "without_fracs": u_fracs,
                 "with_mean": w_mean,
                 "without_mean": u_mean,
                 "delta": delta,
+                "hardness": hard["hardness"],
+                "baseline_missed": hard["baseline_missed"],
+                "min_baseline_fail": hard["min_baseline_fail"],
                 "verify_with": [tw_pass, tw_total],
                 "verify_without": [tu_pass, tu_total],
                 "diff_lines_with_median": _median(r.diff_lines for r in t_with if r.valid),
@@ -1022,6 +1306,7 @@ def _model_block(
             "tokens_without_median": _median(r.total_tokens for r in valid_without),
             "t_total_with_median": _median(r.t_total_s for r in valid_with),
             "t_total_without_median": _median(r.t_total_s for r in valid_without),
+            **skill_hardness(t["hardness"] for t in tasks_detail.values()),
             "task_deltas": task_deltas,
             "tasks": tasks_detail,
         }
@@ -1047,6 +1332,9 @@ def _model_block(
         "invalid_by_reason": dict(sorted(overall_invalid_by_reason.items())),
         "skills": skill_rows,
         "by_skill": by_skill,
+        "task_hardness": {
+            tid: t["hardness"] for row in skill_rows for tid, t in row["tasks"].items()
+        },
     }
 
 
@@ -1165,6 +1453,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     if not multi:
         lines.append(f"- **Judge-noise rate**: {_noise_str(models[0])}")
     lines.append(f"- **Statistical power**: {power_note}")
+    lines.append(f"- **Hardness**: {report.get('hardness_note') or HARDNESS_NOTE}")
 
     for model in models:
         if multi:
@@ -1184,8 +1473,9 @@ def _render_model_tables(report: Mapping[str, Any]) -> list[str]:
     """The per-skill outcome table and the deterministic-checks table of one model block."""
     lines = [
         "",
-        "| skill | tasks | WITH | WITHOUT | lift [95% CI] | verdict | invoked | t_skill p50/p90 | invalid |",
-        "| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- |",
+        "| skill | tasks | WITH | WITHOUT | lift [95% CI] | verdict | invoked | t_skill p50/p90 "
+        "| invalid | ceiling/total |",
+        "| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- | :--- |",
     ]
 
     for row in report.get("skills") or []:
@@ -1209,6 +1499,7 @@ def _render_model_tables(report: Mapping[str, Any]) -> list[str]:
                         int(row.get("invalid_total", 0)),
                         row.get("invalid_by_reason") or {},
                     ),
+                    _fmt_ceiling(row),
                 )
             )
             + " |"
@@ -1261,6 +1552,95 @@ def _fmt_pair(a: float | None, b: float | None, *, suffix: str = "") -> str:
     if a is None and b is None:
         return "n/a"
     return f"{one(a)} / {one(b)}"
+
+
+def _fmt_ceiling(row: Mapping[str, Any]) -> str:
+    """`ceiling/total` of a per-skill row (v1 rows without the fields render `n/a`), with the
+    `needs harder tasks` flag and the unclassified count when present."""
+    ceiling = row.get("ceiling_tasks")
+    total = row.get("total_tasks")
+    if not isinstance(ceiling, int) or not isinstance(total, int):
+        return "n/a"
+    out = f"{ceiling}/{total}"
+    unclassified = row.get("unclassified_tasks") or 0
+    if unclassified:
+        out += f" ({unclassified} unclassified)"
+    if row.get("needs_harder_tasks"):
+        out += f" — {NEEDS_HARDER_TASKS}"
+    return out
+
+
+def _fmt_hardness_cell(task: Mapping[str, Any] | None) -> str:
+    if task is None:
+        return "—"
+    label = str(task.get("hardness") or HARDNESS_UNCLASSIFIED)
+    missed = list(task.get("baseline_missed") or [])
+    if label == HARDNESS_UNCLASSIFIED:
+        n = len(missed)
+        return f"{label} ({n} valid rep{'' if n == 1 else 's'})"
+    return f"{label} (missed {', '.join(str(m) for m in missed)})"
+
+
+def render_hardness_markdown(hardness: Mapping[str, Any]) -> str:
+    """The task x executor hardness table (`build_hardness` / `hardness_of_report` output):
+    one row per task with every executor's label and the criteria its control arm missed per
+    valid rep, then `ceiling/total` per skill and executor with the `needs harder tasks` flag."""
+    models = [m for m in hardness.get("models") or [] if isinstance(m, Mapping)]
+    suite = hardness.get("suite") if isinstance(hardness.get("suite"), Mapping) else {}
+    lines = ["# skillbench task hardness", ""]
+    if suite.get("name") or suite.get("hash"):
+        lines.append(
+            f"- **Suite**: `{suite.get('name') or 'unnamed'}` "
+            f"(hash `{str(suite.get('hash') or 'unknown')[:12]}`)"
+        )
+    if hardness.get("manifest_hash"):
+        lines.append(f"- **Manifest hash**: `{hardness['manifest_hash']}`")
+    lines.append(
+        "- **Executors**: "
+        + (
+            ", ".join(
+                f"`{m.get('executor')}` (control arm `{m.get('control_arm')}`, "
+                f"judge `{m.get('judge')}`)"
+                for m in models
+            )
+            or "none"
+        )
+    )
+    lines.append(f"- **Rule**: {hardness.get('hardness_note') or HARDNESS_NOTE}")
+
+    executors = [str(m.get("executor")) for m in models]
+    task_ids = sorted({tid for m in models for tid in (m.get("tasks") or {})})
+    lines += [
+        "",
+        "| skill | task | min fail | " + " | ".join(executors) + " |",
+        "| :--- | :--- | ---: | " + " | ".join(":---" for _ in executors) + " |",
+    ]
+    for tid in task_ids:
+        cells = [(m.get("tasks") or {}).get(tid) for m in models]
+        first = next((c for c in cells if c), {})
+        thr = first.get("min_baseline_fail", DEFAULT_MIN_BASELINE_FAIL)
+        lines.append(
+            f"| {first.get('skill') or tid.split('/', 1)[0]} | {tid.split('/', 1)[-1]} | {thr} | "
+            + " | ".join(_fmt_hardness_cell(c) for c in cells)
+            + " |"
+        )
+
+    skills = sorted({s for m in models for s in (m.get("skills") or {})})
+    lines += [
+        "",
+        "Per skill: ceiling tasks / total tasks (flagged when more than "
+        f"{CEILING_FLAG_SHARE * 100:.0f} % are at the ceiling; ceiling tasks stay in the lift):",
+        "",
+        "| skill | " + " | ".join(executors) + " |",
+        "| :--- | " + " | ".join(":---" for _ in executors) + " |",
+    ]
+    for skill in skills:
+        lines.append(
+            f"| {skill} | "
+            + " | ".join(_fmt_ceiling((m.get("skills") or {}).get(skill) or {}) for m in models)
+            + " |"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def write_report(report: Mapping[str, Any], out_dir: Path) -> tuple[Path, Path, Path]:
@@ -1346,6 +1726,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     C.add_suite_arg(p)
     p.add_argument(
+        "--hardness-only",
+        action="store_true",
+        help="print the task x executor hardness table (informative / ceiling / unclassified "
+        "per executor, from the control arm alone) and exit without writing a report; works "
+        "on control-arm namespaces alone, e.g. after `skillbench-matrix --arms baseline`",
+    )
+    p.add_argument(
         "--out-dir",
         type=Path,
         default=None,
@@ -1361,6 +1748,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--k must be positive")
         C.apply_suite(args.suite)
         cells, default_out = _resolve_cells(args)
+        if args.hardness_only:
+            control_cells = [c for c in cells if c.arm_label in CONTROL_LABELS]
+            print(render_hardness_markdown(build_hardness(control_cells)), end="")
+            return 0
         report = build_report(
             cells,
             k=args.k,

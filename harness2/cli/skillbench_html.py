@@ -19,7 +19,8 @@ generative UI, coloured with the host's `--app-*` theme variables (each with an 
 so the file also reads well in a plain browser), and driven by a few lines of vanilla JS
 (tabs and the task picker). Every value is rendered server-side and HTML-escaped; the page
 works without JS except for switching tabs. Accepts a schema-v1 dictionary or a schema-v2 one
-(`models[]`: one block per executor, each rendered under its own heading inside every tab).
+(`models[]`: one block per executor, each rendered under its own heading inside every tab);
+v2 rows add the per-task hardness badge and the per-skill `ceiling/total` column.
 Open it in a browser or embed it in AGY chat with
 `<agent-embed src="file:///.../report.html" height="800px"></agent-embed>`.
 """
@@ -46,6 +47,22 @@ _VERDICT_CLASS = {
     "inconclusive": "bg-amber-500/15 text-amber-600",
 }
 _VERDICT_DEFAULT = "bg-slate-500/15 text-slate-500"
+
+_HARDNESS_CLASS = {
+    "informative": "bg-emerald-500/15 text-emerald-600",
+    "ceiling": "bg-amber-500/15 text-amber-600",
+    "unclassified": "bg-slate-500/15 text-slate-500",
+}
+_FLAG_CLASS = "bg-amber-500/15 text-amber-600"
+_HARDNESS_LEGEND = (
+    "Hardness (per executor, from its control arm alone): <em>informative</em> — the WITHOUT "
+    "arm missed at least <code>min_baseline_fail</code> criteria (default 1) in some valid rep; "
+    "<em>ceiling</em> — every valid WITHOUT rep passed the whole rubric, so the task cannot show "
+    "a lift for this executor; <em>unclassified</em> — fewer than 2 valid WITHOUT reps. Ceiling "
+    "tasks are flagged, never dropped: they stay in the lift, CI and verdict, because excluding "
+    "them would select tasks on the control arm's luck and bias the lift upward. A skill with "
+    "more than 50% of its tasks at the ceiling is marked <em>needs harder tasks</em>."
+)
 
 
 def _e(val: Any) -> str:
@@ -78,6 +95,42 @@ def _verdict_pill(verdict: str) -> str:
         f'<span class="inline-block rounded-full px-2 py-0.5 text-xs font-medium {cls}">'
         f"{_e(verdict)}</span>"
     )
+
+
+def _hardness_pill(task: Mapping[str, Any]) -> str:
+    """Hardness badge of a task row; rows without the field (schema v1) get `n/a`."""
+    label = task.get("hardness")
+    if not isinstance(label, str) or not label:
+        return f'<span class="{MUTED} text-xs">n/a</span>'
+    missed = list(task.get("baseline_missed") or [])
+    title = (
+        f"WITHOUT reps missed {', '.join(str(m) for m in missed)} criteria; "
+        f'need >= {task.get("min_baseline_fail", 1)} in some rep'
+        if missed
+        else f"{len(missed)} valid WITHOUT reps"
+    )
+    cls = _HARDNESS_CLASS.get(label, _VERDICT_DEFAULT)
+    return (
+        f'<span class="inline-block rounded-full px-2 py-0.5 text-xs font-medium {cls}" '
+        f'title="{_e(title)}">{_e(label)}</span>'
+    )
+
+
+def _ceiling_cell(row: Mapping[str, Any]) -> str:
+    """`ceiling/total` of a per-skill row plus the `needs harder tasks` flag."""
+    ceiling, total = row.get("ceiling_tasks"), row.get("total_tasks")
+    if not isinstance(ceiling, int) or not isinstance(total, int):
+        return f'<span class="{MUTED}">n/a</span>'
+    out = _e(f"{ceiling}/{total}")
+    unclassified = row.get("unclassified_tasks") or 0
+    if unclassified:
+        out += f'<div class="{MUTED} text-xs">{_e(unclassified)} unclassified</div>'
+    if row.get("needs_harder_tasks"):
+        out += (
+            f'<div><span class="inline-block rounded-full px-2 py-0.5 text-xs font-medium '
+            f'{_FLAG_CLASS}">needs harder tasks</span></div>'
+        )
+    return out
 
 
 def _ci_bar(lift: float | None, lo: float | None, hi: float | None) -> str:
@@ -201,6 +254,7 @@ def _skills_tab(report: Mapping[str, Any]) -> str:
                     f'{_num(r.get("tokens_without_median"))}'
                 ),
                 _e(r.get("invalid_total", 0)),
+                _ceiling_cell(r),
             ]
         )
     table = _table(
@@ -218,15 +272,18 @@ def _skills_tab(report: Mapping[str, Any]) -> str:
             "tests WITHOUT",
             "tokens p50 W/WO",
             "invalid",
+            "ceiling/total",
         ],
         rows,
-        "lrrrlcccccccr",
+        "lrrrlcccccccrc",
     )
     note = (
         f'<p class="{MUTED} text-xs mt-3">WITH / WITHOUT: mean share of rubric criteria passed. '
         "Lift: per-task paired difference, 95% CI from a two-level bootstrap (tasks, then reps). "
         "Tests: the task's deterministic <code>verify</code> command, original tests restored. "
-        "Verdict <em>helps</em> / <em>hurts</em> only when the whole CI is above / below 0.</p>"
+        "Verdict <em>helps</em> / <em>hurts</em> only when the whole CI is above / below 0. "
+        "Ceiling/total: tasks whose WITHOUT arm already passed every criterion (see the "
+        "Tasks tab); they stay in the lift.</p>"
     )
     return table + note
 
@@ -243,6 +300,7 @@ def _tasks_tab(report: Mapping[str, Any]) -> str:
                     _e(_pct(t.get("with_mean"))),
                     _e(_pct(t.get("without_mean"))),
                     f'<span class="font-medium">{_e(_pp(t.get("delta")))}</span>',
+                    _hardness_pill(t),
                     _e(f'{len(t.get("with_fracs") or [])} / {len(t.get("without_fracs") or [])}'),
                     _e(_ratio(*(t.get("verify_with") or [0, 0]))),
                     _e(_ratio(*(t.get("verify_without") or [0, 0]))),
@@ -273,21 +331,23 @@ def _tasks_tab(report: Mapping[str, Any]) -> str:
             "WITH",
             "WITHOUT",
             "Δ",
+            "hardness",
             "graded reps W/WO",
             "tests WITH",
             "tests WITHOUT",
             "diff lines p50 W/WO",
         ],
         rows,
-        "llrrrcccc",
+        "llrrrccccc",
     )
+    legend = f'<p class="{MUTED} text-xs mt-3">{_HARDNESS_LEGEND}</p>'
     crit = (
         f'<h3 class="{FG} text-base font-semibold mt-6 mb-3">Criteria pass rate per arm</h3>'
         f'<div class="grid md:grid-cols-2 gap-4">{"".join(crit_blocks)}</div>'
         if crit_blocks
         else ""
     )
-    return table + crit
+    return table + legend + crit
 
 
 def _rep_panel(rep: Mapping[str, Any], idx: int, total: int) -> str:
