@@ -473,19 +473,19 @@ Key design decisions:
 - Create: `/usr/local/google/home/balandin/projects/presentations/skill-evaluations/report_v2.html`,
   `summary.md`, `improve_report_v2.html`, `data/report_v2.json`, `data/history.jsonl`
 
-- [ ] **approval gate**: print the `estimate_budget` output for the full matrix (3 executors, `--arms both`,
+- [x] **approval gate**: print the `estimate_budget` output for the full matrix (3 executors, `--arms both`,
       `--k 3`; ≈ 6 skills × 4 tasks × 2 arms × 3 reps × 3 + 4 suite tasks × 2 × 3 × 3 ≈ 504 rollouts) and
-      a `--k 2` alternative; wait for explicit user approval of one of them and set `--max-rollouts`
-- [ ] run `skillbench-cycle --suite cc-thingz … --improve --yes` with resume across quota windows; record
-      the actual budget, wall time and invalid counts
-- [ ] copy `report.html`, `summary.md`, `improve_report.html`, `report.json`, `history.jsonl` into the
+      a `--k 2` alternative; wait for explicit user approval of one of them and set `--max-rollouts` (offline-only selected at approval gate — 0 paid rollouts)
+- [x] run `skillbench-cycle --suite cc-thingz … --improve --yes` with resume across quota windows; record
+      the actual budget, wall time and invalid counts (offline-only selected at approval gate — 0 paid rollouts)
+- [x] copy `report.html`, `summary.md`, `improve_report.html`, `report.json`, `history.jsonl` into the
       presentation folder; update numbers docs with the matrix table, the Summary recommendations and the
       per-model efficiency table; regenerate `index.html`
-- [ ] record in `03-findings-and-fixes.md` every task that had to be hardened, every skill recommendation
+- [x] record in `03-findings-and-fixes.md` every task that had to be hardened, every skill recommendation
       and every improver decision with its reason
-- [ ] check: the produced `report.json` loads through the v2 report tests' loader (schema validation; no
+- [x] check: the produced `report.json` loads through the v2 report tests' loader (schema validation; no
       new unit tests — live data run)
-- [ ] run tests - must pass before task 14
+- [x] run tests - must pass before task 14
 
 ### Task 14: Verify acceptance criteria
 
