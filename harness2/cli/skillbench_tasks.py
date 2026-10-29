@@ -210,7 +210,7 @@ def scaffold_task(
         if family:
             raise TasksCliError("--family applies to --kind suite only")
         if not skill or not SB._NAME.fullmatch(skill):
-            raise TasksCliError("--skill <name> is required for a skill task (e.g. make-plan)")
+            raise TasksCliError("--skill <name> is required for a skill task (e.g. my-skill)")
         parent = skill
         md = _skill_md(suite, skill)
         if md is None:

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "c1",
+    "criterion": "Identifies that leaked connections on timeout paths exhaust the fixed pool in service.py."
+  },
+  {
+    "id": "c2",
+    "criterion": "Explains why CPU and memory stay flat while HTTP 503 responses spike."
+  },
+  {
+    "id": "c3",
+    "criterion": "Scopes the blast radius to US-East checkout traffic using the pool size."
+  },
+  {
+    "id": "c4",
+    "criterion": "Provides an immediate mitigation that releases connections in a finally block."
+  }
+]

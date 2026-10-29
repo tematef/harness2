@@ -1,0 +1,10 @@
+kind = "suite"
+family = "release"
+pilot = true
+timeout = 180
+prompt = """During a staged deployment of release_pipeline.py, error rates jumped at the 25% traffic mark. Diagnose the root cause in release_pipeline.py, fix the defect so unit checks pass, and document the updated progressive rollout plan."""
+forbidden_terms = [
+  "incident-triage",
+  "canary-rollout",
+  "SKILL.md",
+]

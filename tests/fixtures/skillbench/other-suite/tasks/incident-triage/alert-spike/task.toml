@@ -1,0 +1,15 @@
+target_skill = "incident-triage"
+kind = "skill"
+pilot = true
+timeout = 120
+prompt = """Checkout requests in service.py started returning HTTP 503 after the connection pool refactor, while CPU and memory usage remain flat. Investigate the repository and write a diagnostic report explaining the failure mechanism, blast radius, and safe mitigation steps."""
+asks_user = true
+user_answers = [
+  "Focus on the primary US-East checkout pool where max_connections is 16.",
+  "Prefer a zero-downtime configuration mitigation before a full rollback.",
+]
+forbidden_terms = [
+  "incident-triage",
+  "canary-rollout",
+  "SKILL.md",
+]

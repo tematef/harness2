@@ -1,0 +1,18 @@
+[
+  {
+    "id": "c1",
+    "criterion": "Pinpoints the off-by-one percentage comparison in release_pipeline.py."
+  },
+  {
+    "id": "c2",
+    "criterion": "Explains why errors only appear once weight reaches 25%."
+  },
+  {
+    "id": "c3",
+    "criterion": "Proposes or applies the fix to preserve header forwarding on the new backend."
+  },
+  {
+    "id": "c4",
+    "criterion": "Documents the staged rollout verification and abort gates after the fix."
+  }
+]

@@ -1,0 +1,11 @@
+target_skill = "canary-rollout"
+kind = "skill"
+pilot = true
+timeout = 120
+prompt = """We are deploying v2 of router.py behind the weighted traffic splitter. Produce a staged traffic-shift schedule from 0% to 100% with explicit health metrics, abort thresholds, and rollback steps tailored to the session-affinity behaviour in router.py."""
+asks_user = false
+forbidden_terms = [
+  "canary-rollout",
+  "incident-triage",
+  "SKILL.md",
+]

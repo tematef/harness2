@@ -489,18 +489,18 @@ Key design decisions:
 
 ### Task 14: Verify acceptance criteria
 
-- [ ] a synthetic 2-plugin suite under `tests/fixtures/skillbench/other-suite/` (not cc-thingz, different
+- [x] a synthetic 2-plugin suite under `tests/fixtures/skillbench/other-suite/` (not cc-thingz, different
       skill names, one asking skill) runs through `skillbench-tasks check`, staging for all four arm labels,
       report (mocked cells) and improve (mocked improver) with no code change — the no-hard-coding proof
-- [ ] `grep -rn "cc-thingz\|make-plan\|root-cause\|brainstorm" harness2/` returns only docstrings, the
+- [x] `grep -rn "cc-thingz\|make-plan\|root-cause\|brainstorm" harness2/` returns only docstrings, the
       example `suites/cc-thingz.toml` and the bundled corpus — no logic
-- [ ] Summary page answers the three questions on one screen: per-skill recommendation, per-family
+- [x] Summary page answers the three questions on one screen: per-skill recommendation, per-family
       suite-vs-built-in verdict, per-model efficiency; `summary.md` renders in GitHub markdown
-- [ ] matrix resume: re-running the same command after an interruption schedules 0 new rollouts
-- [ ] improver refuses a model mismatch, passes a multi-model gate in the mocked test, `--apply` dry-run
+- [x] matrix resume: re-running the same command after an interruption schedules 0 new rollouts
+- [x] improver refuses a model mismatch, passes a multi-model gate in the mocked test, `--apply` dry-run
       prints a correct branch/commit
-- [ ] run full test suite: `.venv/bin/python -m unittest discover -s tests` and `.venv/bin/ruff check .`
-- [ ] every public function in the new modules has at least one test
+- [x] run full test suite: `.venv/bin/python -m unittest discover -s tests` and `.venv/bin/ruff check .`
+- [x] every public function in the new modules has at least one test
 
 ### Task 15: [Final] Update documentation
 

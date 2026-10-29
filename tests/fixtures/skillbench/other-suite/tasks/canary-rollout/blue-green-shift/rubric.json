@@ -1,0 +1,18 @@
+[
+  {
+    "id": "c1",
+    "criterion": "Defines progressive traffic stages (e.g. 5%, 25%, 50%, 100%) with bake intervals."
+  },
+  {
+    "id": "c2",
+    "criterion": "Accounts for sticky session cookies in router.py when shifting traffic between v1 and v2."
+  },
+  {
+    "id": "c3",
+    "criterion": "Specifies quantitative abort thresholds for error rate and latency."
+  },
+  {
+    "id": "c4",
+    "criterion": "Includes a deterministic rollback procedure that drains v2 sessions safely."
+  }
+]

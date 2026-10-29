@@ -1,0 +1,16 @@
+name = "acme-ops"
+plugins_dir = "./plugins"
+plugins = ["triage-kit", "deploy-kit"]
+tasks_root = "./tasks"
+banned_tools = ["AskUserQuestion", "EnterPlanMode", "TodoWrite", "LegacyDeployTool"]
+
+[families]
+release = ["incident-triage", "canary-rollout"]
+
+[matrix]
+executors = ["opus-5.5-high", "gemini-3.8-flash-high"]
+
+[matrix.judge_for]
+"opus-" = "gemini-3.8-flash-high"
+"gemini-" = "fable-5.1-high"
+"fable-" = "gemini-3.8-flash-high"

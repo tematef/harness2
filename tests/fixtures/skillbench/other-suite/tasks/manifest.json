@@ -1,0 +1,9 @@
+{
+  "hash": "80e9ebe7bc122cbacad8fb9e4be2b405d81d58ad451b8fe0dfd5340d5f8b80f8",
+  "tasks": {
+    "_suite/full-release": "6ac690c0bb2cbc86d478df3d0076883f28bd97835b6977f69b11a4a31be1f4a0",
+    "canary-rollout/blue-green-shift": "8e3af3fc9e3be849b4ead14fa08d21dd29a2ac88edeee31df5fc6318c9b8f048",
+    "incident-triage/alert-spike": "84cb267812b371c6c9c30e1529f841e7784d05169dbd69b5dcb36ae416ef7b21"
+  },
+  "version": 1
+}

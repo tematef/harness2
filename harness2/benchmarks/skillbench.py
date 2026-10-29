@@ -371,7 +371,7 @@ def _load_kind(meta: dict, toml_path: Path, task_dir: Path) -> tuple[str, str, s
         )
     skill = meta["target_skill"]
     if not isinstance(skill, str) or not _NAME.fullmatch(skill):
-        raise TaskError(f"{toml_path}: target_skill must be a skill name like 'make-plan'")
+        raise TaskError(f"{toml_path}: target_skill must be a skill name like 'my-skill'")
     if task_dir.parent.name != skill:
         raise TaskError(
             f"{toml_path}: target_skill {skill!r} but the task lives under "
