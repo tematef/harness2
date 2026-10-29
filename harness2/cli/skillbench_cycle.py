@@ -68,17 +68,7 @@ def normalize_stage(stage: str | None) -> str:
     return resolved
 
 
-def _csv(raw: Sequence[str] | str | None) -> tuple[str, ...]:
-    if raw is None:
-        return ()
-    if isinstance(raw, str):
-        return tuple(s.strip() for s in raw.split(",") if s.strip())
-    out: list[str] = []
-    for item in raw:
-        for s in str(item).split(","):
-            if s.strip():
-                out.append(s.strip())
-    return tuple(dict.fromkeys(out))
+_csv = C.csv_list
 
 
 # --------------------------------------------------------------------------------------------

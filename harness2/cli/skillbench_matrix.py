@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import statistics
 import sys
 from datetime import datetime, timezone
@@ -116,17 +115,7 @@ class MatrixJob(BudgetDict):
         )
 
 
-def _csv(raw: Sequence[str] | str | None) -> tuple[str, ...]:
-    if raw is None:
-        return ()
-    if isinstance(raw, str):
-        return tuple(s.strip() for s in raw.split(",") if s.strip())
-    out: list[str] = []
-    for item in raw:
-        for s in str(item).split(","):
-            if s.strip():
-                out.append(s.strip())
-    return tuple(dict.fromkeys(out))
+_csv = C.csv_list
 
 
 def resolve_judge(
@@ -1080,21 +1069,16 @@ def _main(args: argparse.Namespace) -> int:
                 sweep_ns = _sweep_args_namespace(args, arm)
                 run_sweep._check_identity(adapter, sweep_ns, adapt_ns_dir, tag=arm)
                 run_sweep.write_run_json(adapter, adapt_ns_dir)
-                run_sweep._sync_results_cell(adapter, adapt_ns_dir)
+                C.sync_results_cell(adapter, adapt_ns_dir)
 
                 sweep_rc = int(run_sweep.main(_sweep_argv(args, arm)) or 0)
                 if sweep_rc in (0, 2):
-                    run_sweep._sync_results_cell(adapter, adapt_ns_dir)
+                    C.sync_results_cell(adapter, adapt_ns_dir)
                     judge_rc = int(judge.main(_judge_argv(args, arm)) or 0)
                 else:
                     judge_rc = 1
 
-                if (adapt_ns_dir / "base_judged.json").is_file():
-                    results_cell_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(
-                        adapt_ns_dir / "base_judged.json",
-                        results_cell_dir / "base_judged.json",
-                    )
+                C.sync_results_cell(adapter, adapt_ns_dir)
 
             if sweep_rc == 0 and judge_rc == 0:
                 _mark_cell_done(results_cell_dir, cell_jobs)

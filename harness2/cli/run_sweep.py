@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,8 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _csv(raw: str) -> tuple[str, ...]:
-    return tuple(s.strip() for s in raw.split(",") if s.strip())
+_csv = C.csv_list
 
 
 def _stream_for(adapter, args) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
@@ -255,7 +253,8 @@ def _main(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-RUN_JSON = "run.json"
+RUN_JSON = C.RUN_JSON
+_sync_results_cell = C.sync_results_cell
 
 
 def _fresh_suite_hash(suite: object) -> str | None:
@@ -270,26 +269,6 @@ def _fresh_suite_hash(suite: object) -> str | None:
 
         return compute_suite_hash(plugins_dir, plugins)
     return getattr(suite, "suite_hash", None)
-
-
-def _sync_results_cell(adapter, ns_dir: Path) -> None:
-    """Mirror `config.json`, `run.json` and `<task>/summary.json` into `adapter._results_root`
-    (`<runs_root>/results/<executor>/<arm>/`) so `discover_cells` finds a self-contained cell."""
-    results_root = getattr(adapter, "_results_root", None)
-    if results_root is None:
-        return
-    dst_root = Path(results_root)
-    if dst_root == ns_dir:
-        return
-    dst_root.mkdir(parents=True, exist_ok=True)
-    for meta in ("config.json", RUN_JSON):
-        src = ns_dir / meta
-        if src.is_file():
-            shutil.copyfile(src, dst_root / meta)
-    for summary_path in sorted(ns_dir.glob("*/summary.json")):
-        task_dst = dst_root / summary_path.parent.name
-        task_dst.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(summary_path, task_dst / "summary.json")
 
 
 def write_run_json(adapter, namespace_dir: Path) -> Path:

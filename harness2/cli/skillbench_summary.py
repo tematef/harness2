@@ -456,7 +456,9 @@ def _normalize_history_record(
 
 
 def _str_or_none(val: Any) -> str | None:
-    return val if isinstance(val, str) and val else None
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
 
 
 def history_records_from_report(

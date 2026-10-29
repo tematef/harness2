@@ -104,6 +104,8 @@ from .skillbench_summary import (
 )
 from .skillbench_summary import (
     RECOMMENDATION_RULE_NOTE,
+    _delta_pct,
+    _str_or_none,
     append_history,
     build_summary,
     default_history_path,
@@ -242,10 +244,6 @@ def discover_cells(results_root: Path) -> list[ReportCell]:
             f"no judged namespaces under {root}; expected <executor>/<arm-label>/base_judged.json"
         )
     return cells
-
-
-def _str_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
 
 
 @dataclass(frozen=True)
@@ -552,8 +550,18 @@ def _score_counts(score: Any) -> tuple[int, int] | None:
     return (n_passed, n_criteria)
 
 
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _read_json(path: Path, *, strict: bool = False) -> Any:
+    """Load a JSON file; when `strict=False` (default), missing/unreadable/non-dict files
+    return `{}`."""
+    if strict:
+        return json.loads(path.read_text(encoding="utf-8"))
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 _META_FILES = ("config.json", RUN_JSON)
@@ -565,15 +573,8 @@ def _load_cell_meta(ns_dir: Path) -> dict[str, Any]:
     missing files contribute nothing; `None` values never override a known one."""
     meta: dict[str, Any] = {}
     for name in _META_FILES:
-        path = Path(ns_dir) / name
-        if not path.is_file():
-            continue
-        try:
-            loaded = _read_json(path)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(loaded, dict):
-            meta.update({k: v for k, v in loaded.items() if v is not None})
+        loaded = _read_json(Path(ns_dir) / name)
+        meta.update({k: v for k, v in loaded.items() if v is not None})
     return meta
 
 
@@ -589,7 +590,7 @@ def _load_arm_records(ns_dir: Path) -> tuple[dict[str, Any], list[_RepRecord]]:
             f"{judged_path} does not exist; run `harness2-judge --bench skillbench --bases` first"
         )
     try:
-        raw_judged = _read_json(judged_path)
+        raw_judged = _read_json(judged_path, strict=True)
     except (OSError, json.JSONDecodeError) as e:
         raise ValueError(f"{judged_path}: unreadable JSON ({e})") from None
     if not isinstance(raw_judged, list):
@@ -615,7 +616,7 @@ def _load_arm_records(ns_dir: Path) -> tuple[dict[str, Any], list[_RepRecord]]:
     records: list[_RepRecord] = []
     for summary_path in sorted(ns_dir.glob("*/summary.json")):
         try:
-            summary = _read_json(summary_path)
+            summary = _read_json(summary_path, strict=True)
         except (OSError, json.JSONDecodeError) as e:
             raise ValueError(f"{summary_path}: unreadable JSON ({e})") from None
         if not isinstance(summary, Mapping):
@@ -687,7 +688,7 @@ def _load_rep(
             invalid_reason = "missing skill_timing.json"
         else:
             try:
-                timing = _read_json(timing_path)
+                timing = _read_json(timing_path, strict=True)
             except (OSError, json.JSONDecodeError):
                 timing = None
             if not isinstance(timing, Mapping):
@@ -734,14 +735,9 @@ def _load_rep(
                         )
                     )
 
-        v_path = run_dir / VERIFY_FILE
-        if v_path.is_file():
-            try:
-                v_data = _read_json(v_path)
-            except (OSError, json.JSONDecodeError):
-                v_data = None
-            if isinstance(v_data, Mapping) and isinstance(v_data.get("passed"), bool):
-                verify_passed = v_data["passed"]
+        v_data = _read_json(run_dir / VERIFY_FILE)
+        if isinstance(v_data.get("passed"), bool):
+            verify_passed = v_data["passed"]
         try:
             diff = diff_stats(run_dir)
         except OSError:
@@ -759,7 +755,7 @@ def _load_rep(
         j_path = run_dir / JUDGMENTS_FILE
         if j_path.is_file():
             try:
-                j_data = _read_json(j_path)
+                j_data = _read_json(j_path, strict=True)
             except (OSError, json.JSONDecodeError):
                 j_data = None
             if isinstance(j_data, Mapping):
@@ -816,20 +812,6 @@ def _load_rep(
 def _median(vals: Iterable[float | int | None]) -> float | None:
     clean = [float(v) for v in vals if v is not None]
     return float(st.median(clean)) if clean else None
-
-
-def _delta_pct(treatment: float | None, control: float | None) -> float | None:
-    """Percentage change `(treatment - control) / control * 100` when both medians are known
-    and `control > 0`."""
-    if (
-        treatment is None
-        or control is None
-        or isinstance(treatment, bool)
-        or isinstance(control, bool)
-        or control <= 0
-    ):
-        return None
-    return (float(treatment) - float(control)) / float(control) * 100.0
 
 
 def pick_best_model(rows: Sequence[Mapping[str, Any]]) -> str | None:

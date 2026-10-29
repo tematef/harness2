@@ -57,6 +57,7 @@ from ..benchmarks.skillbench import (
     _default_runs_root,
     _env_pilot,
     _path_segment,
+    _stage_judge_auth,
     build_prompt,
     deliverable_text,
     diff_stats,
@@ -77,7 +78,6 @@ from ..substrate.agy import (
     _kill_group,
     agy_argv,
     agy_bin_missing_message,
-    auth_files,
     exec_effort,
     exec_model,
     executor_env,
@@ -97,6 +97,7 @@ from .skillbench_report import (
     HARDNESS_UNCLASSIFIED,
     MIN_BASELINE_REPS,
     NEEDS_HARDER_TASKS,
+    _read_json,
     build_report,
 )
 from .skillbench_summary import (
@@ -105,6 +106,7 @@ from .skillbench_summary import (
     REC_NEEDS_HARDER_TASKS,
     _extract_tokens_delta_pct,
     _extract_wall_delta_pct,
+    _str_or_none,
     recommend,
 )
 
@@ -200,41 +202,12 @@ def improver_model(override: str | None = None) -> str:
     return exec_model()
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _str_or_none(val: Any) -> str | None:
-    if isinstance(val, str) and val.strip():
-        return val.strip()
-    return None
-
-
 def _parse_models(
     models: Sequence[str] | str | None = None,
     executor: str | None = None,
 ) -> tuple[str, ...]:
     """Normalize `--models` / `models` / `executor` into a deduplicated tuple of model IDs."""
-    out: list[str] = []
-    if models is not None:
-        if isinstance(models, str):
-            items = [s.strip() for s in models.split(",") if s.strip()]
-        else:
-            items = []
-            for m in models:
-                for s in str(m).split(","):
-                    if s.strip():
-                        items.append(s.strip())
-        out.extend(items)
-    if executor and str(executor).strip():
-        out.append(str(executor).strip())
-    return tuple(dict.fromkeys(out))
+    return C.csv_list((*C.csv_list(models), executor or ""))
 
 
 def detect_cell_executor(
@@ -1078,19 +1051,7 @@ def build_improver_prompt(
     )
 
 
-def _stage_isolated_auth(home: Path) -> list[Path]:
-    real = Path.home()
-    copied: list[Path] = []
-    for rel in auth_files():
-        src = real / rel
-        if not src.is_file():
-            continue
-        dst = home / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst, follow_symlinks=True)
-        dst.chmod(0o600)
-        copied.append(dst)
-    return copied
+_stage_isolated_auth = _stage_judge_auth
 
 
 def run_improver_once(
@@ -1134,7 +1095,7 @@ def run_improver_once(
     )
     t0 = time.monotonic()
     try:
-        _stage_isolated_auth(home)
+        _stage_judge_auth(home)
         try:
             proc = subprocess.Popen(
                 argv,

@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from pathlib import Path
+from typing import Sequence
 
 from ..core import library as LIB
 from ..core import schedule as SCHED
@@ -30,6 +32,7 @@ from ..core.spec import BenchmarkAdapter
 
 SUITE_ENV = "SKILLBENCH_SUITE"
 MATRIX_ENV = "SKILLBENCH_MATRIX"
+RUN_JSON = "run.json"
 
 BENCHES = ("jb", "wb", "lab", "skillbench")
 WB_SUBSETS = ("office", "web", "code")
@@ -295,9 +298,44 @@ def add_run_identity_args(p: argparse._ActionsContainer) -> None:
     add_modes_arg(p)
 
 
+def csv_list(raw: Sequence[str] | str | None) -> tuple[str, ...]:
+    """Split a comma-separated string or sequence of strings into a deduplicated tuple."""
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        items = [s.strip() for s in raw.split(",") if s.strip()]
+    else:
+        items = [s.strip() for item in raw for s in str(item).split(",") if s.strip()]
+    return tuple(dict.fromkeys(items))
+
+
+_csv = csv_list
+
+
+def sync_results_cell(adapter: object, ns_dir: Path) -> None:
+    """Mirror `config.json`, `run.json`, `base_judged.json` and `<task>/summary.json` into
+    `adapter._results_root` (`<runs_root>/results/<executor>/<arm>/`) so `discover_cells` finds
+    a self-contained cell."""
+    results_root = getattr(adapter, "_results_root", None)
+    if results_root is None:
+        return
+    dst_root = Path(results_root)
+    if dst_root == ns_dir:
+        return
+    dst_root.mkdir(parents=True, exist_ok=True)
+    for meta in ("config.json", RUN_JSON, "base_judged.json"):
+        src = ns_dir / meta
+        if src.is_file():
+            shutil.copyfile(src, dst_root / meta)
+    for summary_path in sorted(ns_dir.glob("*/summary.json")):
+        task_dst = dst_root / summary_path.parent.name
+        task_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(summary_path, task_dst / "summary.json")
+
+
 def parse_modes(raw: str) -> tuple[str, ...]:
     """'parallel,sequential' (or the on-disk tokens 'agg,seq') -> tokens in MODES order."""
-    names = [s.strip() for s in raw.split(",") if s.strip()]
+    names = list(csv_list(raw))
     if not names:
         raise ValueError(
             f"--modes takes a comma list of parallel | sequential (agg | seq), got {raw!r}"
