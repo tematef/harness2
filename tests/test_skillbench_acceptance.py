@@ -847,10 +847,18 @@ class TestPublicFunctionCoverage(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         suite = ss.load_suite(OTHER_SUITE_TOML)
 
-        # skillbench_suite.discover_plugins
+        # skillbench_suite.discover_plugins, skill_files, skill_names
         self.assertEqual(
             ss.discover_plugins(OTHER_SUITE_DIR / "plugins"),
             ("deploy-kit", "triage-kit"),
+        )
+        self.assertEqual(
+            set(ss.skill_files(suite.plugins_dir, suite.plugins)),
+            {"incident-triage", "canary-rollout"},
+        )
+        self.assertEqual(
+            ss.skill_names(suite.plugins_dir, suite.plugins),
+            {"incident-triage", "canary-rollout"},
         )
 
         # skillbench_tasks.render_task_toml, rubric_stubs, scaffold_task, render_table
@@ -945,11 +953,19 @@ class TestPublicFunctionCoverage(unittest.TestCase):
         }
         srows = ssum.build_summary(sample_report, history=[])
         self.assertEqual(len(srows), 1)
+        self.assertEqual(ssum.recommend(srows[0])[0], ssum.REC_KEEP)
         sample_report["summary"] = srows
         hrecs = ssum.history_records_from_report(sample_report, date="2026-10-29")
         self.assertEqual(len(hrecs), 1)
+        def_hpath = ssum.default_history_path(OTHER_SUITE_TOML)
+        self.assertEqual(def_hpath.name, "history.jsonl")
+        app_hpath = tmp / "appended_history.jsonl"
+        ssum.append_history(app_hpath, sample_report, date="2026-10-29")
+        self.assertEqual(len(ssum.read_history(app_hpath)), 1)
         hmd = ssum.render_history_markdown(hrecs)
         self.assertIn("incident-triage", hmd)
+        sum_md = ssum.render_summary_markdown(sample_report, history=hrecs)
+        self.assertIn("incident-triage", sum_md)
         sec_html = ssum.render_summary_section_html(sample_report, history=hrecs)
         self.assertIn("incident-triage", sec_html)
         full_html = ssum.render_summary_html(sample_report, history=hrecs)
@@ -985,10 +1001,44 @@ class TestPublicFunctionCoverage(unittest.TestCase):
         self.assertEqual(cres["rc"], 0)
 
     def test_every_public_function_in_new_modules_is_called_in_tests(self) -> None:
-        test_sources = "\n".join(
-            p.read_text(encoding="utf-8")
-            for p in sorted((REPO_ROOT / "tests").glob("test_skillbench*.py"))
-        )
+        mod_by_dotted = {
+            mod.__name__: rel_path for rel_path, mod in self.NEW_MODULES
+        }
+        called_by_mod: dict[str, set[str]] = {rel_path: set() for rel_path, _ in self.NEW_MODULES}
+
+        for p in sorted((REPO_ROOT / "tests").glob("test_skillbench*.py")):
+            tree = ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+            mod_aliases: dict[str, str] = {}
+            fn_imports: dict[str, tuple[str, str]] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module in mod_by_dotted:
+                        rel = mod_by_dotted[node.module]
+                        for alias in node.names:
+                            fn_imports[alias.asname or alias.name] = (rel, alias.name)
+                    elif node.module in ("harness2.cli", "harness2.benchmarks"):
+                        for alias in node.names:
+                            full = f"{node.module}.{alias.name}"
+                            if full in mod_by_dotted:
+                                mod_aliases[alias.asname or alias.name] = mod_by_dotted[full]
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name in mod_by_dotted:
+                            mod_aliases[alias.asname or alias.name] = mod_by_dotted[alias.name]
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Attribute) and isinstance(
+                        node.func.value, ast.Name
+                    ):
+                        rel = mod_aliases.get(node.func.value.id)
+                        if rel is not None:
+                            called_by_mod[rel].add(node.func.attr)
+                    elif isinstance(node.func, ast.Name):
+                        target = fn_imports.get(node.func.id)
+                        if target is not None:
+                            called_by_mod[target[0]].add(target[1])
+
         missing: list[str] = []
         for rel_path, _ in self.NEW_MODULES:
             mod_path = REPO_ROOT / rel_path
@@ -1001,7 +1051,7 @@ class TestPublicFunctionCoverage(unittest.TestCase):
             ]
             self.assertTrue(pub_funcs, f"No public functions found in {rel_path}")
             for fn in pub_funcs:
-                if not re.search(rf"\b{re.escape(fn)}\s*\(", test_sources):
+                if fn not in called_by_mod[rel_path]:
                     missing.append(f"{rel_path}:{fn}")
         self.assertEqual(missing, [], f"Untested public functions: {missing}")
 

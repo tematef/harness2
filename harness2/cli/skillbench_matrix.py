@@ -74,9 +74,6 @@ MATRIX_JSON = "matrix.json"
 CELL_DONE_JSON = ".cell_done.json"
 HISTORY_JSONL = "history.jsonl"
 
-# Alias for callers expecting either name.
-model_context = executor_env
-
 
 class BudgetDict(dict):
     """A `dict` that also supports attribute access (`budget.rollouts` == `budget["rollouts"]`)."""
@@ -266,36 +263,33 @@ def _completed_reps_in_dir(ns_dir: Path, k: int) -> set[tuple[str, int]]:
         if tid and label and row.get("score") is not None:
             graded_labels.setdefault(tid, set()).add(label)
 
-    # Also check summary.json files if present; if base_judged.json alone is present with
-    # graded base1..basek rows, accept those too.
-    summaries = list(ns_dir.glob("*/summary.json"))
-    if summaries:
-        for sp in summaries:
-            try:
-                summary = json.loads(sp.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(summary, Mapping):
-                continue
-            if summary.get("status") not in ("bases-only", "ok", "skipped"):
-                continue
-            tid = str(summary.get("task_id") or "")
-            if not tid:
-                continue
-            for entry in summary.get("base") or []:
-                if not isinstance(entry, Mapping):
-                    continue
-                lbl = str(entry.get("label") or "")
-                if lbl.startswith("base") and lbl[4:].isdigit():
-                    rep_idx = int(lbl[4:])
-                    if lbl in graded_labels.get(tid, set()) or entry.get("ok"):
-                        if judged_path.is_file():
-                            done.add((tid, rep_idx))
-    else:
-        for tid, labels in graded_labels.items():
+    failed_labels: dict[str, set[str]] = {}
+    for sp in ns_dir.glob("*/summary.json"):
+        try:
+            summary = json.loads(sp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(summary, Mapping):
+            continue
+        tid = str(summary.get("task_id") or "")
+        if not tid:
+            continue
+        if summary.get("status") not in ("bases-only", "ok", "skipped"):
             for rep_idx in range(1, k + 1):
-                if f"base{rep_idx}" in labels:
-                    done.add((tid, rep_idx))
+                failed_labels.setdefault(tid, set()).add(f"base{rep_idx}")
+            continue
+        for entry in summary.get("base") or []:
+            if isinstance(entry, Mapping) and entry.get("ok") is False:
+                lbl = str(entry.get("label") or "")
+                if lbl:
+                    failed_labels.setdefault(tid, set()).add(lbl)
+
+    for tid, labels in graded_labels.items():
+        bad = failed_labels.get(tid, set())
+        for rep_idx in range(1, k + 1):
+            lbl = f"base{rep_idx}"
+            if lbl in labels and lbl not in bad:
+                done.add((tid, rep_idx))
     return done
 
 
@@ -442,20 +436,15 @@ def _extract_samples_from_record(
             break
 
 
-def _parse_history_records(
-    history: Any,
-) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
-    """Turn `history` (None, Path/str to `.jsonl`/`.json`/dir, Mapping, or sequence of dicts)
-    into `(wall_seconds_by_executor, tokens_by_executor)`."""
-    wall_by_exec: dict[str, list[float]] = {}
-    tok_by_exec: dict[str, list[float]] = {}
-    if history is None:
-        return wall_by_exec, tok_by_exec
-
-    if isinstance(history, (str, Path)):
-        path = Path(history).expanduser()
+def _read_records_from_source(source: Any) -> list[dict[str, Any]]:
+    """Read raw history / timing record dicts from a path, mapping, or iterable."""
+    out: list[dict[str, Any]] = []
+    if source is None:
+        return out
+    if isinstance(source, (str, Path)):
+        path = Path(source).expanduser()
         if not path.exists():
-            return wall_by_exec, tok_by_exec
+            return out
         if path.is_dir():
             for tf in sorted(path.rglob(SKILL_TIMING_FILE)):
                 try:
@@ -463,21 +452,16 @@ def _parse_history_records(
                 except (OSError, json.JSONDecodeError):
                     continue
                 if isinstance(rec, Mapping):
-                    _extract_samples_from_record(rec, wall_by_exec, tok_by_exec)
+                    out.append(dict(rec))
             hist_file = path / HISTORY_JSONL
             if hist_file.is_file():
-                w2, t2 = _parse_history_records(hist_file)
-                for k, vals in w2.items():
-                    wall_by_exec.setdefault(k, []).extend(vals)
-                for k, vals in t2.items():
-                    tok_by_exec.setdefault(k, []).extend(vals)
-            return wall_by_exec, tok_by_exec
+                out.extend(_read_records_from_source(hist_file))
+            return out
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
-            return wall_by_exec, tok_by_exec
+            return out
         if path.suffix == ".jsonl":
-            records = []
             for line in text.splitlines():
                 line = line.strip()
                 if not line:
@@ -487,57 +471,50 @@ def _parse_history_records(
                 except json.JSONDecodeError:
                     continue
                 if isinstance(obj, Mapping):
-                    records.append(obj)
-            return _parse_history_records(records)
+                    out.append(dict(obj))
+            return out
         try:
             loaded = json.loads(text)
         except json.JSONDecodeError:
-            return wall_by_exec, tok_by_exec
-        return _parse_history_records(loaded)
+            return out
+        return _read_records_from_source(loaded)
 
-    if isinstance(history, Mapping):
-        # Either a single record dict or a mapping of executor -> record / list of records / float.
+    if isinstance(source, Mapping):
         if any(
-            k in history
-            for k in (
-                "executor",
-                "requested_model",
-                "model",
-                "t_total_s",
-                "wall_s",
-                "total_tokens",
-                "tokens",
-            )
+            k in source
+            for k in ("executor", "requested_model", "model", "t_total_s", "wall_s", "total_tokens", "tokens")
         ):
-            _extract_samples_from_record(history, wall_by_exec, tok_by_exec)
-            return wall_by_exec, tok_by_exec
-        for ex, val in history.items():
+            return [dict(source)]
+        for ex, val in source.items():
             if isinstance(val, (int, float)) and not isinstance(val, bool):
-                wall_by_exec.setdefault(str(ex), []).append(float(val))
+                out.append({"executor": str(ex), "t_total_s": float(val)})
             elif isinstance(val, Mapping):
-                _extract_samples_from_record(
-                    val, wall_by_exec, tok_by_exec, default_executor=str(ex)
-                )
+                out.append({"executor": str(ex), **val})
             elif isinstance(val, Iterable) and not isinstance(val, (str, bytes)):
                 for item in val:
                     if isinstance(item, Mapping):
-                        _extract_samples_from_record(
-                            item, wall_by_exec, tok_by_exec, default_executor=str(ex)
-                        )
+                        out.append({"executor": str(ex), **item})
                     elif isinstance(item, (int, float)) and not isinstance(item, bool):
-                        wall_by_exec.setdefault(str(ex), []).append(float(item))
-        return wall_by_exec, tok_by_exec
+                        out.append({"executor": str(ex), "t_total_s": float(item)})
+        return out
 
-    if isinstance(history, Iterable) and not isinstance(history, (str, bytes)):
-        for item in history:
+    if isinstance(source, Iterable) and not isinstance(source, (str, bytes)):
+        for item in source:
             if isinstance(item, Mapping):
-                _extract_samples_from_record(item, wall_by_exec, tok_by_exec)
+                out.append(dict(item))
             elif isinstance(item, (str, Path)):
-                w2, t2 = _parse_history_records(item)
-                for k, vals in w2.items():
-                    wall_by_exec.setdefault(k, []).extend(vals)
-                for k, vals in t2.items():
-                    tok_by_exec.setdefault(k, []).extend(vals)
+                out.extend(_read_records_from_source(item))
+    return out
+
+
+def _parse_history_records(
+    history: Any,
+) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+    """Turn `history` into `(wall_seconds_by_executor, tokens_by_executor)`."""
+    wall_by_exec: dict[str, list[float]] = {}
+    tok_by_exec: dict[str, list[float]] = {}
+    for rec in _read_records_from_source(history):
+        _extract_samples_from_record(rec, wall_by_exec, tok_by_exec)
     return wall_by_exec, tok_by_exec
 
 
@@ -548,32 +525,17 @@ def load_history(
     runs_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Collect historical rollout timing / `history.jsonl` records for budget estimation."""
-    records: list[dict[str, Any]] = []
-    sources: list[Any] = []
     if source is not None:
-        sources.append(source)
-    else:
-        if suite is not None and suite.path is not None:
-            cand = suite.path.parent / HISTORY_JSONL
-            if cand.is_file():
-                sources.append(cand)
-        if runs_root is not None:
-            res_dir = Path(runs_root) / "results"
-            if res_dir.is_dir():
-                sources.append(res_dir)
-    for src in sources:
-        w_map, t_map = _parse_history_records(src)
-        for ex in sorted(set(w_map) | set(t_map)):
-            walls = w_map.get(ex) or []
-            toks = t_map.get(ex) or []
-            n = max(len(walls), len(toks))
-            for idx in range(n):
-                rec: dict[str, Any] = {"executor": ex}
-                if idx < len(walls):
-                    rec["t_total_s"] = walls[idx]
-                if idx < len(toks):
-                    rec["total_tokens"] = int(round(toks[idx]))
-                records.append(rec)
+        return _read_records_from_source(source)
+    records: list[dict[str, Any]] = []
+    if suite is not None and suite.path is not None:
+        cand = suite.path.parent / HISTORY_JSONL
+        if cand.is_file():
+            records.extend(_read_records_from_source(cand))
+    if runs_root is not None:
+        res_dir = Path(runs_root) / "results"
+        if res_dir.is_dir():
+            records.extend(_read_records_from_source(res_dir))
     return records
 
 

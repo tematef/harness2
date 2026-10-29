@@ -27,7 +27,6 @@ import io
 import json
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 from html.parser import HTMLParser
@@ -37,9 +36,7 @@ from unittest import mock
 
 from harness2 import config
 from harness2.cli import skillbench_report as SR
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_skillbench_report_v2 import Spec, seed_namespace  # noqa: E402
+from tests.test_skillbench_report_v2 import Spec, seed_namespace
 
 # Control arm (WITHOUT) hits the ceiling on t1 and t2, misses on t3; WITH is perfect.
 TWO_CEILING: Spec = {

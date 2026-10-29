@@ -115,6 +115,13 @@ def _toml_list(items: Sequence[str]) -> str:
     return "[\n" + "".join(f"  {_toml_str(i)},\n" for i in items) + "]"
 
 
+def _toml_multiline_str(v: str) -> str:
+    escaped = v.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    if escaped.endswith('"'):
+        escaped = escaped[:-1] + '\\"'
+    return f'"""{escaped}"""'
+
+
 def render_task_toml(
     *,
     kind: str,
@@ -134,7 +141,7 @@ def render_task_toml(
         lines.append(f"target_skill = {_toml_str(skill)}")
     lines.append("pilot = false")
     lines.append(f"timeout = {int(timeout)}")
-    lines.append(f'prompt = """{prompt}"""')
+    lines.append(f"prompt = {_toml_multiline_str(prompt)}")
     if asks_user is None:
         lines.append(
             "# asks_user = true   # set when the skill asks the user (frontmatter allowed-tools);"
@@ -404,21 +411,28 @@ def render_table(rows: Sequence[TaskCheck]) -> str:
 # --------------------------------------------------------------------------------------------
 
 
-def _add_root_args(p: argparse.ArgumentParser) -> None:
+def _add_root_args(p: argparse.ArgumentParser, *, suppress_default: bool = False) -> None:
+    default_val = argparse.SUPPRESS if suppress_default else None
     p.add_argument(
         "--tasks",
         type=Path,
-        default=None,
+        default=default_val,
         help="task corpus root (default: the suite's tasks_root, else $SKILLBENCH_TASKS_ROOT, "
         "else the bundled corpus)",
     )
-    C.add_suite_arg(p)
+    p.add_argument(
+        "--suite",
+        type=Path,
+        default=default_val,
+        help="path to suite.toml (overrides $SKILLBENCH_SUITE for this run)",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="skillbench-tasks", description=__doc__, formatter_class=C.HelpFormatter
     )
+    _add_root_args(p, suppress_default=False)
     sub = p.add_subparsers(dest="cmd", required=True)
     new = sub.add_parser(
         "new", help="scaffold a task directory", formatter_class=C.HelpFormatter
@@ -430,11 +444,11 @@ def _build_parser() -> argparse.ArgumentParser:
     new.add_argument("--prompt", default=None, help="task prompt (default: a placeholder)")
     new.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="rollout timeout, s")
     new.add_argument("--force", action="store_true", help="overwrite an existing scaffold")
-    _add_root_args(new)
+    _add_root_args(new, suppress_default=True)
     chk = sub.add_parser(
         "check", help="validate every task under the root", formatter_class=C.HelpFormatter
     )
-    _add_root_args(chk)
+    _add_root_args(chk, suppress_default=True)
     return p
 
 

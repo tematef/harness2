@@ -91,9 +91,6 @@ from . import _common as C
 from .run_sweep import RUN_JSON
 from .skillbench_html import render_html
 from .skillbench_summary import (
-    HISTORY_FILENAME as HISTORY_FILENAME,
-)
-from .skillbench_summary import (
     REC_CONSIDER_REMOVING as REC_CONSIDER_REMOVING,
 )
 from .skillbench_summary import (
@@ -106,9 +103,6 @@ from .skillbench_summary import (
     REC_NEEDS_HARDER_TASKS as REC_NEEDS_HARDER_TASKS,
 )
 from .skillbench_summary import (
-    RECOMMENDATION_LABELS as RECOMMENDATION_LABELS,
-)
-from .skillbench_summary import (
     RECOMMENDATION_RULE_NOTE,
     append_history,
     build_summary,
@@ -118,24 +112,6 @@ from .skillbench_summary import (
     render_history_markdown,
     render_summary_markdown,
     write_summary,
-)
-from .skillbench_summary import (
-    SparklineSeries as SparklineSeries,
-)
-from .skillbench_summary import (
-    history_records_from_report as history_records_from_report,
-)
-from .skillbench_summary import (
-    render_sparkline_svg as render_sparkline_svg,
-)
-from .skillbench_summary import (
-    render_summary_html as render_summary_html,
-)
-from .skillbench_summary import (
-    render_summary_section_html as render_summary_section_html,
-)
-from .skillbench_summary import (
-    sparkline_series as sparkline_series,
 )
 
 SCHEMA_VERSION = 2

@@ -32,7 +32,6 @@ import argparse
 import datetime as dt
 import difflib
 import html
-import inspect
 import json
 import os
 import re
@@ -815,11 +814,14 @@ def _format_rep_evidence(
         ),
     ]
     if verify:
+        v_rc = verify.get("exit_code") if "exit_code" in verify else verify.get("returncode")
         parts.append(
             f"- deterministic verify: passed={verify.get('passed')} "
-            f"(rc={verify.get('returncode')}, command={verify.get('command')!r})"
+            f"(rc={v_rc}, command={verify.get('command')!r})"
         )
-        v_err = str(verify.get("stderr") or verify.get("stdout") or "").strip()
+        v_err = str(
+            verify.get("output_tail") or verify.get("stderr") or verify.get("stdout") or ""
+        ).strip()
         if v_err and not verify.get("passed"):
             parts.append(f"  verify output: `{v_err[:400]}`")
 
@@ -1193,16 +1195,11 @@ def propose_skill(
     max_attempts: int = 2,
     suite: SuiteConfig | None = None,
     max_growth: float | None = None,
-    max_growth_pct: float | None = None,
 ) -> dict[str, Any]:
     """Propose and validate a candidate `SKILL.md` (with up to `max_attempts` retries). The
     prompt names `suite` and its `banned_tools` (the active suite when None)."""
     suite = suite if suite is not None else active_suite()
-    eff_growth = (
-        max_growth
-        if max_growth is not None
-        else (max_growth_pct if max_growth_pct is not None else DEFAULT_MAX_GROWTH_PCT)
-    )
+    eff_growth = max_growth if max_growth is not None else DEFAULT_MAX_GROWTH_PCT
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         prompt = build_improver_prompt(
@@ -1884,10 +1881,7 @@ def render_improve_markdown(record: Mapping[str, Any]) -> str:
                 "```",
             ]
         )
-    out = "\n".join(lines)
-    if len(out) > MAX_EVIDENCE_CHARS:
-        out = out[:MAX_EVIDENCE_CHARS] + "\n\n...[evidence packet truncated to fit CLI limit]...\n"
-    return out + "\n"
+    return "\n".join(lines) + "\n"
 
 
 def render_improve_html(record: Mapping[str, Any]) -> str:
@@ -2275,34 +2269,20 @@ def _call_probe_candidate(
     baseline_executor: str | None,
     allow_model_mismatch: bool,
 ) -> dict[str, Any]:
-    """Invoke `probe_candidate` inside `executor_env(executor, judge)`, passing `executor` /
-    `judge` kwargs when supported by `probe_candidate`'s signature (so custom test mocks with
-    the legacy 6-kwarg signature keep working)."""
-    kwargs: dict[str, Any] = {
-        "skill": skill,
-        "candidate_skill_path": candidate_skill_path,
-        "tasks": tasks,
-        "out_results_dir": out_results_dir,
-        "k": k,
-        "root": root,
-    }
-    try:
-        sig = inspect.signature(probe_candidate)
-        params = sig.parameters
-        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        if has_varkw or "executor" in params:
-            kwargs["executor"] = executor
-        if has_varkw or "judge" in params:
-            kwargs["judge"] = judge
-        if has_varkw or "baseline_executor" in params:
-            kwargs["baseline_executor"] = baseline_executor
-        if has_varkw or "allow_model_mismatch" in params:
-            kwargs["allow_model_mismatch"] = allow_model_mismatch
-    except (TypeError, ValueError):
-        pass
-
+    """Invoke `probe_candidate` inside `executor_env(executor, judge)` and verify model guard."""
     with executor_env(executor, judge, matrix=False):
-        raw = probe_candidate(**kwargs)
+        raw = probe_candidate(
+            skill=skill,
+            candidate_skill_path=candidate_skill_path,
+            tasks=tasks,
+            out_results_dir=out_results_dir,
+            k=k,
+            root=root,
+            executor=executor,
+            judge=judge,
+            baseline_executor=baseline_executor,
+            allow_model_mismatch=allow_model_mismatch,
+        )
     summary = dict(raw) if isinstance(raw, Mapping) else {}
     rec_cand_exec = _str_or_none(summary.get("recorded_executor")) or _str_or_none(
         summary.get("executor")
@@ -2539,9 +2519,50 @@ def apply_candidate_patch(
             "commit": None,
         }
 
-    for argv in (checkout_argv, apply_argv, add_argv):
+    orig_ref_proc = subprocess.run(
+        ["git", "-C", str(repo_root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if orig_ref_proc.returncode != 0 or not orig_ref_proc.stdout.strip():
+        orig_ref_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    orig_ref = orig_ref_proc.stdout.strip()
+
+    def _rollback_branch() -> None:
+        subprocess.run(
+            ["git", "-C", str(repo_root), "reset", "--hard"],
+            capture_output=True,
+            check=False,
+        )
+        if orig_ref:
+            subprocess.run(
+                ["git", "-C", str(repo_root), "checkout", orig_ref],
+                capture_output=True,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "-D", branch],
+                capture_output=True,
+                check=False,
+            )
+
+    co_proc = subprocess.run(checkout_argv, capture_output=True, text=True, check=False)
+    if co_proc.returncode != 0:
+        raise RuntimeError(
+            f"git command failed ({shlex.join(checkout_argv)}): "
+            f"{co_proc.stderr.strip() or co_proc.stdout.strip()}"
+        )
+
+    for argv in (apply_argv, add_argv):
         proc = subprocess.run(argv, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
+            _rollback_branch()
             raise RuntimeError(
                 f"git command failed ({shlex.join(argv)}): {proc.stderr.strip() or proc.stdout.strip()}"
             )
@@ -2567,6 +2588,7 @@ def apply_candidate_patch(
     exec_commit_argv.extend(["commit", "--no-gpg-sign", "-m", commit_msg])
     c_proc = subprocess.run(exec_commit_argv, capture_output=True, text=True, check=False)
     if c_proc.returncode != 0:
+        _rollback_branch()
         raise RuntimeError(
             f"git commit failed in {repo_root}: {c_proc.stderr.strip() or c_proc.stdout.strip()}"
         )

@@ -77,6 +77,9 @@ class _SuiteCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
+        prev_note = SU._env_note_shown
+        SU._env_note_shown = False
+        self.addCleanup(setattr, SU, "_env_note_shown", prev_note)
         for k in ("SKILLBENCH_SUITE", "SKILLBENCH_PLUGINS_DIR", "SKILLBENCH_PLUGINS"):
             os.environ.pop(k, None)
 

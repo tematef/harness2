@@ -20,6 +20,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import tomllib
 import unittest
@@ -598,6 +599,154 @@ class TestMatrixGatesAndExecution(_MatrixCase):
         self.assertEqual(rc3, 0)
         self.assertEqual(spy_sweep3.call_count, 0)
         self.assertEqual(spy_judge3.call_count, 0)
+
+    def test_artifact_based_resume_and_partial_judging_or_sweep_reruns_incomplete_reps(
+        self,
+    ) -> None:
+        # 1) Direct unit test of _completed_reps_in_dir with base_judged.json + summary.json
+        #    where base1 is graded (score != None) and base2 has score=None despite entry["ok"]=True
+        cell_dir = self.runs_root / "results" / "opus-5.5-high" / "with"
+        _write(
+            cell_dir / "plan-skill__t1" / "summary.json",
+            json.dumps(
+                {
+                    "task_id": "plan-skill/t1",
+                    "status": "bases-only",
+                    "base": [
+                        {"label": "base1", "ok": True},
+                        {"label": "base2", "ok": True},
+                    ],
+                }
+            )
+            + "\n",
+        )
+        _write(
+            cell_dir / "base_judged.json",
+            json.dumps(
+                [
+                    {
+                        "task": "plan-skill/t1",
+                        "label": "base1",
+                        "score": {"n_passed": 3, "n_criteria": 4},
+                    },
+                    {
+                        "task": "plan-skill/t1",
+                        "label": "base2",
+                        "score": None,
+                    },
+                ]
+            )
+            + "\n",
+        )
+        done_partial = SM._completed_reps_in_dir(cell_dir, k=2)
+        self.assertEqual(done_partial, {("plan-skill/t1", 1)})
+
+        # 2) End-to-end partial judging (judge_rc == 2 on first run -> status "partial", rc == 2),
+        #    then resume re-runs the incomplete cell and finishes (rc == 0, status "ok")
+        shutil.rmtree(self.runs_root, ignore_errors=True)
+        judge_attempts = 0
+
+        def fake_sweep_partial(argv: list[str] | None = None) -> int:
+            p = sweep_cli._build_parser().parse_args(argv)
+            ex = os.environ.get("SKILLBENCH_EXEC_MODEL", "opus-5.5-high")
+            _, adapt_ns = SM._cell_dirs(self.runs_root, ex, str(p.arm), int(p.k), p.seed)
+            for tid in ("plan-skill/t1", "plan-skill/t2"):
+                slug = tid.replace("/", "__")
+                _write(
+                    adapt_ns / slug / "summary.json",
+                    json.dumps(
+                        {
+                            "task_id": tid,
+                            "status": "bases-only",
+                            "base": [
+                                {"label": "base1", "ok": True},
+                                {"label": "base2", "ok": True},
+                            ],
+                        }
+                    )
+                    + "\n",
+                )
+            return 0
+
+        def fake_judge_partial(argv: list[str] | None = None) -> int:
+            nonlocal judge_attempts
+            judge_attempts += 1
+            p, _ = sweep_cli._build_parser().parse_known_args(argv)
+            ex = os.environ.get("SKILLBENCH_EXEC_MODEL", "opus-5.5-high")
+            _, adapt_ns = SM._cell_dirs(self.runs_root, ex, str(p.arm), int(p.k), p.seed)
+            # First call on "with" arm leaves plan-skill/t2 base2 ungraded (score=None) and returns 2
+            partial = str(p.arm) == "with" and judge_attempts == 1
+            rows = []
+            for tid in ("plan-skill/t1", "plan-skill/t2"):
+                for lbl in ("base1", "base2"):
+                    ungraded = partial and tid == "plan-skill/t2" and lbl == "base2"
+                    rows.append(
+                        {
+                            "task": tid,
+                            "label": lbl,
+                            "score": None if ungraded else {"n_passed": 4, "n_criteria": 4},
+                        }
+                    )
+            _write(adapt_ns / "base_judged.json", json.dumps(rows) + "\n")
+            return 2 if partial else 0
+
+        argv_partial = [
+            "--suite",
+            str(self.suite_toml),
+            "--executors",
+            "opus-5.5-high",
+            "--arms",
+            "skill",
+            "--only-domains",
+            "plan-skill",
+            "--k",
+            "2",
+            "--yes",
+        ]
+        with (
+            mock.patch.object(SM.run_sweep, "main", side_effect=fake_sweep_partial) as spy_sw1,
+            mock.patch.object(SM.judge, "main", side_effect=fake_judge_partial) as spy_jg1,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc_p1 = SM.main(argv_partial)
+        self.assertEqual(rc_p1, 2)
+        self.assertEqual(spy_sw1.call_count, 2)
+        self.assertEqual(spy_jg1.call_count, 2)
+        mp1 = json.loads((self.runs_root / "matrix.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            mp1["cell_status"],
+            {"opus-5.5-high/with": "partial", "opus-5.5-high/without": "ok"},
+        )
+
+        # Resume: "without" is skipped (0 pending), "with" has 1 pending rep (plan-skill/t2 base2)
+        jobs_res = SM.expand_jobs(
+            self.suite_toml,
+            executors=["opus-5.5-high"],
+            arms="skill",
+            only_domains="plan-skill",
+            k=2,
+            runs_root=self.runs_root,
+        )
+        pending_with = [j for j in jobs_res if j.arm == "with" and not j.done]
+        pending_without = [j for j in jobs_res if j.arm == "without" and not j.done]
+        self.assertEqual(len(pending_with), 1)
+        self.assertEqual((pending_with[0].task_id, pending_with[0].rep), ("plan-skill/t2", 2))
+        self.assertEqual(len(pending_without), 0)
+
+        with (
+            mock.patch.object(SM.run_sweep, "main", side_effect=fake_sweep_partial) as spy_sw2,
+            mock.patch.object(SM.judge, "main", side_effect=fake_judge_partial) as spy_jg2,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc_p2 = SM.main(argv_partial)
+        self.assertEqual(rc_p2, 0)
+        self.assertEqual(spy_sw2.call_count, 1)
+        self.assertEqual(spy_jg2.call_count, 1)
+        mp2 = json.loads((self.runs_root / "matrix.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            mp2["cell_status"],
+            {"opus-5.5-high/with": "ok", "opus-5.5-high/without": "skipped"},
+        )
 
     def test_identity_mismatch_on_changed_suite_hash_refuses_resume(self) -> None:
         # 1) Test via skillbench-matrix with mocked runner

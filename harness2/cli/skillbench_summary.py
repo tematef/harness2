@@ -129,54 +129,20 @@ def _extract_ceiling(row: Mapping[str, Any]) -> tuple[bool, int | None, int | No
 
 
 def _extract_tokens_delta_pct(row: Mapping[str, Any]) -> float | None:
-    direct = _opt_float(row.get("tokens_delta_pct", row.get("tokens_delta")))
+    direct = _opt_float(row.get("tokens_delta_pct"))
     if direct is not None:
         return direct
-    saving = _opt_float(row.get("tokens_saving_pct"))
-    if saving is not None:
-        return -saving
-    tok_w = _opt_float(
-        row.get(
-            "tokens_with_median",
-            row.get("tokens_suite_median", row.get("tokens_p50_with")),
-        )
-    )
-    tok_wo = _opt_float(
-        row.get(
-            "tokens_without_median",
-            row.get("tokens_baseline_median", row.get("tokens_p50_without")),
-        )
-    )
+    tok_w = _opt_float(row.get("tokens_with_median", row.get("tokens_suite_median")))
+    tok_wo = _opt_float(row.get("tokens_without_median", row.get("tokens_baseline_median")))
     return _delta_pct(tok_w, tok_wo)
 
 
 def _extract_wall_delta_pct(row: Mapping[str, Any]) -> float | None:
-    direct = _opt_float(
-        row.get("wall_delta_pct", row.get("time_delta_pct", row.get("wall_delta")))
-    )
+    direct = _opt_float(row.get("wall_delta_pct", row.get("time_delta_pct")))
     if direct is not None:
         return direct
-    saving = _opt_float(row.get("time_saving_pct", row.get("wall_saving_pct")))
-    if saving is not None:
-        return -saving
-    wall_w = _opt_float(
-        row.get(
-            "t_total_with_median",
-            row.get(
-                "t_total_suite_median",
-                row.get("wall_with_median", row.get("wall_p50_with")),
-            ),
-        )
-    )
-    wall_wo = _opt_float(
-        row.get(
-            "t_total_without_median",
-            row.get(
-                "t_total_baseline_median",
-                row.get("wall_without_median", row.get("wall_p50_without")),
-            ),
-        )
-    )
+    wall_w = _opt_float(row.get("t_total_with_median", row.get("t_total_suite_median")))
+    wall_wo = _opt_float(row.get("t_total_without_median", row.get("t_total_baseline_median")))
     return _delta_pct(wall_w, wall_wo)
 
 
@@ -187,9 +153,6 @@ def _has_verify_gain(row: Mapping[str, Any]) -> bool:
             return vg
         if isinstance(vg, (int, float)):
             return float(vg) > 1e-9
-    vd = _opt_float(row.get("verify_delta"))
-    if vd is not None:
-        return vd > 1e-9
 
     vw = _opt_float(row.get("verify_with_rate", row.get("verify_suite_rate")))
     vu = _opt_float(row.get("verify_without_rate", row.get("verify_baseline_rate")))
@@ -209,12 +172,7 @@ def _has_verify_gain(row: Mapping[str, Any]) -> bool:
 
 
 def _extract_invocation_rate(row: Mapping[str, Any]) -> float | None:
-    raw = _opt_float(
-        row.get(
-            "invocation_rate",
-            row.get("invocation", row.get("inv_rate", row.get("invocation_pct"))),
-        )
-    )
+    raw = _opt_float(row.get("invocation_rate"))
     if raw is not None:
         return raw / 100.0 if raw > 1.0 else raw
     invoked = _opt_int(row.get("invoked"))
@@ -225,19 +183,13 @@ def _extract_invocation_rate(row: Mapping[str, Any]) -> float | None:
 
 
 def _has_accepted_candidate(row: Mapping[str, Any]) -> bool:
-    for key in (
-        "accepted_candidate",
-        "improver_accepted",
-        "has_accepted_candidate",
-        "candidate_accepted",
-    ):
-        val = row.get(key)
-        if isinstance(val, bool) and val:
-            return True
-        if isinstance(val, str) and val.strip().lower() in ("true", "1", "yes", "accepted"):
-            return True
-        if isinstance(val, Mapping) and val.get("accepted") is True:
-            return True
+    val = row.get("accepted_candidate")
+    if isinstance(val, bool) and val:
+        return True
+    if isinstance(val, str) and val.strip().lower() in ("true", "1", "yes", "accepted"):
+        return True
+    if isinstance(val, Mapping) and val.get("accepted") is True:
+        return True
     return False
 
 

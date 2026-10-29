@@ -142,7 +142,7 @@ selection without model calls.
 | JobBench | Professional work | `harness2-setup jb` | [JobBench](docs/BENCHMARKS.md#jobbench) |
 | LAB | Legal work | `harness2-setup lab` | [LAB](docs/BENCHMARKS.md#lab) |
 | WorkBuddy-Bench | Office, web, and code | `harness2-setup wb` | [WorkBuddy](docs/BENCHMARKS.md#workbuddy-bench) |
-| skillbench | Leave-one-out skill lift (`cc-thingz` on AGY) | `harness2-check --bench skillbench` | [skillbench](docs/BENCHMARKS.md#skillbench) |
+| skillbench | Generic skill and plugin-suite lift on AGY (e.g. `cc-thingz`) | `harness2-check --bench skillbench` | [skillbench](docs/BENCHMARKS.md#skillbench) |
 
 Choose one benchmark per command. WorkBuddy also takes `--subset office`,
 `--subset web`, or `--subset code` on every command after setup. The
@@ -194,11 +194,11 @@ at `harness2/benchmarks/skillbench/suites/cc-thingz.toml`).
 
 | Command | Purpose |
 |---|---|
-| `skillbench-tasks` | Scaffold (`new --skill <s\|--kind suite --family <f>> --id <id>`) and validate (`check`) task corpora against `suite.toml` |
-| `skillbench-matrix` | Expand `(executor, arm, task, rep)` jobs, print the rollout/time/token budget table, enforce `--max-rollouts` / `--yes`, and run sweep + judge in-process with resume |
-| `skillbench-report` | Build schema-v2 `report.json`, `report.md`, `report.html`, and `summary.md` (`--results-root`, `--hardness-only`, `--summary-only`, and `history append\|show`) |
-| `skillbench-improve` | Targeted **Propose → Probe → Verify/Judge** loop for weak skills with same-model enforcement, multi-model gating (`--models`), multi-round refinement (`--rounds`), size cap (`--max-growth`), and branch commit (`--apply`) |
-| `skillbench-cycle` | End-to-end orchestrator (`matrix → report → history append → improve`) with `--from`, `--skip`, and `cycle.log` accounting |
+| `skillbench-tasks` | Scaffold (`new --skill <s\|--kind suite --family <f>> --id <id> [--prompt ... --timeout ... --force --tasks ... --suite ...]`) and validate (`check [--tasks ... --suite ...]`) task corpora against `suite.toml` |
+| `skillbench-matrix` | Expand `(executor, arm, task, rep)` jobs (`--suite`, `--suites`, `--executors`, `--k`, `--arms`, `--parallel`, `--seed`, `--split`, `--split-file`, `--only-domains`, `--max-tasks`, `--pilot`, `--runs-root`, `--history`, `--dry-run`), print the rollout/time/token budget table, enforce `--max-rollouts` / `--yes`, and run sweep + judge in-process with resume |
+| `skillbench-report` | Build schema-v2 `report.json`, `report.md`, `report.html`, and `summary.md` (`--suite`, `--suites`, `--results-root`, `--runs-root`, `--with-dir`, `--without-dir`, `--out-dir`, `--k`, `--seed`, `--bootstrap-seed`, `--draws`, `--pilot`, `--history`, `--hardness-only`, `--summary-only`, and `history append\|show` with `--report`, `--date`, `--skill`, `--executor`, `--json`) |
+| `skillbench-improve` | Targeted **Propose → Probe → Verify/Judge** loop for weak skills (`--suite`, `--runs-dir`, `--skill`, `--auto`, `--all-weak`, `--k`, `--pilot`, `--include-verdicts`, `--improver-model`, `--dry-run`) with same-model enforcement (`--allow-model-mismatch`), multi-model gating (`--models`), multi-round refinement (`--rounds`), size cap (`--max-growth`), and branch commit (`--apply`) |
+| `skillbench-cycle` | End-to-end orchestrator (`matrix → report → history append → improve`) with `--from` / `--from-stage`, `--skip`, `--improve`, `--runs-root` / `--runs-dir`, `--cycle-log`, and `cycle.log` accounting |
 
 ### Benchmark any skill set
 

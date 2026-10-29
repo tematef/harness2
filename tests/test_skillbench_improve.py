@@ -39,6 +39,7 @@ from harness2.benchmarks.skillbench import (
 )
 from harness2.cli.skillbench_improve import (
     _build_parser,
+    apply_candidate_patch,
     build_evidence_packet,
     evaluate_acceptance,
     improve_skill,
@@ -1466,6 +1467,109 @@ class TestSkillbenchImprove(unittest.TestCase):
                 )
             self.assertEqual(rc_dirty, 1)
             self.assertIn("uncommitted changes", err_buf2.getvalue())
+
+        # 3. Failed git apply rolls back branch and restores clean worktree on original branch
+        clean_repo = self.tmp / "rollback_repo"
+        clean_plugins_dir = self._init_git_plugins_repo(clean_repo)
+        orig_branch = subprocess.run(
+            ["git", "-C", str(clean_repo), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        bad_patch = self.tmp / "corrupt.patch"
+        bad_patch.write_text(
+            "--- a/skills/make-plan/SKILL.md\n"
+            "+++ b/skills/make-plan/SKILL.md\n"
+            "@@ -999,3 +999,3 @@\n"
+            "-nonexistent line\n"
+            "+replacement line\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            "os.environ",
+            self._base_env(SKILLBENCH_PLUGINS_DIR=str(clean_plugins_dir)),
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "git command failed"):
+                apply_candidate_patch(
+                    skill="make-plan",
+                    patch_path=bad_patch,
+                    skill_record={"accepted": True, "models": ["opus-5.5-high"]},
+                    plugins_dir=clean_plugins_dir,
+                    date="2026-10-29",
+                    dry_run=False,
+                )
+        cur_branch = subprocess.run(
+            ["git", "-C", str(clean_repo), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(cur_branch, orig_branch)
+        status_after = subprocess.run(
+            ["git", "-C", str(clean_repo), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(status_after, "")
+
+    def test_verify_exit_code_and_output_tail_in_evidence_and_no_report_truncation(self) -> None:
+        runs_dir = self.tmp / "runs_verify_ev"
+        safe = safe_tid(self.task.task_id)
+        for arm in ("without", "with"):
+            rdir = runs_dir / "results" / arm / f"{safe}__b1"
+            _seed_rollout(rdir, arm=arm, n_passed=2)
+            (rdir / "verify.json").write_text(
+                json.dumps(
+                    {
+                        "command": "python -m unittest",
+                        "exit_code": 1,
+                        "passed": False,
+                        "output_tail": "AssertionError: expected 42 got 0",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        with mock.patch.dict("os.environ", self._base_env(), clear=False):
+            ev_md = build_evidence_packet(
+                skill="make-plan",
+                current_skill_md=ORIGINAL_SKILL,
+                tasks=[self.task],
+                runs_dir=runs_dir,
+                k=1,
+            )
+        self.assertIn("rc=1", ev_md)
+        self.assertIn("AssertionError: expected 42 got 0", ev_md)
+
+        # Multi-skill improve_report.md exceeding MAX_EVIDENCE_CHARS is NOT truncated
+        big_diff = "+" + ("x" * 90) + "\n"
+        many_skills = {
+            f"skill-{idx}": {
+                "accepted": True,
+                "decision_line": "ACCEPTED (opus-5.5-high: +0.25 lift)",
+                "decision_reason": "improved",
+                "diagnosis": "diag " * 200,
+                "changes_summary": "summary",
+                "diff": big_diff * 300,
+                "without": _make_cand_summary(mean=0.5),
+                "current_with": _make_cand_summary(mean=0.75),
+                "candidate": _make_cand_summary(mean=1.0),
+            }
+            for idx in range(4)
+        }
+        big_md = render_improve_markdown(
+            {
+                "improver_model": "opus-5.5-high",
+                "executor_model": "opus-5.5-high",
+                "judge_model": "fable-5.1-high",
+                "skills": many_skills,
+            }
+        )
+        self.assertGreater(len(big_md), 70_000)
+        self.assertNotIn("truncated to fit CLI limit", big_md)
+        self.assertEqual(big_md.count("```diff"), 4)
 
 
 if __name__ == "__main__":

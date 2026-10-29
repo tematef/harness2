@@ -348,6 +348,48 @@ class ScaffoldTest(TmpCase):
         self.assertEqual(T.script_stems(""), [])
         self.assertEqual(T.script_stems("run tests.py and do_it.sh"), ["do_it"])
 
+    def test_render_task_toml_escapes_backslashes_and_triple_quotes(self):
+        tricky_prompt = r'Fix regex \s+\d+ in C:\repo\app.py and handle """triple""" quotes "'
+        rc, _, err = self.run_main(
+            "--suite",
+            str(self.suite_file),
+            "new",
+            "--skill",
+            "tidier",
+            "--id",
+            "tricky-toml",
+            "--prompt",
+            tricky_prompt,
+        )
+        self.assertEqual(rc, 0, err)
+        t = SB.load_task(self.root / "tidier" / "tricky-toml")
+        self.assertEqual(t.prompt, tricky_prompt)
+
+    def test_suite_and_tasks_flags_accepted_before_or_after_subcommand(self):
+        self.assertEqual(
+            self.run_main(
+                "--suite",
+                str(self.suite_file),
+                "new",
+                "--skill",
+                "tidier",
+                "--id",
+                "t-pre",
+                "--prompt",
+                "Clean up helper module.",
+            )[0],
+            0,
+        )
+        _write(self.root / "tidier" / "t-pre" / "fixture" / "ok.py", "x = 1\n")
+        (self.root / "tidier" / "t-pre" / "rubric.json").write_text(
+            json.dumps([{"id": f"c{i}", "criterion": f"Check {i}"} for i in range(4)]),
+            encoding="utf-8",
+        )
+        rc_pre, out_pre, err_pre = self.run_main("--suite", str(self.suite_file), "check")
+        self.assertEqual(rc_pre, 0, err_pre + out_pre)
+        rc_post, out_post, err_post = self.run_main("check", "--suite", str(self.suite_file))
+        self.assertEqual(rc_post, 0, err_post + out_post)
+
 
 # --------------------------------------------------------------------------------------------
 # check

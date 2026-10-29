@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import inspect
 import json
 import re
 import sys
@@ -42,7 +41,6 @@ from . import _common as C
 from . import skillbench_improve, skillbench_matrix, skillbench_report, skillbench_summary
 
 STAGES: tuple[str, ...] = ("matrix", "report", "history", "improve")
-STAGE_ORDER: tuple[str, ...] = STAGES
 CYCLE_LOG_FILENAME = "cycle.log"
 
 _STAGE_ALIASES: dict[str, str] = {
@@ -253,38 +251,9 @@ def stage_improve(args: argparse.Namespace, runs_root: Path) -> int:
     return 0 if rc is None else int(rc)
 
 
-# Aliases for callers/tests using `run_<stage>` naming.
-run_matrix = stage_matrix
-run_report = stage_report
-run_history = stage_history
-run_improve = stage_improve
-
-
 # --------------------------------------------------------------------------------------------
 # Token accounting & cycle.log helpers
 # --------------------------------------------------------------------------------------------
-
-
-def _snapshot_timing_tokens(root: Path) -> dict[Path, tuple[int, int]]:
-    """Map resolved `skill_timing.json` path -> `(mtime_ns, valid_tokens)` under `root`."""
-    snap: dict[Path, tuple[int, int]] = {}
-    if not root.is_dir():
-        return snap
-    for tf in root.rglob(SKILL_TIMING_FILE):
-        try:
-            resolved = tf.resolve()
-            if resolved in snap:
-                continue
-            stat = tf.stat()
-            data = json.loads(tf.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(data, Mapping) or data.get("valid") is False:
-            continue
-        tok = data.get("total_tokens")
-        if isinstance(tok, int) and not isinstance(tok, bool) and tok >= 0:
-            snap[resolved] = (stat.st_mtime_ns, int(tok))
-    return snap
 
 
 def _sum_dir_tokens(root: Path) -> int:
@@ -310,69 +279,11 @@ def _sum_dir_tokens(root: Path) -> int:
     return total
 
 
-def _report_json_tokens(runs_root: Path) -> int:
-    """Fallback token total from `report.json` (`model_summary` or `models[].total_tokens`)."""
-    rjson = runs_root / "report.json"
-    if not rjson.is_file():
-        return 0
-    try:
-        rep = json.loads(rjson.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return 0
-    if not isinstance(rep, Mapping):
-        return 0
-    msum = rep.get("model_summary")
-    if isinstance(msum, list) and msum:
-        return sum(
-            int(m["total_tokens"])
-            for m in msum
-            if isinstance(m, Mapping)
-            and isinstance(m.get("total_tokens"), int)
-            and not isinstance(m.get("total_tokens"), bool)
-        )
-    models = rep.get("models")
-    if isinstance(models, list) and models:
-        return sum(
-            int(m["total_tokens"])
-            for m in models
-            if isinstance(m, Mapping)
-            and isinstance(m.get("total_tokens"), int)
-            and not isinstance(m.get("total_tokens"), bool)
-        )
-    return 0
-
-
-def _compute_stage_tokens(
-    stage: str,
-    runs_root: Path,
-    before_snap: Mapping[Path, tuple[int, int]],
-    after_snap: Mapping[Path, tuple[int, int]],
-    *,
-    explicit_tokens: int | None = None,
-) -> int:
-    if explicit_tokens is not None:
-        return max(0, int(explicit_tokens))
-
-    delta = 0
-    for path, (mtime_ns, tok) in after_snap.items():
-        prev = before_snap.get(path)
-        if prev is None or prev[0] != mtime_ns:
-            delta += tok
-    if delta > 0:
-        return delta
-
+def _compute_stage_tokens(stage: str, runs_root: Path) -> int:
     if stage == "matrix":
-        res_tok = _sum_dir_tokens(runs_root / "results")
-        if res_tok > 0:
-            return res_tok
-        adapt_tok = _sum_dir_tokens(runs_root / "adapt")
-        if adapt_tok > 0:
-            return adapt_tok
-        return _report_json_tokens(runs_root)
-
+        return _sum_dir_tokens(runs_root / "results") or _sum_dir_tokens(runs_root / "adapt")
     if stage == "improve":
         return _sum_dir_tokens(runs_root / "improve")
-
     return 0
 
 
@@ -477,44 +388,10 @@ def _invoke_stage_runner(
     runner: Callable[..., Any],
     args: argparse.Namespace,
     runs_root: Path,
-) -> tuple[int, int | None, str | None]:
-    """Call `runner` with `(args, runs_root)`, `(args,)`, or `()` depending on its signature.
-
-    Returns `(rc, explicit_tokens, error_message)`.
-    """
-    call_arity = 2
+) -> tuple[int, str | None]:
+    """Call `runner(args, runs_root)` and return `(rc, error_message)`."""
     try:
-        sig = inspect.signature(runner)
-        pos_params = [
-            p
-            for p in sig.parameters.values()
-            if p.kind
-            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        required_pos = [p for p in pos_params if p.default is inspect.Parameter.empty]
-        has_varargs = any(
-            p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
-        )
-        if has_varargs or len(required_pos) >= 2:
-            call_arity = 2
-        elif len(required_pos) == 1:
-            call_arity = 1
-        elif len(pos_params) >= 2 and pos_params[0].name in ("args", "ns", "namespace", "_args"):
-            call_arity = 2
-        elif len(pos_params) == 1 and pos_params[0].name in ("args", "ns", "namespace", "_args"):
-            call_arity = 1
-        else:
-            call_arity = 0
-    except (TypeError, ValueError):
-        call_arity = 2
-
-    try:
-        if call_arity == 2:
-            raw = runner(args, runs_root)
-        elif call_arity == 1:
-            raw = runner(args)
-        else:
-            raw = runner()
+        raw = runner(args, runs_root)
     except (
         config.ConfigError,
         SuiteError,
@@ -523,26 +400,8 @@ def _invoke_stage_runner(
         FileNotFoundError,
         OSError,
     ) as exc:
-        return (1, None, str(exc))
-
-    if raw is None:
-        return (0, None, None)
-    if isinstance(raw, bool):
-        return (0 if raw else 1, None, None)
-    if isinstance(raw, int):
-        return (int(raw), None, None)
-    if isinstance(raw, tuple) and len(raw) >= 2:
-        rc = 0 if raw[0] is None else int(raw[0])
-        tok = int(raw[1]) if raw[1] is not None else None
-        err = str(raw[2]) if len(raw) >= 3 and raw[2] else None
-        return (rc, tok, err)
-    if isinstance(raw, Mapping):
-        rc = int(raw.get("rc", 0) or 0)
-        tok_raw = raw.get("tokens", raw.get("total_tokens"))
-        tok = int(tok_raw) if isinstance(tok_raw, (int, float)) else None
-        err = str(raw["error"]) if raw.get("error") else None
-        return (rc, tok, err)
-    return (int(raw), None, None)
+        return (1, str(exc))
+    return (0 if raw is None else int(raw), None)
 
 
 def _render_or_read_summary(args: argparse.Namespace, runs_root: Path) -> str:
@@ -679,19 +538,11 @@ def run_cycle(
             )
             continue
 
-        before_snap = _snapshot_timing_tokens(runs_root)
         t0 = time.monotonic()
         runner = runners[stage]
-        rc, explicit_tok, err_msg = _invoke_stage_runner(runner, args, runs_root)
+        rc, err_msg = _invoke_stage_runner(runner, args, runs_root)
         wall_s = max(0.0, time.monotonic() - t0)
-        after_snap = _snapshot_timing_tokens(runs_root)
-        tokens = _compute_stage_tokens(
-            stage,
-            runs_root,
-            before_snap,
-            after_snap,
-            explicit_tokens=explicit_tok,
-        )
+        tokens = _compute_stage_tokens(stage, runs_root)
 
         status = "ok" if rc == 0 else "failed"
         rec: dict[str, Any] = {

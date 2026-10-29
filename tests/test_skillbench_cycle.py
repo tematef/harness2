@@ -213,7 +213,16 @@ class _CycleCase(unittest.TestCase):
             HARNESS2_RUNS_DIR=str(self.runs_dir),
             HARNESS2_AGY_BIN=str(STUB),
             SKILLBENCH_SUITE=str(self.suite_toml),
+            SKILLBENCH_EFFORT="high",
         )
+        for k in (
+            "SKILLBENCH_PLUGINS_DIR",
+            "SKILLBENCH_PLUGINS",
+            "SKILLBENCH_TASKS_ROOT",
+            "SKILLBENCH_EXEC_MODEL",
+            "SKILLBENCH_JUDGE_MODEL",
+        ):
+            os.environ.pop(k, None)
         p = mock.patch.object(config, "RUNS", self.runs_dir)
         p.start()
         self.addCleanup(p.stop)
@@ -315,7 +324,7 @@ class TestStageOrderingAndFlags(_CycleCase):
     def test_from_flag_skips_prior_stages_and_resumes_at_target_stage(self) -> None:
         calls: list[str] = []
         runners = {
-            name: (lambda n=name: (calls.append(n), 0)[1])
+            name: (lambda args, runs_root, n=name: (calls.append(n), 0)[1])
             for name in ("matrix", "report", "history", "improve")
         }
 
@@ -406,16 +415,16 @@ class TestFailureHandlingAndCycleLog(_CycleCase):
     def test_failing_stage_stops_cycle_and_reports(self) -> None:
         calls: list[str] = []
 
-        def ok_matrix():
+        def ok_matrix(args, runs_root):
             calls.append("matrix")
             return 0
 
-        def fail_report():
+        def fail_report(args, runs_root):
             calls.append("report")
             return 2
 
         def never_called(name: str):
-            def _fn():
+            def _fn(args, runs_root):
                 calls.append(name)
                 return 0
 
@@ -456,7 +465,7 @@ class TestFailureHandlingAndCycleLog(_CycleCase):
     def test_exception_in_stage_stops_cycle_and_logs_failure(self) -> None:
         calls: list[str] = []
 
-        def boom_matrix():
+        def boom_matrix(args, runs_root):
             calls.append("matrix")
             raise RuntimeError("quota exhausted during matrix")
 
@@ -467,9 +476,9 @@ class TestFailureHandlingAndCycleLog(_CycleCase):
                 ["--suite", str(self.suite_toml), "--runs-root", str(self.runs_root)],
                 stage_runners={
                     "matrix": boom_matrix,
-                    "report": lambda: (calls.append("report"), 0)[1],
-                    "history": lambda: (calls.append("history"), 0)[1],
-                    "improve": lambda: (calls.append("improve"), 0)[1],
+                    "report": lambda args, runs_root: (calls.append("report"), 0)[1],
+                    "history": lambda args, runs_root: (calls.append("history"), 0)[1],
+                    "improve": lambda args, runs_root: (calls.append("improve"), 0)[1],
                 },
             )
         self.assertEqual(rc, 1)
@@ -626,6 +635,77 @@ class TestFailureHandlingAndCycleLog(_CycleCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(SC.main(["--k", "0"]), 1)
         self.assertIn("--k and --parallel must be >= 1", err.getvalue())
+
+    def test_real_default_stage_runners_end_to_end_with_agy_stub(self) -> None:
+        # Execute all 4 real stage runners (_default_stage_runners: stage_matrix -> stage_report ->
+        # stage_history -> stage_improve) without overriding stage_runners or mocking .main
+        out = io.StringIO()
+        fake_improver_resp = {
+            "diagnosis": "Clarify headless steps.",
+            "changes_summary": "AddWhen no one can answer section and concise steps.",
+            "skill_markdown": (
+                "---\n"
+                "name: plan-skill\n"
+                "description: Skill plan-skill\n"
+                "---\n"
+                "# plan-skill\n\n"
+                "## When no one can answer\n"
+                "Proceed immediately with recommended option.\n\n"
+                "## Steps\n"
+                "1. Follow plan-skill directly.\n"
+            ),
+            "model": "opus-5.5-high",
+            "actual_model": "opus-5.5-high",
+            "wall_s": 1.0,
+            "total_tokens": 500,
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "AGY_STUB_SCENARIO": "skill_read",
+                    "AGY_STUB_WITHOUT_SCENARIO": "plain_answer",
+                },
+            ),
+            mock.patch.object(
+                SC.skillbench_improve,
+                "run_improver_once",
+                return_value=fake_improver_resp,
+            ),
+            contextlib.redirect_stdout(out),
+        ):
+            rc = SC.main(
+                [
+                    "--suite",
+                    str(self.suite_toml),
+                    "--runs-root",
+                    str(self.runs_root),
+                    "--arms",
+                    "skill",
+                    "--k",
+                    "2",
+                    "--pilot",
+                    "--improve",
+                    "--skill",
+                    "plan-skill",
+                    "--max-growth",
+                    "300",
+                    "--yes",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.runs_root / "matrix.json").is_file())
+        self.assertTrue((self.runs_root / "report.json").is_file())
+        self.assertTrue((self.runs_root / "report.html").is_file())
+        self.assertTrue((self.runs_root / "summary.md").is_file())
+        self.assertTrue((self.tmp / "history.jsonl").is_file())
+        self.assertTrue((self.runs_root / "improve" / "improve_report.json").is_file())
+        self.assertTrue((self.runs_root / "improve" / "improve_report.html").is_file())
+        parsed = SC.parse_cycle_log(self.runs_root / "cycle.log")
+        for st_name in ("matrix", "report", "history", "improve"):
+            self.assertEqual(parsed["by_stage"][st_name]["status"], "ok")
+        self.assertGreater(parsed["by_stage"]["matrix"]["tokens"], 0)
+        self.assertGreater(parsed["by_stage"]["improve"]["tokens"], 0)
 
 
 if __name__ == "__main__":

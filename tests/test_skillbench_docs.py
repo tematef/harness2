@@ -16,13 +16,22 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
+import shlex
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from harness2 import config
+from harness2.cli import (
+    skillbench_cycle,
+    skillbench_improve,
+    skillbench_matrix,
+    skillbench_report,
+    skillbench_tasks,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCHMARKS_MD = ROOT / "docs" / "BENCHMARKS.md"
@@ -247,6 +256,63 @@ class TestSkillbenchDocumentation(unittest.TestCase):
                 self.assertIn("opus-5.5-high", text)
                 self.assertIn("fable-5.1-high", text)
                 self.assertIn(JETSKI_CLI, text)
+
+    def test_all_cli_flags_documented_and_code_block_invocations_parse_cleanly(self) -> None:
+        def _flags_of(parser: argparse.ArgumentParser) -> set[str]:
+            out: set[str] = set()
+            for action in parser._actions:
+                for opt in action.option_strings:
+                    if opt.startswith("--") and opt != "--help":
+                        out.add(opt)
+                if isinstance(action, argparse._SubParsersAction):
+                    for sp in action.choices.values():
+                        out |= _flags_of(sp)
+            return out
+
+        cli_parsers = {
+            "skillbench-tasks": skillbench_tasks._build_parser(),
+            "skillbench-matrix": skillbench_matrix._build_parser(),
+            "skillbench-report": skillbench_report._build_parser(),
+            "skillbench-improve": skillbench_improve._build_parser(),
+            "skillbench-cycle": skillbench_cycle._build_parser(),
+        }
+        history_parser = skillbench_report._build_history_parser()
+
+        all_flags: set[str] = set()
+        for p in cli_parsers.values():
+            all_flags |= _flags_of(p)
+        all_flags |= _flags_of(history_parser)
+
+        bench_text = BENCHMARKS_MD.read_text(encoding="utf-8")
+        readme_text = README_MD.read_text(encoding="utf-8")
+        for flag in sorted(all_flags):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, bench_text, f"{flag} missing from docs/BENCHMARKS.md")
+                self.assertIn(flag, readme_text, f"{flag} missing from README.md")
+
+        # Parse every skillbench-* invocation inside fenced bash code blocks in docs
+        code_block_re = re.compile(r"```bash\n(.*?)```", re.DOTALL)
+        for doc in (BENCHMARKS_MD, SETUP_MD, README_MD):
+            doc_text = doc.read_text(encoding="utf-8")
+            for block_match in code_block_re.finditer(doc_text):
+                block = re.sub(r"\\\n\s*", " ", block_match.group(1))
+                for raw_line in block.splitlines():
+                    line = raw_line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    tokens = shlex.split(line)
+                    while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+                        tokens.pop(0)
+                    if not tokens or tokens[0] not in cli_parsers:
+                        continue
+                    prog = tokens[0]
+                    argv = tokens[1:]
+                    with self.subTest(doc=doc.name, cmd=line):
+                        if prog == "skillbench-report" and argv and argv[0] == "history":
+                            ns = history_parser.parse_args(argv[1:])
+                        else:
+                            ns = cli_parsers[prog].parse_args(argv)
+                        self.assertIsNotNone(ns)
 
 
 if __name__ == "__main__":
