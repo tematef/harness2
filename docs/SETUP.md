@@ -142,25 +142,33 @@ Codex runs with its sandbox disabled. Review the
 
 ## AGY executor
 
-The AGY substrate (`--substrate agy`) drives headless AGY / Jetski (`agy -p <prompt> --output-format stream-json --dangerously-skip-permissions --disable-slash-commands`) and is the default executor for [`skillbench`](BENCHMARKS.md#skillbench). It does not require `HARNESS2_SOLVER_MODEL` or `HARNESS2_JUDGE_MODEL`; instead, configure the AGY binary, plugin checkout and models (credentials and effort are optional) in `.env` or the shell:
+The AGY substrate (`--substrate agy`) drives headless AGY / Jetski (`agy -p <prompt> --output-format stream-json --dangerously-skip-permissions --disable-slash-commands`) and is the default executor for [`skillbench`](BENCHMARKS.md#skillbench). It does not require `HARNESS2_SOLVER_MODEL` or `HARNESS2_JUDGE_MODEL`; instead, configure the AGY binary, a `suite.toml` file (via `--suite` or `SKILLBENCH_SUITE`, or the deprecated `SKILLBENCH_PLUGINS_DIR` fallback), and models (credentials and effort are optional) in `.env` or the shell:
 
 | Setting | Meaning |
 |---|---|
 | `HARNESS2_AGY_BIN` | Executable name or path for AGY (default `agy`); for Google-internal Jetski use `/google/bin/releases/jetski-devs/tools/cli` (a shell alias or function such as `jet` cannot be used) |
-| `SKILLBENCH_PLUGINS_DIR` | Path to a `cc-thingz` `plugins/` checkout (**required**) |
-| `SKILLBENCH_PLUGINS` | Comma-separated plugin allowlist (default `brainstorm,planning,review,skill-eval,thinking-tools,workflow`) |
+| `SKILLBENCH_SUITE` | Path to a `suite.toml` config describing the plugin suite under test (`name`, `plugins_dir`, `plugins`, `tasks_root`, `banned_tools`, `[families]`, `[matrix]`); alternative to `--suite` (example: `harness2/benchmarks/skillbench/suites/cc-thingz.toml`) |
+| `SKILLBENCH_TASKS_ROOT` | Task corpus root when `suite.toml` sets no `tasks_root` and `--tasks` is not passed (optional, defaults to the bundled corpus under `harness2/benchmarks/skillbench/tasks`) |
+| `SKILLBENCH_PLUGINS_DIR` | Deprecated fallback when no `suite.toml` is configured: path to a plugin suite's `plugins/` checkout |
+| `SKILLBENCH_PLUGINS` | Deprecated fallback: comma-separated plugin allowlist (e.g. `brainstorm,planning,review,skill-eval,thinking-tools,workflow`, or unset to stage every directory with `plugin.json`) |
 | `SKILLBENCH_AUTH_FILES` | Comma-separated paths relative to `$HOME` copied into each rollout's isolated `HOME` (optional, default none: internal Jetski authenticates without files) |
-| `SKILLBENCH_EXEC_MODEL` | Executor model id passed to `agy --model` (default `opus-5.5-high`; `jet models` lists the ids, which embed the effort) |
-| `SKILLBENCH_JUDGE_MODEL` | Judge model id passed to `agy --model` (default `fable-5.1-high`) |
+| `SKILLBENCH_EXEC_MODEL` | Executor model id passed to `agy --model` in single-model runs (default `opus-5.5-high`; `jet models` lists the ids, which embed the effort) |
+| `SKILLBENCH_JUDGE_MODEL` | Judge model id passed to `agy --model` in single-model runs (default `fable-5.1-high`) |
+| `SKILLBENCH_IMPROVER_MODEL` | Improver model id passed to `agy --model` by `skillbench-improve` (optional, defaults to `SKILLBENCH_EXEC_MODEL`) |
 | `SKILLBENCH_EFFORT` | Extra `agy --effort` value (`low`, `medium`, `high`, `xhigh`, `max`) for both arms (optional, default empty: no `--effort`, the model id pins it) |
+| `SKILLBENCH_JUDGE_REPEAT` | Repeated judge calls per rollout (optional, default `1`) |
+| `SKILLBENCH_PILOT` | Set to `1` to restrict runs and reports to `pilot = true` tasks (optional, default `0`) |
 
-Each rollout runs inside a fresh git repository (`<run>/work`) with a throwaway `HOME` (`<run>/home`) containing only the arm's allowlisted plugins and a copy (never a symlink) of any `SKILLBENCH_AUTH_FILES`, plus `PATH` shims for clipboard and diff tools (`xclip`, `xsel`, `wl-copy`, `pbcopy`, `revdiff`). Copied auth files are removed from `<run>/home` when the rollout completes.
+Each rollout runs inside a fresh git repository (`<run>/work`) with a throwaway `HOME` (`<run>/home`) containing only the arm's staged plugins (`with` / `without` for leave-one-out skill arms, `baseline` / `suite-<name>` for suite arms, plus any `--suites` competitors) and a copy (never a symlink) of any `SKILLBENCH_AUTH_FILES`, plus `PATH` shims for clipboard and diff tools (`xclip`, `xsel`, `wl-copy`, `pbcopy`, `revdiff`). Copied auth files are removed from `<run>/home` when the rollout completes.
 
-Verify the AGY installation, any listed auth files, the plugin checkout, and the frozen task manifest before running:
+Verify the AGY installation, any listed auth files, the suite / plugin checkout, and the frozen task manifest before running:
 
 ```bash
-harness2-check --bench skillbench --substrate agy
+harness2-check --bench skillbench --substrate agy --suite harness2/benchmarks/skillbench/suites/cc-thingz.toml
+skillbench-tasks check --suite harness2/benchmarks/skillbench/suites/cc-thingz.toml
 ```
+
+See the [skillbench benchmark guide](BENCHMARKS.md#skillbench) for `suite.toml` fields, schema v2, and the `skillbench-tasks`, `skillbench-matrix`, `skillbench-report`, `skillbench-improve`, and `skillbench-cycle` console scripts.
 
 ## Network access during setup
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Documentation and `.env.example` verification for skillbench (Task 16)."""
+"""Documentation and `.env.example` verification for skillbench (Task 16 & v2 Task 15)."""
 
 from __future__ import annotations
 
@@ -28,11 +28,14 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCHMARKS_MD = ROOT / "docs" / "BENCHMARKS.md"
 SETUP_MD = ROOT / "docs" / "SETUP.md"
 README_MD = ROOT / "README.md"
+AGENTS_MD = ROOT / ".agents" / "AGENTS.md"
 ENV_EXAMPLE = ROOT / ".env.example"
 JETSKI_CLI = "/google/bin/releases/jetski-devs/tools/cli"
 
 REQUIRED_ENV_KEYS = (
     "HARNESS2_AGY_BIN",
+    "SKILLBENCH_SUITE",
+    "SKILLBENCH_TASKS_ROOT",
     "SKILLBENCH_PLUGINS_DIR",
     "SKILLBENCH_PLUGINS",
     "SKILLBENCH_AUTH_FILES",
@@ -41,6 +44,27 @@ REQUIRED_ENV_KEYS = (
     "SKILLBENCH_EFFORT",
     "SKILLBENCH_JUDGE_REPEAT",
     "SKILLBENCH_PILOT",
+)
+
+NEW_ENV_KEYS = (
+    "SKILLBENCH_SUITE",
+    "SKILLBENCH_TASKS_ROOT",
+)
+
+NEW_FLAGS = (
+    "--suite",
+    "--suites",
+    "--results-root",
+    "--hardness-only",
+    "--summary-only",
+)
+
+SKILLBENCH_CLIS = (
+    "skillbench-tasks",
+    "skillbench-matrix",
+    "skillbench-report",
+    "skillbench-improve",
+    "skillbench-cycle",
 )
 
 
@@ -56,9 +80,19 @@ class TestSkillbenchDocumentation(unittest.TestCase):
             "manifest.json",
             "user_answers",
             "forbidden_terms",
-            # arms & leave-one-out
+            # suite.toml reference & schema v2
+            "suite.toml",
+            "plugins_dir",
+            "[families]",
+            "[matrix.judge_for]",
+            "schema_version: 2",
+            "summary.md",
+            "history.jsonl",
+            # arms & leave-one-out & suite arms
             "--arm with",
             "--arm without",
+            "baseline",
+            "suite-<name>",
             "leave-one-out",
             # allowlist
             "SKILLBENCH_PLUGINS_DIR",
@@ -71,23 +105,32 @@ class TestSkillbenchDocumentation(unittest.TestCase):
             "pbcopy",
             "revdiff",
             "side_effects/",
-            # metrics & report
+            # metrics & report & recommendation labels
             "skillbench-report",
             "t_skill_s",
             "helps",
             "hurts",
             "inconclusive",
             "insufficient data",
+            "needs harder tasks",
+            "consider removing",
+            "fix",
+            "keep",
             # statistical power note
             "35",
             "0.2",
             # env vars
             "HARNESS2_AGY_BIN",
+            "SKILLBENCH_SUITE",
+            "SKILLBENCH_TASKS_ROOT",
             "SKILLBENCH_AUTH_FILES",
             "SKILLBENCH_EXEC_MODEL",
             "SKILLBENCH_JUDGE_MODEL",
             "SKILLBENCH_EFFORT",
             "SKILLBENCH_JUDGE_REPEAT",
+            # new flags & CLIs
+            *NEW_FLAGS,
+            *SKILLBENCH_CLIS,
             # cost gates / pilot / spike
             "agy_spike.sh",
             "run_skillbench.sh",
@@ -101,12 +144,17 @@ class TestSkillbenchDocumentation(unittest.TestCase):
         for term in (
             "--substrate agy",
             "HARNESS2_AGY_BIN",
+            "SKILLBENCH_SUITE",
+            "SKILLBENCH_TASKS_ROOT",
             "SKILLBENCH_PLUGINS_DIR",
             "SKILLBENCH_AUTH_FILES",
             "SKILLBENCH_EFFORT",
             "SKILLBENCH_EXEC_MODEL",
             "SKILLBENCH_JUDGE_MODEL",
             "harness2-check --bench skillbench",
+            "--suite",
+            "suite.toml",
+            *SKILLBENCH_CLIS,
         ):
             with self.subTest(term=term):
                 self.assertIn(term, text)
@@ -121,6 +169,50 @@ class TestSkillbenchDocumentation(unittest.TestCase):
         table = table_match.group(0)
         self.assertIn("skillbench", table)
         self.assertIn("docs/BENCHMARKS.md#skillbench", table)
+
+    def test_readme_covers_generic_skillbench_v2_workflows_and_clis(self) -> None:
+        text = README_MD.read_text(encoding="utf-8")
+        self.assertRegex(text, r"(?m)^###\s+Benchmark any skill set\b")
+        self.assertRegex(text, r"(?m)^###\s+Improve a weak skill\b")
+        for term in (
+            "suite.toml",
+            "skillbench-tasks new",
+            "skillbench-tasks check",
+            "--arms baseline",
+            "--hardness-only",
+            "--results-root",
+            "history.jsonl",
+            "summary.md",
+            # recommendation rule in order
+            "needs harder tasks",
+            "consider removing",
+            "fix",
+            "keep",
+            # improver v2 flags
+            "--models",
+            "--rounds",
+            "--max-growth",
+            "--apply",
+            # all 5 skillbench CLIs
+            *SKILLBENCH_CLIS,
+        ):
+            with self.subTest(term=term):
+                self.assertIn(term, text)
+
+    def test_agents_md_covers_v2_rules(self) -> None:
+        text = AGENTS_MD.read_text(encoding="utf-8")
+        for term in (
+            "No paid runs without explicit user approval.",
+            "suite.toml",
+            "no suite hard-coding",
+            "schema_version: 2",
+            "Staging only reads the checkout; only",
+            "`--apply` writes, on a branch, never on a dirty tree",
+            *SKILLBENCH_CLIS,
+        ):
+            with self.subTest(term=term):
+                self.assertIn(term, text)
+        self.assertNotIn("touch the `cc-thingz` checkout", text)
 
     def test_env_example_contains_agy_and_skillbench_keys_and_loads_cleanly(self) -> None:
         self.assertTrue(ENV_EXAMPLE.is_file(), f"missing {ENV_EXAMPLE}")

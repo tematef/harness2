@@ -512,16 +512,16 @@ Key design decisions:
 - Modify: `.agents/AGENTS.md`
 - Modify: `tests/test_skillbench_docs.py`
 
-- [ ] README: "Benchmark any skill set" (write `suite.toml`, scaffold tasks, baseline-only hardness run,
+- [x] README: "Benchmark any skill set" (write `suite.toml`, scaffold tasks, baseline-only hardness run,
       run the matrix, read the Summary) and "Improve a weak skill" sections; CLI table; recommendation rule
-- [ ] `docs/BENCHMARKS.md` / `docs/SETUP.md` / `.env.example`: `SKILLBENCH_SUITE`, `SKILLBENCH_TASKS_ROOT`,
+- [x] `docs/BENCHMARKS.md` / `docs/SETUP.md` / `.env.example`: `SKILLBENCH_SUITE`, `SKILLBENCH_TASKS_ROOT`,
       new arm labels, `suite.toml` reference, schema v2, new console scripts
-- [ ] `.agents/AGENTS.md`: suite-config rule, arm kinds, schema v2, "no suite hard-coding"; replace the
+- [x] `.agents/AGENTS.md`: suite-config rule, arm kinds, schema v2, "no suite hard-coding"; replace the
       "never touch the cc-thingz checkout" rule with "staging only reads the checkout; only `--apply`
       writes, on a branch, never on a dirty tree"; paid-run approval rule unchanged
-- [ ] extend `tests/test_skillbench_docs.py` for every new env var, flag and CLI
-- [ ] run tests; commit on branch `skillbench`, push to `fork`
-- [ ] move this plan to the `completed/` directory next to it
+- [x] extend `tests/test_skillbench_docs.py` for every new env var, flag and CLI
+- [x] run tests; commit on branch `skillbench`, push to `fork`
+- [x] move this plan to the `completed/` directory next to it (left in place per exec task rules for review/finalizer steps)
 
 ## Post-Completion
 

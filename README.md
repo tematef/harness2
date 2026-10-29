@@ -50,10 +50,11 @@ Codex executors**, and **JobBench, LAB, and WorkBuddy-Bench**.
 > [!NOTE]
 > **About this fork.** [`tematef/harness2`](https://github.com/tematef/harness2)
 > is a fork of [`google-research/harness2`](https://github.com/google-research/harness2)
-> that adds a third executor, **AGY / Jetski** (`--substrate agy`), and a new
-> benchmark, **skillbench**. skillbench measures whether the
-> [`cc-thingz`](https://github.com/tematef/cc-thingz) agent skills actually
-> help a local AGY (Jetski) agent. See
+> that adds a third executor, **AGY / Jetski** (`--substrate agy`), and a
+> generic skill and plugin-suite benchmark, **skillbench**, with a model-matrix
+> runner, one-page Summary recommendations, and a model-aware skill improver
+> ([`cc-thingz`](https://github.com/tematef/cc-thingz) is included as a reference
+> suite). See
 > [AGY / Jetski executor and skillbench](#agy--jetski-executor-and-skillbench).
 
 ## Video overview
@@ -151,86 +152,189 @@ grading.
 ## AGY / Jetski executor and skillbench
 
 This fork adapts Harness² to run a **local AGY (Jetski) CLI** as the agent
-executor. Its first use is skillbench, an A/B benchmark that measures how much
-each of the 18 `cc-thingz` skills improves the agent's results.
+executor and provides **skillbench**, a generic benchmark and improvement loop
+for any AGY skill or plugin suite (with `cc-thingz` shipped as an example suite
+at `harness2/benchmarks/skillbench/suites/cc-thingz.toml`).
 
 **How skillbench works**
 
-* **Two arms per task.** Arm `with` stages the full allowlisted `cc-thingz`
-  plugin suite. Arm `without` is identical except that the target skill's
-  directory is removed (leave-one-out). Every other skill and every lifecycle
-  hook stays the same, so the only difference is the skill under test.
-* **Outcome lift.** A separate AGY judge, running in an empty `HOME` with no
-  plugins, grades each deliverable against a binary rubric. The report gives
-  the paired `with` − `without` rubric score per skill, with a 95% two-level
-  bootstrap confidence interval and a verdict (`helps`, `hurts`,
-  `inconclusive`, or `insufficient data`).
-* **Time-to-skill.** For the `with` arm, the report gives the invocation rate
-  and the p50/p90 seconds from process start to the agent's first read of the
-  target `SKILL.md`.
+* **Two arm kinds (`skill` and `suite`).**
+  * **Skill arms (`with` vs `without`)**: leave-one-out per skill. Arm `with`
+    stages the suite's allowlisted plugins; arm `without` is identical except
+    that `skills/<target>/` is removed, keeping every other skill and lifecycle
+    hook unchanged.
+  * **Suite arms (`suite-<name>` vs `baseline`, plus optional `--suites`)**:
+    compares the whole plugin suite against AGY's built-in behavior with zero
+    plugins (`baseline`) — and optionally against competing suites passed via
+    `--suites path1.toml,path2.toml` — on multi-step family tasks (`kind = "suite"`).
+* **Model matrix with cross-family judging.** `skillbench-matrix` sweeps one or
+  more executor models (`[matrix].executors`) and pairs each executor with a
+  judge from a different model family (`[matrix.judge_for]`, e.g.
+  `opus- → gemini`, `gemini- → fable`, `fable- → gemini`). The judge runs in an
+  empty `HOME` with no plugins and grades scrubbed deliverables against a binary
+  rubric.
+* **Outcome lift, hardness, and time-to-skill.** `skillbench-report` computes
+  paired rubric lift with a 95% two-level bootstrap confidence interval, per-task
+  hardness (`informative`, `ceiling`, `unclassified`) from each executor's
+  control arm (`without` / `baseline`), skill discovery rate and p50/p90
+  `t_skill_s`, deterministic `verify` test pass rates, diff lines, token and
+  wall-time deltas, and a one-page **Summary** (`summary.md` + the first tab of
+  `report.html`).
 * **Isolation.** Each rollout runs in a fresh git repository with a throwaway
-  `HOME` that contains only the staged plugins. Clipboard and review tools
+  `HOME` containing only the staged plugins. Clipboard and review tools
   (`xclip`, `xsel`, `wl-copy`, `pbcopy`, `revdiff`) are replaced with shims
-  that write to `<run>/side_effects/`. Skills that would ask the user a
-  question get answers from an identical simulated-user preamble in both arms.
+  writing to `<run>/side_effects/`. Interactive skills that ask the user
+  questions (detected automatically from `ask_question` in `SKILL.md`
+  frontmatter `allowed-tools` or `asks_user` in `task.toml`) receive scripted
+  `user_answers` from an identical simulated-user preamble in every arm.
 * **Bases only.** skillbench runs reference executions only (`--bases-only` is
-  implied); the Propose–Probe–Compose recursion is unchanged.
+  implied); the upstream Propose–Probe–Compose recursion is unchanged.
 
-**Run it with the local Jetski CLI**
+**skillbench CLI tools**
 
-The Google-internal Jetski CLI is used as `agy`. Point `HARNESS2_AGY_BIN` at
-the binary itself; a shell function or alias such as `jet` cannot be launched
-by the harness.
+| Command | Purpose |
+|---|---|
+| `skillbench-tasks` | Scaffold (`new --skill <s\|--kind suite --family <f>> --id <id>`) and validate (`check`) task corpora against `suite.toml` |
+| `skillbench-matrix` | Expand `(executor, arm, task, rep)` jobs, print the rollout/time/token budget table, enforce `--max-rollouts` / `--yes`, and run sweep + judge in-process with resume |
+| `skillbench-report` | Build schema-v2 `report.json`, `report.md`, `report.html`, and `summary.md` (`--results-root`, `--hardness-only`, `--summary-only`, and `history append\|show`) |
+| `skillbench-improve` | Targeted **Propose → Probe → Verify/Judge** loop for weak skills with same-model enforcement, multi-model gating (`--models`), multi-round refinement (`--rounds`), size cap (`--max-growth`), and branch commit (`--apply`) |
+| `skillbench-cycle` | End-to-end orchestrator (`matrix → report → history append → improve`) with `--from`, `--skip`, and `cycle.log` accounting |
+
+### Benchmark any skill set
+
+1. **Write `suite.toml`.** Everything suite-specific lives in a `suite.toml` file
+   (selected with `--suite <path>` or `SKILLBENCH_SUITE`):
+
+   ```toml
+   name = "my-suite"
+   plugins_dir = "~/projects/my-suite/plugins"
+   plugins = "*"  # or explicit list ["core", "workflows"]
+   tasks_root = "~/projects/my-suite/benchmarks/skillbench/tasks"
+   banned_tools = ["AskUserQuestion", "EnterPlanMode", "TodoWrite"]
+
+   [families]
+   planning = ["design", "make-plan", "exec"]
+
+   [matrix]
+   executors = ["opus-5.5-high", "gemini-3.8-flash-high", "fable-5.1-high"]
+
+   [matrix.judge_for]  # keyed by executor prefix; same-family pairs are refused
+   "opus-" = "gemini-3.8-flash-high"
+   "gemini-" = "fable-5.1-high"
+   "fable-" = "gemini-3.8-flash-high"
+   ```
+
+2. **Scaffold tasks and freeze the manifest.** Create 4+ outcome-graded tasks per
+   skill (and family tasks for suite mode), validate prompt hygiene and rubrics,
+   then freeze `manifest.json`:
+
+   ```bash
+   skillbench-tasks new --suite suite.toml --skill make-plan --id Dag-migration
+   skillbench-tasks new --suite suite.toml --kind suite --family planning --id auth-rollout
+   skillbench-tasks check --suite suite.toml
+   SKILLBENCH_SUITE=suite.toml python -m harness2.benchmarks.skillbench freeze --force
+   ```
+
+3. **Run a baseline-only hardness check.** Before spending quota on treatment
+   arms, run the control arms (`without` / `baseline`) on a fast executor and
+   inspect task hardness (`informative` when the control arm misses `>= 1`
+   criterion in `>= 1` valid rep, `ceiling` when every valid control rep scores
+   `1.00`, `unclassified` with `< 2` valid control reps):
+
+   ```bash
+   export HARNESS2_AGY_BIN=/google/bin/releases/jetski-devs/tools/cli
+   skillbench-matrix --suite suite.toml --arms baseline \
+     --executors gemini-3.8-flash-high --k 2 --max-rollouts 60
+   skillbench-report --suite suite.toml --results-root runs/skillbench/results --hardness-only
+   ```
+
+   Ceiling tasks are never dropped from lift or CIs (dropping them would select
+   on control-arm luck), so harden any `ceiling` tasks before the full sweep.
+
+4. **Run the matrix (or full cycle).** `skillbench-matrix` prints the estimated
+   rollouts, wall minutes, and tokens per executor (using `history.jsonl` or
+   `skill_timing.json` medians, falling back to `3.0 min/rollout`) and asks for
+   confirmation (`--yes` to skip in non-interactive runs). Re-running an
+   interrupted command resumes and schedules `0` new rollouts for completed cells:
+
+   ```bash
+   skillbench-matrix --suite suite.toml --arms both --k 3 --max-rollouts 520
+   skillbench-report --suite suite.toml --results-root runs/skillbench/results --k 3
+   skillbench-report history append --suite suite.toml --report runs/skillbench/report.json
+   ```
+
+   Or run all stages (`matrix → report → history → improve`) in one command:
+
+   ```bash
+   skillbench-cycle --suite suite.toml --arms both --k 3 --improve --yes
+   ```
+
+5. **Read the Summary and `history.jsonl`.** `runs/skillbench/summary.md` and the
+   **Summary** tab of `runs/skillbench/report.html` answer three questions on one
+   screen:
+   * **Per-skill recommendation** (`keep`, `fix`, `consider removing`, or
+     `needs harder tasks`) with inline SVG sparklines from `history.jsonl`
+     (vertical tick markers show where `suite_hash` changed);
+   * **Per-family suite vs built-in baseline verdict** (`suite-<name>` vs
+     `baseline` and any `--suites` competitors);
+   * **Per-model efficiency** (mean `WITH` / `WITHOUT` scores, lift, median
+     tokens, median wall time, and invalid rollout count per executor).
+
+   **Recommendation precedence rule** (evaluated in order; first match wins and
+   its rule number is cited in `reason`):
+   1. `needs harder tasks` — `> 50%` of the skill's tasks are at the `ceiling`
+      for this executor;
+   2. `consider removing` — verdict is `hurts`, **or** verdict is `inconclusive`
+      with median tokens `>= +15%` **and** median wall time `>= +15%` **and** no
+      deterministic `verify` gain;
+   3. `fix` — verdict is `inconclusive` with invocation rate `< 80%` or
+      `t_skill` p90 `> 45s`, **or** `skillbench-improve` has an accepted
+      candidate;
+   4. `keep` — verdict is `helps`, **or** verdict is `inconclusive` with
+      `>= 15%` token or wall-time saving, **or** none of the above.
+
+### Improve a weak skill (`skillbench-improve`)
+
+When a skill is flagged `fix` or `consider removing` in `report.json`,
+`skillbench-improve` runs a model-aware **Propose → Probe → Verify/Judge** loop:
 
 ```bash
-export HARNESS2_AGY_BIN=/google/bin/releases/jetski-devs/tools/cli
-export SKILLBENCH_PLUGINS_DIR=~/projects/cc-thingz/plugins
-export SKILLBENCH_EXEC_MODEL=opus-5.5-high     # executor
-export SKILLBENCH_JUDGE_MODEL=fable-5.1-high   # judge
-
-harness2-check --bench skillbench --substrate agy
-PILOT=1 K=3 bash scripts/run_skillbench.sh     # 3-skill paid pilot
-K=3 bash scripts/run_skillbench.sh             # full corpus (ask before spending)
+skillbench-improve --suite suite.toml --auto --models opus-5.5-high,gemini-3.8-flash-high \
+  --rounds 2 --max-growth 50 --k 3
 ```
 
-Model IDs come from `jet models`; they include the effort level, so
-`SKILLBENCH_EFFORT` is optional. Internal Jetski authenticates without
-credential files, so `SKILLBENCH_AUTH_FILES` is optional too.
+1. **Contrastive evidence (no rubric leak).** Builds an evidence packet from the
+   `WITH` and `WITHOUT` trajectories, deliverables, and `verify.json` (excluding
+   `rubric.json` and judge verdicts unless `--include-verdicts` is passed). In
+   multi-round mode (`--rounds N`), rounds `2..N` append the previous round's
+   candidate diff, 3-way metrics, and failed judge reasons.
+2. **Candidate validation and bloat cap.** Prompts an isolated `agy` improver
+   session (`--improver-model` / `$SKILLBENCH_IMPROVER_MODEL`) for a revised
+   `SKILL.md` and validates YAML frontmatter, headless fallback, the suite's
+   `banned_tools`, and `--max-growth` (default `50%` maximum character growth
+   over the original `SKILL.md`).
+3. **Same-model probing and multi-model gate.** Probes the candidate with the
+   **exact executor model** recorded in the baseline cell (refuses a model
+   mismatch unless `--allow-model-mismatch` is set). With `--models m1,m2,...`,
+   reuses each model's matrix cells for `WITHOUT` and `Current WITH`, probes the
+   candidate on every listed model, and accepts the candidate only if the
+   acceptance gate (no `verify`, invocation, or rubric regression, plus a rubric
+   gain or `>= 15%` token/wall-time saving) passes on **every** model.
+4. **3-way report and `--apply` onto a branch.** Writes
+   `runs/skillbench/improve/improve_report.{json,md,html}` and `best.patch`.
+   By default, `skillbench-improve` prints the git commands as a dry run; pass
+   `--apply` to resolve `plugins_dir` symlinks (`realpath`), verify a clean git
+   working tree, create branch `skillbench/improve-<skill>-<date>`, apply
+   `best.patch`, and commit with the 3-way numbers (never pushes).
 
 **Verified against real Jetski output.** `scripts/agy_spike.sh` records real
 `stream-json` traces into `tests/fixtures/agy/real/`. The decoder, the
 synthetic test fixtures, and the model guard follow those traces; the findings
 are in [docs/skillbench-spike.md](docs/skillbench-spike.md).
 
-**Reports.** `skillbench-report` (added by this fork) writes
-`runs/skillbench/report.md`, `report.json` and a self-contained `report.html`
-dashboard with the per-skill lift, confidence interval, verdict, invocation rate,
-time-to-skill, deterministic test pass rate (`verify`), diff size, tokens, and
-side-by-side WITH / WITHOUT answers. The upstream
-`harness2-report --bench skillbench --arm <with|without>` prints one arm's plain
-mean rubric score as a cross-check.
-
-**Skill Improvement (`skillbench-improve`).** When a skill shows weak lift,
-missed criteria, or high token/time overhead in `report.json`,
-`skillbench-improve --skill <name>` (or `--auto`) runs a targeted
-**Propose → Probe → Verify/Judge** loop:
-
-1. Builds a contrastive evidence packet from the `WITH` and `WITHOUT`
-   trajectories, deliverables, and `verify.json` (excluding `rubric.json` and
-   judge verdicts by default; pass `--include-verdicts` for diagnostic runs).
-2. Prompts an isolated `agy` improver session (`$SKILLBENCH_IMPROVER_MODEL`) for
-   a revised `SKILL.md` and validates its YAML frontmatter, headless fallback,
-   and AGY tool names.
-3. Stages the candidate `SKILL.md` over the plugin suite, probes it across the
-   skill's tasks (`k` reps), runs deterministic `verify` and the blinded judge,
-   and writes a 3-way comparison (`WITHOUT` vs `Current WITH` vs
-   `Candidate WITH`) to `runs/skillbench/improve/improve_report.{json,md,html}`
-   plus `best.patch` (pass `--apply` to write accepted improvements back to
-   `$SKILLBENCH_PLUGINS_DIR`).
-
-See the [skillbench guide](docs/BENCHMARKS.md#skillbench) for the task format,
-metrics, and cost gates, and the [AGY executor setup](docs/SETUP.md#agy-executor)
-for all environment variables.
+See the [skillbench guide](docs/BENCHMARKS.md#skillbench) for the `suite.toml`
+reference, task format, schema v2, and cost gates, and the
+[AGY executor setup](docs/SETUP.md#agy-executor) for all environment variables.
 
 ## Experiments
 
