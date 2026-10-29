@@ -255,5 +255,111 @@ class PilotCorpusTest(unittest.TestCase):
                         )
 
 
+class ExternalCcThingzCorpusTest(unittest.TestCase):
+    """Verifies the external 28-task cc-thingz corpus when present on disk (Task 12)."""
+
+    SUITE_TOML = (
+        Path(__file__).resolve().parents[1]
+        / "harness2"
+        / "benchmarks"
+        / "skillbench"
+        / "suites"
+        / "cc-thingz.toml"
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from harness2.benchmarks.skillbench_suite import load_suite
+
+        cls.suite = load_suite(cls.SUITE_TOML)
+        if cls.suite.tasks_root is None or not cls.suite.tasks_root.is_dir():
+            raise unittest.SkipTest(f"external corpus not present at {cls.suite.tasks_root}")
+        cls.root = cls.suite.tasks_root
+        cls.tasks = SB.load_tasks(cls.root)
+
+    def test_corpus_shape_kinds_and_families(self) -> None:
+        self.assertEqual(len(self.tasks), 28)
+        expected_skills = {
+            "brainstorm": 4,
+            "make-plan": 4,
+            "exec": 4,
+            "root-cause-investigator": 4,
+            "dialectic": 4,
+            "code-review-refactor": 4,
+        }
+        skill_counts: dict[str, int] = {k: 0 for k in expected_skills}
+        suite_tasks: list[SB.SkillbenchTask] = []
+        for task in self.tasks.values():
+            if task.kind == "suite":
+                suite_tasks.append(task)
+                self.assertEqual(task.family, "planning")
+                self.assertEqual(task.target_skill, "")
+            else:
+                self.assertEqual(task.kind, "skill")
+                self.assertIn(task.target_skill, skill_counts)
+                skill_counts[task.target_skill] += 1
+        self.assertEqual(skill_counts, expected_skills)
+        self.assertEqual(len(suite_tasks), 4)
+
+    def test_check_corpus_and_manifest_pass(self) -> None:
+        from harness2.cli.skillbench_tasks import check_corpus
+
+        manifest_hash = SB.check_manifest(self.root)
+        self.assertEqual(len(manifest_hash), 64)
+        rows = check_corpus(self.root, suite=self.suite)
+        self.assertEqual(len(rows), 28)
+        failing = [r for r in rows if not r.ok]
+        self.assertEqual(failing, [], f"failing tasks: {failing}")
+
+    def test_prompt_and_rubric_hygiene_and_user_answers(self) -> None:
+        skill_files = self.suite.skill_files()
+        for tid, task in self.tasks.items():
+            with self.subTest(task_id=tid):
+                self.assertGreaterEqual(len(task.rubric), 5)
+                self.assertLessEqual(len(task.rubric), SB.MAX_CRITERIA)
+                self.assertEqual(
+                    SB.check_prompt(task.prompt, ALL_SKILL_NAMES, task.forbidden_terms),
+                    [],
+                )
+                full_prompt = SB.build_prompt(task)
+                self.assertEqual(
+                    SB.check_prompt(full_prompt, ALL_SKILL_NAMES, task.forbidden_terms),
+                    [],
+                )
+                md = (
+                    skill_files[task.target_skill].read_text(encoding="utf-8")
+                    if task.target_skill in skill_files
+                    else None
+                )
+                asks = SB.task_asks_user(task, md)
+                if task.kind == "suite" or task.target_skill in ASKING_SKILLS:
+                    self.assertTrue(asks)
+                    self.assertGreaterEqual(len(task.user_answers), 4)
+                else:
+                    self.assertFalse(asks)
+                for crit in task.rubric:
+                    self.assertEqual(check_rubric_criterion(crit.id), [])
+                    self.assertEqual(check_rubric_criterion(crit.criterion), [])
+
+    def test_external_fixtures_execute_unittest(self) -> None:
+        for tid, task in self.tasks.items():
+            with self.subTest(task_id=tid):
+                with tempfile.TemporaryDirectory(prefix="skillbench-ext-") as tmp:
+                    work = Path(tmp) / "work"
+                    shutil.copytree(task.fixture, work)
+                    proc = subprocess.run(
+                        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                        cwd=work,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if task.target_skill == "root-cause-investigator":
+                        self.assertNotEqual(proc.returncode, 0)
+                        self.assertIn("FAIL:", proc.stderr)
+                    else:
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

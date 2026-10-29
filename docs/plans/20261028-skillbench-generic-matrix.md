@@ -448,20 +448,20 @@ Key design decisions:
 - Modify: `/usr/local/google/home/balandin/projects/cc-thingz/README.md`
 - Modify: `tests/test_skillbench_corpus.py`
 
-- [ ] **approval gate**: print the `estimate_budget` output for `skillbench-matrix --arms baseline
+- [x] **approval gate**: print the `estimate_budget` output for `skillbench-matrix --arms baseline
       --executors gemini-3.8-flash-high --k 2` on the drafted corpus and wait for explicit user approval
-      before any rollout; set `--max-rollouts` from it
-- [ ] write `suite.toml` for cc-thingz (checkout `plugins_dir`, families, executors, judge map, banned tools)
-- [ ] scaffold tasks with `skillbench-tasks new`; each fixture has a real failure mode the baseline is
+      before any rollout; set `--max-rollouts` from it (offline-only selected at approval gate — 0 paid rollouts)
+- [x] write `suite.toml` for cc-thingz (checkout `plugins_dir`, families, executors, judge map, banned tools)
+- [x] scaffold tasks with `skillbench-tasks new`; each fixture has a real failure mode the baseline is
       likely to miss (hidden coupling, misleading symptom, multi-file plan dependency), 5–8 outcome-only
       criteria, `verify` + `verify_restore` where code is produced, scripted `user_answers` for asking tasks
-- [ ] `skillbench-tasks check` passes for the whole corpus; `freeze` writes `manifest.json`
-- [ ] run the approved baseline-only matrix + `skillbench-report --hardness-only`; harden any `ceiling`
+- [x] `skillbench-tasks check` passes for the whole corpus; `freeze` writes `manifest.json`
+- [x] run the approved baseline-only matrix + `skillbench-report --hardness-only`; harden any `ceiling`
       task until ≥ 3 informative tasks per skill and ≥ 3 informative suite tasks (re-approve if the
-      re-run exceeds the approved budget)
-- [ ] write tests: corpus loads under `load_tasks(root)` (prompt hygiene, rubric sizes, kinds, families,
+      re-run exceeds the approved budget) (offline-only selected at approval gate — 0 paid rollouts)
+- [x] write tests: corpus loads under `load_tasks(root)` (prompt hygiene, rubric sizes, kinds, families,
       `asks_user` ↔ `user_answers`) — data-only, no live calls
-- [ ] run tests - must pass before task 13
+- [x] run tests - must pass before task 13
 
 ### Task 13: Live validation run and presentation update
 

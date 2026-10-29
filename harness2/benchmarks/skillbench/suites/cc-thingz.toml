@@ -8,9 +8,9 @@
 name = "cc-thingz"
 plugins_dir = "~/projects/cc-thingz/plugins"
 plugins = ["brainstorm", "planning", "review", "skill-eval", "thinking-tools", "workflow"]  # or "*"
-# External corpus living next to the skills (Task 12 authors it); until it exists the
-# bundled corpus under harness2/benchmarks/skillbench/tasks/ is used.
-# tasks_root = "~/projects/cc-thingz/benchmarks/skillbench"
+# External corpus living next to the skills; when absent or unset, the bundled corpus
+# under harness2/benchmarks/skillbench/tasks/ is used.
+tasks_root = "~/projects/cc-thingz/benchmarks/skillbench/tasks"
 banned_tools = ["AskUserQuestion", "EnterPlanMode", "TodoWrite"]
 
 [families]
